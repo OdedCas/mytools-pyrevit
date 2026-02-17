@@ -1,0 +1,26 @@
+{
+  "walls": [
+    "^A?-?WALL(S)?$",
+    "^WALL_.*",
+    "^A-WALL$",
+    "^WALL$"
+  ],
+  "doors": [
+    "^A?-?DOOR(S)?$",
+    "^DOOR_.*",
+    "^A-DOOR$",
+    "^DOOR$"
+  ],
+  "windows": [
+    "^A?-?WIN(DOW)?S?$",
+    "^WINDOW_.*",
+    "^A-WIND$",
+    "^WINDOW$"
+  ],
+  "ignore": [
+    "^DEFPOINTS$",
+    "^HATCH.*",
+    "^TEXT.*",
+    "^DIM.*"
+  ]
+}

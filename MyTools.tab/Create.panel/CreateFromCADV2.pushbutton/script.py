@@ -1,0 +1,783 @@
+# -*- coding: utf-8 -*-
+__title__ = "Create From CAD V2"
+__doc__ = "Read DWG/DXF linework, recognize walls/windows/doors, and build a Revit model."
+
+import os
+import sys
+import math
+import clr
+
+clr.AddReference("System.Windows.Forms")
+import System.Windows.Forms as WinForms
+
+from System.Windows.Forms import (
+    OpenFileDialog,
+    DialogResult,
+    Form,
+    Label,
+    Button,
+    FormBorderStyle,
+)
+
+from Autodesk.Revit.DB import (
+    BuiltInCategory,
+    BuiltInParameter,
+    CurveLoop,
+    ElementId,
+    FamilySymbol,
+    FilteredElementCollector,
+    Floor,
+    FloorType,
+    Level,
+    Line,
+    Structure,
+    Transaction,
+    ViewPlan,
+    ViewType,
+    Wall,
+    WallKind,
+    WallType,
+    DWGImportOptions,
+    XYZ,
+)
+from Autodesk.Revit.UI import TaskDialog
+from Autodesk.Revit.Exceptions import OperationCanceledException
+
+from v2_snapshot import SnapshotRun
+from v2_cad_extract import (
+    load_config,
+    load_layer_map,
+    get_imported_cad_instances,
+    extract_cad_from_view,
+)
+from v2_cad_classify import classify_entities
+from v2_cad_recognition import recognize_topology
+
+
+uidoc = __revit__.ActiveUIDocument
+doc = uidoc.Document
+
+CM_PER_FT = 30.48
+
+
+def cm_to_ft(v):
+    return float(v) / CM_PER_FT
+
+
+def ft_to_cm(v):
+    return float(v) * CM_PER_FT
+
+
+def first_or_none(iterable):
+    for it in iterable:
+        return it
+    return None
+
+
+def set_form_center(form):
+    try:
+        form.StartPosition = WinForms.FormStartPosition.CenterScreen
+    except Exception:
+        pass
+
+
+def choose_input_kind():
+    form = Form()
+    form.Text = "Choose Source"
+    form.Width = 460
+    form.Height = 170
+    form.FormBorderStyle = FormBorderStyle.FixedDialog
+    set_form_center(form)
+    form.MinimizeBox = False
+    form.MaximizeBox = False
+
+    lbl = Label()
+    lbl.Left = 12
+    lbl.Top = 12
+    lbl.Width = 430
+    lbl.Height = 22
+    lbl.Text = "Select input source:"
+    form.Controls.Add(lbl)
+
+    btn_cad = Button()
+    btn_cad.Text = "CAD DWG/DXF"
+    btn_cad.Left = 28
+    btn_cad.Top = 56
+    btn_cad.Width = 180
+
+    btn_scan = Button()
+    btn_scan.Text = "Scan / Sketch"
+    btn_scan.Left = 236
+    btn_scan.Top = 56
+    btn_scan.Width = 180
+
+    choice = {"kind": None}
+
+    def on_cad(sender, args):
+        choice["kind"] = "cad"
+        form.DialogResult = DialogResult.OK
+        form.Close()
+
+    def on_scan(sender, args):
+        choice["kind"] = "scan"
+        form.DialogResult = DialogResult.OK
+        form.Close()
+
+    btn_cad.Click += on_cad
+    btn_scan.Click += on_scan
+    form.Controls.Add(btn_cad)
+    form.Controls.Add(btn_scan)
+
+    if form.ShowDialog() != DialogResult.OK:
+        return None
+    return choice["kind"]
+
+
+def choose_cad_source_mode(has_existing):
+    form = Form()
+    form.Text = "Choose CAD Source"
+    form.Width = 520
+    form.Height = 200
+    form.FormBorderStyle = FormBorderStyle.FixedDialog
+    set_form_center(form)
+    form.MinimizeBox = False
+    form.MaximizeBox = False
+
+    lbl = Label()
+    lbl.Left = 12
+    lbl.Top = 12
+    lbl.Width = 480
+    lbl.Height = 44
+    if has_existing:
+        lbl.Text = "Use existing imported CAD in this view, or import a new DWG/DXF."
+    else:
+        lbl.Text = "No imported CAD found in this view. Import a new DWG/DXF file."
+    form.Controls.Add(lbl)
+
+    btn_existing = Button()
+    btn_existing.Text = "Use Existing in View"
+    btn_existing.Left = 28
+    btn_existing.Top = 84
+    btn_existing.Width = 200
+    btn_existing.Enabled = bool(has_existing)
+
+    btn_import = Button()
+    btn_import.Text = "Import DWG/DXF File"
+    btn_import.Left = 260
+    btn_import.Top = 84
+    btn_import.Width = 200
+
+    choice = {"source": None}
+
+    def on_existing(sender, args):
+        choice["source"] = "existing"
+        form.DialogResult = DialogResult.OK
+        form.Close()
+
+    def on_import(sender, args):
+        choice["source"] = "import"
+        form.DialogResult = DialogResult.OK
+        form.Close()
+
+    btn_existing.Click += on_existing
+    btn_import.Click += on_import
+
+    form.Controls.Add(btn_existing)
+    form.Controls.Add(btn_import)
+
+    if form.ShowDialog() != DialogResult.OK:
+        return None
+    return choice["source"]
+
+
+def choose_post_action():
+    form = Form()
+    form.Text = "DWG After Build"
+    form.Width = 500
+    form.Height = 190
+    form.FormBorderStyle = FormBorderStyle.FixedDialog
+    set_form_center(form)
+    form.MinimizeBox = False
+    form.MaximizeBox = False
+
+    lbl = Label()
+    lbl.Left = 12
+    lbl.Top = 12
+    lbl.Width = 460
+    lbl.Height = 44
+    lbl.Text = "After model generation, keep imported CAD or replace it with model?"
+    form.Controls.Add(lbl)
+
+    btn_keep = Button()
+    btn_keep.Text = "Keep DWG + Model"
+    btn_keep.Left = 28
+    btn_keep.Top = 84
+    btn_keep.Width = 200
+
+    btn_replace = Button()
+    btn_replace.Text = "Replace DWG with Model"
+    btn_replace.Left = 260
+    btn_replace.Top = 84
+    btn_replace.Width = 200
+
+    choice = {"mode": None}
+
+    def on_keep(sender, args):
+        choice["mode"] = "keep"
+        form.DialogResult = DialogResult.OK
+        form.Close()
+
+    def on_replace(sender, args):
+        choice["mode"] = "replace"
+        form.DialogResult = DialogResult.OK
+        form.Close()
+
+    btn_keep.Click += on_keep
+    btn_replace.Click += on_replace
+
+    form.Controls.Add(btn_keep)
+    form.Controls.Add(btn_replace)
+
+    if form.ShowDialog() != DialogResult.OK:
+        return None
+    return choice["mode"]
+
+
+def pick_cad_path():
+    dialog = OpenFileDialog()
+    dialog.Filter = "CAD Files|*.dwg;*.dxf|DWG Files|*.dwg|DXF Files|*.dxf"
+    dialog.Multiselect = False
+    dialog.Title = "Select CAD file to import"
+    if dialog.ShowDialog() == DialogResult.OK:
+        return dialog.FileName
+    return None
+
+
+def get_plan_view():
+    active = uidoc.ActiveView
+    if isinstance(active, ViewPlan) and (not active.IsTemplate) and active.ViewType == ViewType.FloorPlan:
+        return active
+    return None
+
+
+def get_level_from_view(plan_view):
+    if plan_view and hasattr(plan_view, "GenLevel") and plan_view.GenLevel:
+        return plan_view.GenLevel
+    return first_or_none(FilteredElementCollector(doc).OfClass(Level))
+
+
+def get_floor_type():
+    return first_or_none(FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_Floors).OfClass(FloorType))
+
+
+def get_wall_type_nearest(thickness_ft):
+    wall_types = [wt for wt in FilteredElementCollector(doc).OfClass(WallType) if wt.Kind == WallKind.Basic]
+    if not wall_types:
+        return None
+    return min(wall_types, key=lambda wt: abs(wt.Width - thickness_ft))
+
+
+def set_param(element, bip, value):
+    if element is None:
+        return False
+    p = element.get_Parameter(bip)
+    if p and (not p.IsReadOnly):
+        p.Set(value)
+        return True
+    return False
+
+
+def set_param_by_names(element, names, value):
+    if element is None:
+        return False
+    for name in names:
+        try:
+            p = element.LookupParameter(name)
+            if p and (not p.IsReadOnly):
+                p.Set(value)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def set_opening_size(instance, width_ft, height_ft, width_bip, height_bip):
+    w_ok = set_param(instance, width_bip, width_ft)
+    h_ok = set_param(instance, height_bip, height_ft)
+    if not w_ok:
+        set_param_by_names(instance, ["Width", "width", "Rough Width"], width_ft)
+    if not h_ok:
+        set_param_by_names(instance, ["Height", "height", "Rough Height"], height_ft)
+
+
+def get_symbol(category):
+    return first_or_none(FilteredElementCollector(doc).OfCategory(category).OfClass(FamilySymbol))
+
+
+def build_loop(points):
+    loop = CurveLoop()
+    n = len(points)
+    for i in range(n):
+        loop.Append(Line.CreateBound(points[i], points[(i + 1) % n]))
+    return loop
+
+
+def _dist_pt_seg(px, py, ax, ay, bx, by):
+    vx = bx - ax
+    vy = by - ay
+    wx = px - ax
+    wy = py - ay
+    vv = (vx * vx) + (vy * vy)
+    if vv <= 1e-9:
+        dx = px - ax
+        dy = py - ay
+        return math.sqrt((dx * dx) + (dy * dy)), 0.0
+    t = ((wx * vx) + (wy * vy)) / vv
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+    cx = ax + (vx * t)
+    cy = ay + (vy * t)
+    dx = px - cx
+    dy = py - cy
+    return math.sqrt((dx * dx) + (dy * dy)), t
+
+
+def _project_t_cm(px, py, ax, ay, bx, by):
+    vx = bx - ax
+    vy = by - ay
+    ln = math.sqrt((vx * vx) + (vy * vy))
+    if ln <= 1.0e-9:
+        return 0.0
+    ux = vx / ln
+    uy = vy / ln
+    return ((px - ax) * ux) + ((py - ay) * uy)
+
+
+def _edge_list_from_poly_cm(poly_cm):
+    out = []
+    n = len(poly_cm)
+    for i in range(n):
+        a = poly_cm[i]
+        b = poly_cm[(i + 1) % n]
+        dx = float(b[0]) - float(a[0])
+        dy = float(b[1]) - float(a[1])
+        ln = math.sqrt((dx * dx) + (dy * dy))
+        if ln <= 1.0e-9:
+            continue
+        out.append({"idx": i, "a": a, "b": b, "len": ln})
+    return out
+
+
+def _manual_pick_opening_pairs(kind):
+    pairs = []
+    while True:
+        try:
+            p1 = uidoc.Selection.PickPoint("Pick {} LEFT edge (ESC to finish {})".format(kind.upper(), kind.upper()))
+        except OperationCanceledException:
+            break
+        p2 = uidoc.Selection.PickPoint("Pick {} RIGHT edge".format(kind.upper()))
+        pairs.append((p1, p2))
+    return pairs
+
+
+def _convert_pair_to_opening(p1_ft, p2_ft, kind, edges, cfg):
+    p1 = (ft_to_cm(p1_ft.X), ft_to_cm(p1_ft.Y))
+    p2 = (ft_to_cm(p2_ft.X), ft_to_cm(p2_ft.Y))
+    mx = (p1[0] + p2[0]) * 0.5
+    my = (p1[1] + p2[1]) * 0.5
+
+    best = None
+    best_dist = None
+    for e in edges:
+        d, _ = _dist_pt_seg(mx, my, float(e["a"][0]), float(e["a"][1]), float(e["b"][0]), float(e["b"][1]))
+        if best is None or d < best_dist:
+            best = e
+            best_dist = d
+    if best is None:
+        return None
+
+    t1 = _project_t_cm(p1[0], p1[1], float(best["a"][0]), float(best["a"][1]), float(best["b"][0]), float(best["b"][1]))
+    t2 = _project_t_cm(p2[0], p2[1], float(best["a"][0]), float(best["a"][1]), float(best["b"][0]), float(best["b"][1]))
+    s = max(0.0, min(t1, t2))
+    t = min(float(best["len"]), max(t1, t2))
+    width = max(1.0, t - s)
+
+    op = {
+        "type": kind,
+        "host_edge": int(best["idx"]),
+        "start_cm": s,
+        "end_cm": t,
+        "width_cm": width,
+        "confidence": 1.0,
+        "manual": True,
+    }
+    if kind == "door":
+        op["height_cm"] = float(cfg.get("default_door_height_cm", 210.0))
+    elif kind == "window":
+        op["height_cm"] = float(cfg.get("default_window_height_cm", 100.0))
+        op["sill_cm"] = float(cfg.get("default_window_sill_cm", 105.0))
+    return op
+
+
+def maybe_manual_openings(topology, cfg, snapshot):
+    openings = list(topology.get("openings") or [])
+    door_count = len([o for o in openings if str(o.get("type", "")).lower() == "door"])
+    window_count = len([o for o in openings if str(o.get("type", "")).lower() == "window"])
+
+    if door_count >= 1 and window_count >= 1:
+        return topology
+
+    poly_cm = list(topology.get("room_polygon_cm") or [])
+    edges = _edge_list_from_poly_cm(poly_cm)
+    if not edges:
+        return topology
+
+    TaskDialog.Show(
+        "Create From CAD V2",
+        "Auto opening recognition is incomplete (doors={}, windows={}).\\n"
+        "You can now pick openings manually on the CAD.\\n"
+        "Pick points in pairs (left/right). Press ESC to finish each type.".format(door_count, window_count),
+    )
+
+    manual = []
+    door_pairs = _manual_pick_opening_pairs("door")
+    for p1, p2 in door_pairs:
+        op = _convert_pair_to_opening(p1, p2, "door", edges, cfg)
+        if op:
+            manual.append(op)
+
+    window_pairs = _manual_pick_opening_pairs("window")
+    for p1, p2 in window_pairs:
+        op = _convert_pair_to_opening(p1, p2, "window", edges, cfg)
+        if op:
+            manual.append(op)
+
+    if not manual:
+        snapshot.log("Manual opening fallback: no manual picks")
+        return topology
+
+    keep = []
+    if not any([m for m in manual if m["type"] == "door"]):
+        keep.extend([o for o in openings if str(o.get("type", "")).lower() == "door"])
+    if not any([m for m in manual if m["type"] == "window"]):
+        keep.extend([o for o in openings if str(o.get("type", "")).lower() == "window"])
+
+    topology["openings"] = keep + manual
+    snapshot.log(
+        "Manual opening fallback applied: doors={}, windows={}".format(
+            len([o for o in topology["openings"] if o.get("type") == "door"]),
+            len([o for o in topology["openings"] if o.get("type") == "window"]),
+        )
+    )
+    return topology
+
+
+def import_cad_file_to_view(view, cad_path):
+    t_imp = Transaction(doc, "Import CAD (V2)")
+    try:
+        t_imp.Start()
+        opts = DWGImportOptions()
+        opts.ThisViewOnly = True
+        opts.OrientToView = True
+        opts.VisibleLayersOnly = True
+
+        imported_ref = clr.Reference[ElementId](ElementId.InvalidElementId)
+        ok = doc.Import(cad_path, opts, view, imported_ref)
+        if not ok:
+            t_imp.RollBack()
+            return None, "Revit failed to import CAD file."
+
+        t_imp.Commit()
+        imported_id = imported_ref.Value
+        inst = doc.GetElement(imported_id) if imported_id else None
+        if inst is None:
+            return None, "CAD imported but ImportInstance not found."
+        return inst, None
+    except Exception as ex:
+        try:
+            if t_imp.HasStarted():
+                t_imp.RollBack()
+        except Exception:
+            pass
+        return None, str(ex)
+
+
+def cleanup_imported_cad_instance(instance_id, snapshot):
+    if instance_id is None:
+        return
+    t_clean = Transaction(doc, "Remove Source CAD (V2)")
+    try:
+        t_clean.Start()
+        elem = doc.GetElement(ElementId(int(instance_id)))
+        if elem is not None:
+            doc.Delete(elem.Id)
+        t_clean.Commit()
+        snapshot.log("Removed CAD import instance {}".format(instance_id))
+    except Exception as ex:
+        try:
+            if t_clean.HasStarted():
+                t_clean.RollBack()
+        except Exception:
+            pass
+        snapshot.log("Failed removing CAD {}: {}".format(instance_id, ex))
+
+
+def build_model_from_topology(level, topology, cfg, snapshot):
+    poly_cm = list(topology.get("room_polygon_cm") or [])
+    if len(poly_cm) < 3:
+        raise Exception("Invalid recognized room polygon")
+
+    wall_thickness_cm = float(topology.get("measurements_cm", {}).get("wall_thickness_cm", cfg.get("default_wall_thickness_cm", 20.0)))
+    wall_type = get_wall_type_nearest(cm_to_ft(wall_thickness_cm))
+    floor_type = get_floor_type()
+    if wall_type is None or floor_type is None:
+        raise Exception("Missing WallType or FloorType in project")
+
+    inner_pts = [XYZ(cm_to_ft(p[0]), cm_to_ft(p[1]), 0.0) for p in poly_cm]
+
+    area2 = 0.0
+    for i in range(len(poly_cm)):
+        x1, y1 = poly_cm[i]
+        x2, y2 = poly_cm[(i + 1) % len(poly_cm)]
+        area2 += (x1 * y2) - (x2 * y1)
+    if abs(area2) <= 1e-6:
+        raise Exception("Recognized polygon has near-zero area")
+
+    wall_height_ft = cm_to_ft(300.0)
+    half = wall_type.Width * 0.5
+
+    walls = []
+    wall_meta = []
+    door_ids = []
+    window_ids = []
+
+    t_geo = Transaction(doc, "Create Model From CAD V2")
+    t_geo.Start()
+    try:
+        for i in range(len(inner_pts)):
+            p0 = inner_pts[i]
+            p1 = inner_pts[(i + 1) % len(inner_pts)]
+            dx = p1.X - p0.X
+            dy = p1.Y - p0.Y
+            ln = math.sqrt((dx * dx) + (dy * dy))
+            if ln <= 1e-9:
+                continue
+
+            if area2 > 0.0:
+                ox = dy / ln
+                oy = -dx / ln
+            else:
+                ox = -dy / ln
+                oy = dx / ln
+
+            c0 = XYZ(p0.X + (ox * half), p0.Y + (oy * half), 0.0)
+            c1 = XYZ(p1.X + (ox * half), p1.Y + (oy * half), 0.0)
+
+            wall = Wall.Create(doc, Line.CreateBound(c0, c1), wall_type.Id, level.Id, wall_height_ft, 0.0, False, False)
+            walls.append(wall)
+            wall_meta.append({
+                "center_start": c0,
+                "dir_x": dx / ln,
+                "dir_y": dy / ln,
+                "len_ft": ln,
+            })
+
+        if len(walls) < 3:
+            raise Exception("Failed to create enough walls")
+
+        Floor.Create(doc, [build_loop(inner_pts)], floor_type.Id, level.Id)
+        roof = Floor.Create(doc, [build_loop(inner_pts)], floor_type.Id, level.Id)
+        set_param(roof, BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM, wall_height_ft)
+
+        door_type = get_symbol(BuiltInCategory.OST_Doors)
+        window_type = get_symbol(BuiltInCategory.OST_Windows)
+
+        if door_type and (not door_type.IsActive):
+            door_type.Activate()
+        if window_type and (not window_type.IsActive):
+            window_type.Activate()
+        doc.Regenerate()
+
+        openings = list(topology.get("openings") or [])
+        for op in openings:
+            otype = str(op.get("type", "")).lower()
+            host = int(op.get("host_edge", -1))
+            if host < 0 or host >= len(walls):
+                continue
+            meta = wall_meta[host]
+
+            s_cm = float(op.get("start_cm", 0.0))
+            e_cm = float(op.get("end_cm", 0.0))
+            center_t_cm = (s_cm + e_cm) * 0.5
+            center_t_ft = cm_to_ft(center_t_cm)
+            if center_t_ft < 0.0:
+                center_t_ft = 0.0
+            if center_t_ft > meta["len_ft"]:
+                center_t_ft = meta["len_ft"]
+
+            px = meta["center_start"].X + (meta["dir_x"] * center_t_ft)
+            py = meta["center_start"].Y + (meta["dir_y"] * center_t_ft)
+
+            if otype == "door" and door_type:
+                dw = cm_to_ft(float(op.get("width_cm", cfg.get("default_door_width_cm", 100.0))))
+                dh = cm_to_ft(float(op.get("height_cm", cfg.get("default_door_height_cm", 210.0))))
+                inst = doc.Create.NewFamilyInstance(XYZ(px, py, 0.0), door_type, walls[host], level, Structure.StructuralType.NonStructural)
+                set_opening_size(inst, dw, dh, BuiltInParameter.DOOR_WIDTH, BuiltInParameter.DOOR_HEIGHT)
+                door_ids.append(inst.Id.IntegerValue)
+
+            elif otype == "window" and window_type:
+                ww = cm_to_ft(float(op.get("width_cm", cfg.get("default_window_width_cm", 100.0))))
+                wh = cm_to_ft(float(op.get("height_cm", cfg.get("default_window_height_cm", 100.0))))
+                sill = cm_to_ft(float(op.get("sill_cm", cfg.get("default_window_sill_cm", 105.0))))
+                inst = doc.Create.NewFamilyInstance(XYZ(px, py, sill), window_type, walls[host], level, Structure.StructuralType.NonStructural)
+                set_opening_size(inst, ww, wh, BuiltInParameter.WINDOW_WIDTH, BuiltInParameter.WINDOW_HEIGHT)
+                set_param(inst, BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM, sill)
+                window_ids.append(inst.Id.IntegerValue)
+
+        t_geo.Commit()
+
+        summary = {
+            "geometry": {
+                "mode": "polygon_v2",
+                "wall_ids": [w.Id.IntegerValue for w in walls],
+                "door_ids": door_ids,
+                "window_ids": window_ids,
+            },
+            "dimensions": {
+                "ok": False,
+                "note": "Dimensions are intentionally disabled in V2 while CAD recognition is stabilized.",
+            },
+        }
+        snapshot.save_json("08_geometry_summary.json", summary)
+        return summary
+
+    except Exception:
+        t_geo.RollBack()
+        raise
+
+
+def run_command():
+    plan_view = get_plan_view()
+    if plan_view is None:
+        TaskDialog.Show("Create From CAD V2", "Run this command in a Floor Plan view.")
+        return
+
+    level = get_level_from_view(plan_view)
+    if level is None:
+        TaskDialog.Show("Create From CAD V2", "No valid Level found.")
+        return
+
+    snapshot = SnapshotRun()
+    snapshot.log("Run started")
+
+    kind = choose_input_kind()
+    if kind is None:
+        TaskDialog.Show("Create From CAD V2", "Canceled.")
+        return
+
+    if kind == "scan":
+        TaskDialog.Show("Create From CAD V2", "Scan/sketch flow is handled by the legacy command: 'Create Room From Image'.")
+        return
+
+    ext_dir = os.path.dirname(__file__)
+    cfg = load_config(os.path.join(ext_dir, "cad_config.json"))
+    layer_map = load_layer_map(os.path.join(ext_dir, "cad_layer_map.json"))
+
+    try:
+        cad_instances = get_imported_cad_instances(doc, plan_view)
+    except Exception:
+        cad_instances = []
+
+    source_mode = choose_cad_source_mode(len(cad_instances) > 0)
+    if source_mode is None:
+        TaskDialog.Show("Create From CAD V2", "Canceled.")
+        return
+
+    post_action = choose_post_action()
+    if post_action is None:
+        TaskDialog.Show("Create From CAD V2", "Canceled.")
+        return
+
+    selected_instance = None
+    cad_path = None
+
+    if source_mode == "import":
+        cad_path = pick_cad_path()
+        if not cad_path:
+            TaskDialog.Show("Create From CAD V2", "Canceled.")
+            return
+        selected_instance, err = import_cad_file_to_view(plan_view, cad_path)
+        if selected_instance is None:
+            TaskDialog.Show("Create From CAD V2", "CAD import failed.\n{}".format(err or "Unknown error"))
+            return
+    else:
+        if len(cad_instances) == 0:
+            TaskDialog.Show("Create From CAD V2", "No imported CAD found in active view.")
+            return
+        if len(cad_instances) > 1:
+            TaskDialog.Show("Create From CAD V2", "Multiple CAD imports found. Keep one visible import or use 'Import DWG/DXF File'.")
+            return
+        selected_instance = cad_instances[0]
+
+    selected_id = selected_instance.Id.IntegerValue if selected_instance else None
+    snapshot.save_json("00_input_meta.json", {
+        "source_kind": "cad",
+        "source_mode": source_mode,
+        "post_action": post_action,
+        "cad_path": cad_path,
+        "cad_instance_id": selected_id,
+        "view_name": plan_view.Name,
+        "units": "cm",
+    })
+
+    model_created = False
+    try:
+        raw = extract_cad_from_view(doc, plan_view, cfg, target_instance_id=selected_id)
+        classified = classify_entities(raw.get("lines", []), raw.get("arcs", []), layer_map)
+        topology = recognize_topology(classified, cfg)
+        topology = maybe_manual_openings(topology, cfg, snapshot)
+
+        snapshot.save_json("01_raw_cad.json", raw)
+        snapshot.save_json("02_classified.json", {
+            "wall_lines": len(classified.get("wall_lines", [])),
+            "door_lines": len(classified.get("door_lines", [])),
+            "window_lines": len(classified.get("window_lines", [])),
+            "door_arcs": len(classified.get("door_arcs", [])),
+            "window_arcs": len(classified.get("window_arcs", [])),
+            "dimension_lines": len(classified.get("dimension_lines", [])),
+            "dimension_arcs": len(classified.get("dimension_arcs", [])),
+            "unclassified_lines": len(classified.get("unclassified_lines", [])),
+            "unclassified_arcs": len(classified.get("unclassified_arcs", [])),
+            "ignored": classified.get("ignored", 0),
+        })
+        snapshot.save_json("03_topology.json", topology)
+
+        out = build_model_from_topology(level, topology, cfg, snapshot)
+        model_created = True
+
+        if post_action == "replace":
+            cleanup_imported_cad_instance(selected_id, snapshot)
+
+        TaskDialog.Show(
+            "Create From CAD V2",
+            "Model generated from CAD.\nWalls: {}\nDoors: {}\nWindows: {}\nSnapshots:\n{}".format(
+                len(out.get("geometry", {}).get("wall_ids", [])),
+                len(out.get("geometry", {}).get("door_ids", [])),
+                len(out.get("geometry", {}).get("window_ids", [])),
+                snapshot.run_dir,
+            ),
+        )
+
+    except OperationCanceledException:
+        snapshot.log("Canceled by user")
+        TaskDialog.Show("Create From CAD V2", "Canceled.\nSnapshots:\n{}".format(snapshot.run_dir))
+    except Exception as ex:
+        snapshot.save_error("v2_pipeline", ex)
+        TaskDialog.Show("Create From CAD V2", "CAD recognition failed.\n{}\n\nSnapshots:\n{}".format(ex, snapshot.run_dir))
+        # If we imported this run and failed, keep CAD so user can inspect/debug.
+
+
+if __name__ == "__main__":
+    run_command()

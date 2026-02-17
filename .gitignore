@@ -1,0 +1,12 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Debug snapshots
+snapshots/
+*.snapshot.json
+
+# OS files
+.DS_Store
+Thumbs.db
