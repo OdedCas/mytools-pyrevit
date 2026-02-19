@@ -54,6 +54,25 @@ File: `v2_cad_recognition.py`
   - `internal_wall_dangling_max_cm`
   - `internal_wall_perimeter_parallel_tol_cm`
   - `internal_wall_perimeter_parallel_angle_deg`
+  - `internal_wall_source_exclude_layer_tokens`
+  - `internal_wall_include_unpaired_singles`
+  - `internal_wall_unpaired_single_min_len_cm`
+
+### 5b) Internal wall source graph improved
+File: `v2_cad_recognition.py`
+- Internal walls are no longer detected only from perimeter solve graph.
+- Source now combines:
+  - paired centerlines
+  - unpaired-pair centerlines
+  - optional long unpaired singles inside polygon
+- Dimension/annotation layer tokens are excluded from internal wall source.
+- Added debug fields:
+  - `internal_wall_source_mode`
+  - `internal_wall_source_line_count`
+  - `internal_wall_source_unpaired_pair_count`
+  - `internal_wall_source_unpaired_single_count`
+  - `internal_wall_graph_node_count`
+  - `internal_wall_graph_segment_count`
 
 ### 6) Internal wall rejection tuning in model stage
 File: `script.py`

@@ -2530,12 +2530,74 @@ def recognize_topology(classified, cfg):
                 "synthetic": True,
             })
 
-    # Detect internal partition walls (edges inside the outer polygon)
-    all_bridge_segs = [{"a": br["a"], "b": br["b"], "bridged": True} for br in bridges]
+    # Detect internal partition walls from a richer centerline graph:
+    # perimeter solve may run in centerlines_only (paired lines only), which
+    # can miss real internal walls drawn as unpaired lines.
+    internal_source_mode = "solve_graph"
+    internal_source_lines = list(wall_lines)
+    internal_source_unpaired_single_count = 0
+    internal_source_unpaired_pair_count = 0
+    if pairs:
+        used_in_pairs = set()
+        for pi, pj in pairs:
+            used_in_pairs.add(int(pi))
+            used_in_pairs.add(int(pj))
+
+        paired_centerlines = _collapse_to_centerlines(wall_lines_raw, pairs, include_unpaired=False)
+        unpaired_lines = []
+        for li, ln in enumerate(wall_lines_raw):
+            if li in used_in_pairs:
+                continue
+            unpaired_lines.append(ln)
+
+        exclude_tokens = list(cfg.get("internal_wall_source_exclude_layer_tokens", ["dim", "dimension", "text", "annotation"]) or [])
+        exclude_tokens = [str(t).strip().lower() for t in exclude_tokens if str(t).strip()]
+        filtered_unpaired = []
+        for ln in unpaired_lines:
+            layer = str(ln.get("layer", "")).lower()
+            blocked = False
+            for tok in exclude_tokens:
+                if tok and (tok in layer):
+                    blocked = True
+                    break
+            if blocked:
+                continue
+            filtered_unpaired.append(ln)
+
+        # Keep only unpaired geometry that still behaves like wall traces
+        # (has a valid parallel pair); this drops most dimension/noise lines.
+        unpaired_pairs, _, _ = _find_wall_pairs(filtered_unpaired, cfg)
+        unpaired_centerlines = []
+        if unpaired_pairs:
+            unpaired_centerlines = _collapse_to_centerlines(filtered_unpaired, unpaired_pairs, include_unpaired=False)
+        internal_source_unpaired_pair_count = len(unpaired_centerlines)
+
+        # Also allow long unpaired single traces inside the room. This recovers
+        # partitions when one side of a double-wall trace is missing/noisy.
+        include_unpaired_singles = bool(cfg.get("internal_wall_include_unpaired_singles", True))
+        single_min_len_cm = float(cfg.get("internal_wall_unpaired_single_min_len_cm", 80.0))
+        unpaired_singles = []
+        if include_unpaired_singles:
+            for ln in filtered_unpaired:
+                if _line_len(ln) < single_min_len_cm:
+                    continue
+                mx, my = _line_mid(ln)
+                if not _point_in_poly(mx, my, poly):
+                    continue
+                unpaired_singles.append(ln)
+        internal_source_unpaired_single_count = len(unpaired_singles)
+
+        internal_source_lines = _merge_unique_lines(paired_centerlines, _merge_unique_lines(unpaired_centerlines, unpaired_singles))
+        internal_source_mode = "paired_centerlines_plus_unpaired_pairs_and_singles"
+
+    snap_cm = float(cfg.get("endpoint_snap_mm", 4.0)) / 10.0
+    min_len_cm = float(cfg.get("min_segment_mm", 8.0)) / 10.0
+    internal_nodes, internal_segs = _build_graph(internal_source_lines, snap_cm, min_len_cm)
+    all_bridge_segs = []
     internal_walls, internal_wall_stats = _find_internal_walls(
         poly,
-        nodes,
-        segs,
+        internal_nodes,
+        internal_segs,
         all_bridge_segs,
         snap_tol=float(cfg.get("internal_wall_snap_tol_cm", 2.0)),
         min_len_cm=float(cfg.get("internal_wall_min_length_cm", 30.0)),
@@ -2586,6 +2648,12 @@ def recognize_topology(classified, cfg):
         "graph_node_count": len(nodes),
         "graph_segment_count": len(segs),
         "bridged_count": len(bridges),
+        "internal_wall_source_mode": internal_source_mode,
+        "internal_wall_source_line_count": len(internal_source_lines),
+        "internal_wall_source_unpaired_pair_count": int(internal_source_unpaired_pair_count),
+        "internal_wall_source_unpaired_single_count": int(internal_source_unpaired_single_count),
+        "internal_wall_graph_node_count": len(internal_nodes),
+        "internal_wall_graph_segment_count": len(internal_segs),
         "cycle_count": len(cycles),
         "picked_area_cm2": picked["area"],
         "picked_support": picked["support"],

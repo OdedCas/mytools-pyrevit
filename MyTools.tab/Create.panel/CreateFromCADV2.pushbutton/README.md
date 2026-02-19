@@ -19,8 +19,12 @@ Converts CAD linework (DWG/DXF) into Revit model elements:
 - `opening_symbol_require_visible_geometry: true`
 - `opening_host_fallback_max_dist_cm: 180.0`
 - `model_skip_low_confidence_openings: false`
-- `internal_wall_perimeter_parallel_tol_cm: 10.0`
+- `internal_wall_perimeter_parallel_tol_cm: 20.0`
 - `internal_wall_perimeter_parallel_angle_deg: 8.0`
+- `internal_wall_source_exclude_layer_tokens: ["dim","dimension","text","annotation"]`
+- `internal_wall_include_unpaired_singles: true`
+- `internal_wall_unpaired_single_min_len_cm: 80.0`
+- `internal_wall_min_length_cm: 80.0`
 - `internal_wall_endpoint_snap_cm: 6.0`
 - `internal_wall_dangling_max_cm: 35.0`
 
@@ -41,4 +45,3 @@ If internal walls are noisy:
 1. Increase `internal_wall_min_length_cm`
 2. Increase `internal_wall_perimeter_parallel_tol_cm`
 3. Reduce `internal_wall_dangling_max_cm`
-
