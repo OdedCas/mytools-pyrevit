@@ -74,6 +74,30 @@ File: `v2_cad_recognition.py`
   - `internal_wall_graph_node_count`
   - `internal_wall_graph_segment_count`
 
+### 5c) Perimeter cycle scoring upgraded
+File: `v2_cad_recognition.py`
+- Perimeter loop selection now uses a weighted score instead of only
+  nested/support heuristics.
+- Score favors:
+  - larger area
+  - opening support
+- Score penalizes:
+  - short edges
+  - jog/notch artifacts
+  - self-intersections
+  - excessive edge complexity
+- New config keys:
+  - `perimeter_min_seg_cm`
+  - `perimeter_notch_axis_tol_deg`
+  - `perimeter_target_edges`
+  - `perimeter_score_area_w`
+  - `perimeter_score_support_w`
+  - `perimeter_score_short_w`
+  - `perimeter_score_jog_w`
+  - `perimeter_score_notch_w`
+  - `perimeter_score_self_touch_w`
+  - `perimeter_score_complexity_w`
+
 ### 6) Internal wall rejection tuning in model stage
 File: `script.py`
 - Internal walls near and parallel to perimeter are rejected before creation.
@@ -100,6 +124,12 @@ File: `script.py`
 ### `03_topology.json`
 - `openings[*].center_x_cm`
 - `openings[*].center_y_cm`
+- `debug.perimeter_candidate_count`
+- `debug.perimeter_selected_score`
+- `debug.perimeter_short_edge_count`
+- `debug.perimeter_jog_count`
+- `debug.perimeter_notch_count`
+- `debug.perimeter_self_touch_count`
 - `debug.internal_wall_candidate_count`
 - `debug.internal_wall_rejected_boundary_count`
 - `debug.internal_wall_rejected_outside_count`

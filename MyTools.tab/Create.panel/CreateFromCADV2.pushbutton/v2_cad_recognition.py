@@ -1609,11 +1609,41 @@ def _opening_from_window_pattern(all_lines, edges, cfg):
 
 def _pick_room_cycle(cycles, nodes, classified, cfg):
     min_area = float(cfg.get("polygon_min_area_cm2", 6000.0))
+    min_seg_cm = float(cfg.get("perimeter_min_seg_cm", 35.0))
+    notch_axis_tol_deg = float(cfg.get("perimeter_notch_axis_tol_deg", 12.0))
 
     door_lines = classified.get("door_lines") or []
     win_lines = classified.get("window_lines") or []
     all_opening_lines = list(door_lines) + list(win_lines)
     all_opening_arcs = list(classified.get("door_arcs") or []) + list(classified.get("window_arcs") or [])
+
+    def _seg_intersect(a, b, c, d):
+        def _orient(p, q, r):
+            return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+        o1 = _orient(a, b, c)
+        o2 = _orient(a, b, d)
+        o3 = _orient(c, d, a)
+        o4 = _orient(c, d, b)
+        return (o1 * o2 < 0.0) and (o3 * o4 < 0.0)
+
+    def _self_intersection_count(poly):
+        if len(poly) < 4:
+            return 0
+        segs = []
+        n = len(poly)
+        for i in range(n):
+            segs.append((poly[i], poly[(i + 1) % n], i))
+        count = 0
+        for i in range(len(segs)):
+            a1, a2, ai = segs[i]
+            for j in range(i + 1, len(segs)):
+                b1, b2, bj = segs[j]
+                if abs(ai - bj) <= 1 or abs(ai - bj) >= (n - 1):
+                    continue
+                if _seg_intersect(a1, a2, b1, b2):
+                    count += 1
+        return count
 
     scored = []
     for cyc in cycles:
@@ -1648,49 +1678,104 @@ def _pick_room_cycle(cycles, nodes, classified, cfg):
             if dmin <= 100.0:
                 support += 1
 
+        perim = 0.0
+        short_count = 0
+        short_total = 0.0
+        notch_count = 0
+        jog_count = 0
+        n_edges = len(edges)
+        for i in range(n_edges):
+            e = edges[i]
+            el = float(e.get("len", 0.0))
+            perim += el
+            if el < min_seg_cm:
+                short_count += 1
+                short_total += el
+                prev_e = edges[(i - 1) % n_edges]
+                next_e = edges[(i + 1) % n_edges]
+                if _angle_delta_axis(prev_e.get("ang", 0.0), next_e.get("ang", 0.0)) <= notch_axis_tol_deg:
+                    notch_count += 1
+                # Tiny edge + meaningful turn = jog artifact.
+                if _angle_delta(prev_e.get("ang", 0.0), e.get("ang", 0.0)) >= 20.0:
+                    jog_count += 1
+                if _angle_delta(e.get("ang", 0.0), next_e.get("ang", 0.0)) >= 20.0:
+                    jog_count += 1
+
+        self_touch_count = _self_intersection_count(pts)
+
         scored.append({
             "poly": pts,
             "area": area,
             "support": support,
             "centroid": _poly_centroid(pts),
             "probe": _inner_probe_point(pts, _poly_centroid(pts)),
+            "perimeter_cm": perim,
+            "short_edge_count": short_count,
+            "short_edge_total_cm": short_total,
+            "notch_count": notch_count,
+            "jog_count": jog_count,
+            "self_touch_count": self_touch_count,
+            "edge_count": len(edges),
         })
 
     if not scored:
         return None
 
-    # Determine nesting: inner room loops are usually contained by an outer wall loop.
-    for i in range(len(scored)):
-        contains_count = 0
-        px, py = scored[i]["probe"]
-        for j in range(len(scored)):
-            if i == j:
+    max_area = max([float(s.get("area", 0.0)) for s in scored] or [1.0])
+    max_support = max([int(s.get("support", 0)) for s in scored] or [0])
+    max_edge_count = max([int(s.get("edge_count", 0)) for s in scored] or [1])
+
+    area_w = float(cfg.get("perimeter_score_area_w", 1.0))
+    support_w = float(cfg.get("perimeter_score_support_w", 0.35))
+    short_w = float(cfg.get("perimeter_score_short_w", 2.0))
+    jog_w = float(cfg.get("perimeter_score_jog_w", 1.2))
+    notch_w = float(cfg.get("perimeter_score_notch_w", 1.4))
+    self_w = float(cfg.get("perimeter_score_self_touch_w", 2.5))
+    complexity_w = float(cfg.get("perimeter_score_complexity_w", 0.2))
+    target_edges = int(cfg.get("perimeter_target_edges", 22))
+
+    best = None
+    for s in scored:
+        area_norm = float(s["area"]) / max(max_area, 1.0)
+        support_norm = 0.0
+        if max_support > 0:
+            support_norm = float(s["support"]) / float(max_support)
+
+        perim = max(1.0, float(s.get("perimeter_cm", 1.0)))
+        short_pen = float(s.get("short_edge_total_cm", 0.0)) / perim
+        jog_pen = float(s.get("jog_count", 0)) / float(max(1, int(s.get("edge_count", 1))))
+        notch_pen = float(s.get("notch_count", 0)) / float(max(1, int(s.get("edge_count", 1))))
+        self_pen = float(s.get("self_touch_count", 0))
+        complexity_pen = max(0.0, float(int(s.get("edge_count", 0)) - target_edges) / float(max(1, max_edge_count)))
+
+        score = (
+            (area_w * area_norm)
+            + (support_w * support_norm)
+            - (short_w * short_pen)
+            - (jog_w * jog_pen)
+            - (notch_w * notch_pen)
+            - (self_w * self_pen)
+            - (complexity_w * complexity_pen)
+        )
+        s["score"] = score
+
+        if best is None:
+            best = s
+            continue
+        if score > float(best.get("score", -1.0e12)) + 1.0e-9:
+            best = s
+            continue
+        if _abs(score - float(best.get("score", 0.0))) <= 1.0e-9:
+            # Tiebreaker: larger area, then fewer short edges.
+            if float(s["area"]) > float(best["area"]) + 1.0e-6:
+                best = s
                 continue
-            # A polygon can only be contained by a larger-area polygon.
-            if scored[j]["area"] <= scored[i]["area"]:
-                continue
-            if _point_in_poly(px, py, scored[j]["poly"]):
-                contains_count += 1
-        scored[i]["contains_count"] = contains_count
+            if _abs(float(s["area"]) - float(best["area"])) <= 1.0e-6:
+                if int(s.get("short_edge_count", 0)) < int(best.get("short_edge_count", 0)):
+                    best = s
+                    continue
 
-    # For nested double-line walls, inner room boundary is typically a contained loop.
-    nested = [s for s in scored if s.get("contains_count", 0) > 0]
-    if nested:
-        max_support_nested = max([s["support"] for s in nested])
-        nested = [s for s in nested if s["support"] == max_support_nested]
-        nested.sort(key=lambda x: x["area"], reverse=True)
-        return nested[0]
-
-    # Prefer loops that are supported by opening geometry.
-    max_support = max([s["support"] for s in scored])
-    if max_support > 0:
-        cands = [s for s in scored if s["support"] == max_support]
-        cands.sort(key=lambda x: x["area"], reverse=True)
-        return cands[0]
-
-    # Otherwise pick the largest room-like loop.
-    scored.sort(key=lambda x: x["area"], reverse=True)
-    return scored[0]
+    return best
 
 
 def _match_dimensions_to_edges(edges, dim_lines, cfg):
@@ -2648,6 +2733,12 @@ def recognize_topology(classified, cfg):
         "graph_node_count": len(nodes),
         "graph_segment_count": len(segs),
         "bridged_count": len(bridges),
+        "perimeter_candidate_count": len(cycles),
+        "perimeter_selected_score": picked.get("score"),
+        "perimeter_short_edge_count": int(picked.get("short_edge_count", 0)),
+        "perimeter_jog_count": int(picked.get("jog_count", 0)),
+        "perimeter_notch_count": int(picked.get("notch_count", 0)),
+        "perimeter_self_touch_count": int(picked.get("self_touch_count", 0)),
         "internal_wall_source_mode": internal_source_mode,
         "internal_wall_source_line_count": len(internal_source_lines),
         "internal_wall_source_unpaired_pair_count": int(internal_source_unpaired_pair_count),
