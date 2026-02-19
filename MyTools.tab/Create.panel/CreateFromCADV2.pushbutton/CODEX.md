@@ -80,6 +80,15 @@ File: `script.py`
 - Summary includes:
   - `internal_wall_reject_breakdown`
 
+### 6b) Tiny perimeter jog collapse in model stage
+File: `script.py`
+- Wall run builder now skips very short polygon jog segments and bridges the
+  next collinear segment across them.
+- This prevents 5-20cm recognition artifacts from creating visible wall kinks.
+- New config keys:
+  - `model_wall_jog_skip_cm`
+  - `model_wall_jog_bridge_join_tol_cm`
+
 ### 7) Low-confidence opening policy switch
 File: `script.py`
 - Added flag:

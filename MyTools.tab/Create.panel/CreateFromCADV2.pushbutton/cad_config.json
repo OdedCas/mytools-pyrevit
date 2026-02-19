@@ -59,6 +59,8 @@
   "internal_wall_unpaired_single_min_len_cm": 80.0,
   "model_wall_merge_angle_deg": 2.0,
   "model_wall_join_tol_cm": 1.0,
+  "model_wall_jog_skip_cm": 20.0,
+  "model_wall_jog_bridge_join_tol_cm": 12.0,
   "model_wall_min_length_cm": 20.0,
   "model_min_opening_confidence": 0.45,
   "model_skip_low_confidence_openings": false,

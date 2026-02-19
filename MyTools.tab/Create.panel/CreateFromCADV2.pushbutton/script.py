@@ -486,6 +486,8 @@ def _angle_delta_axis_deg(a, b):
 def _build_wall_runs_from_polygon(poly_cm, cfg):
     merge_tol_deg = float(cfg.get("model_wall_merge_angle_deg", 2.0))
     join_tol_cm = float(cfg.get("model_wall_join_tol_cm", 1.0))
+    jog_skip_cm = float(cfg.get("model_wall_jog_skip_cm", 20.0))
+    jog_bridge_join_tol_cm = float(cfg.get("model_wall_jog_bridge_join_tol_cm", 12.0))
 
     edges = []
     n = len(poly_cm)
@@ -509,8 +511,20 @@ def _build_wall_runs_from_polygon(poly_cm, cfg):
 
     runs = []
     edge_to_run = {}
+    skipped_short_since_last = False
 
     for e in edges:
+        if float(e.get("len_cm", 0.0)) < jog_skip_cm:
+            if runs:
+                edge_to_run[e["idx"]] = {
+                    "run_idx": len(runs) - 1,
+                    "offset_cm": max(0.0, float(runs[-1]["len_cm"])),
+                    "len_cm": e["len_cm"],
+                    "from_short_jog": True,
+                }
+            skipped_short_since_last = True
+            continue
+
         if not runs:
             runs.append({
                 "start": e["a"],
@@ -545,8 +559,9 @@ def _build_wall_runs_from_polygon(poly_cm, cfg):
         dot = (ldir_x * e["dir_x"]) + (ldir_y * e["dir_y"])
         ang_ok = _angle_delta_axis_deg(lang, e["ang"]) <= merge_tol_deg
         forward_ok = dot > 0.2
+        effective_join_tol_cm = jog_bridge_join_tol_cm if skipped_short_since_last else join_tol_cm
 
-        if join_dist <= join_tol_cm and ang_ok and forward_ok:
+        if join_dist <= effective_join_tol_cm and ang_ok and forward_ok:
             offset_cm = float(last["len_cm"])
             last["end"] = e["b"]
             last["len_cm"] = float(last["len_cm"]) + float(e["len_cm"])
@@ -569,6 +584,7 @@ def _build_wall_runs_from_polygon(poly_cm, cfg):
                 }],
             })
             edge_to_run[e["idx"]] = {"run_idx": run_idx, "offset_cm": 0.0, "len_cm": e["len_cm"]}
+        skipped_short_since_last = False
 
     return {
         "edges": edges,

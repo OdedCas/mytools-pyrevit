@@ -27,6 +27,8 @@ Converts CAD linework (DWG/DXF) into Revit model elements:
 - `internal_wall_min_length_cm: 80.0`
 - `internal_wall_endpoint_snap_cm: 6.0`
 - `internal_wall_dangling_max_cm: 35.0`
+- `model_wall_jog_skip_cm: 20.0`
+- `model_wall_jog_bridge_join_tol_cm: 12.0`
 
 ## Snapshot outputs
 Each run writes JSON snapshots under the configured snapshot root.
