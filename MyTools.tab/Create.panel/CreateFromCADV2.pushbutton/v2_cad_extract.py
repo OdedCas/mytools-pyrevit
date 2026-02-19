@@ -53,6 +53,16 @@ def default_config():
         "dimension_span_ratio_max": 2.5,
         "dimension_scale_min": 0.5,
         "dimension_scale_max": 2.0,
+        "enable_synthetic_window_fallback": False,
+        "internal_wall_min_length_cm": 30.0,
+        "internal_wall_snap_tol_cm": 2.0,
+        "model_wall_merge_angle_deg": 2.0,
+        "model_wall_join_tol_cm": 1.0,
+        "model_wall_min_length_cm": 20.0,
+        "model_min_opening_confidence": 0.45,
+        "model_opening_end_clearance_cm": 15.0,
+        "model_place_synthetic_openings": False,
+        "internal_wall_perimeter_duplicate_tol_cm": 12.0,
     }
 
 

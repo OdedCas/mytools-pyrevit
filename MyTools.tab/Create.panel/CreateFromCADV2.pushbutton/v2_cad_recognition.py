@@ -79,24 +79,330 @@ def _centroid_of_line_mids(lines):
     return (sx / n, sy / n)
 
 
-def _collapse_double_wall_lines(lines, cfg):
-    lines = list(lines or [])
-    if len(lines) < 2:
-        return lines, {
-            "input_count": len(lines),
-            "output_count": len(lines),
-            "paired_count": 0,
-            "estimated_wall_thickness_cm": None,
-        }
+def _merge_collinear_overlapping(lines, perp_tol=5.0, gap_tol=2.0):
+    """Merge overlapping collinear lines into maximal segments.
 
+    Groups lines by direction (H/V/diagonal) and perpendicular position.
+    Lines in the same group that overlap or nearly touch are merged into
+    one line spanning their combined extent.
+    """
+    if not lines or len(lines) < 2:
+        return list(lines or [])
+
+    # For each line, compute: axis unit vector, perpendicular offset, projection range
+    entries = []
+    for idx, ln in enumerate(lines):
+        x1 = float(ln["x1"])
+        y1 = float(ln["y1"])
+        x2 = float(ln["x2"])
+        y2 = float(ln["y2"])
+        dx = x2 - x1
+        dy = y2 - y1
+        length = math.sqrt(dx * dx + dy * dy)
+        if length < 0.5:
+            entries.append(None)
+            continue
+        # Normalize direction: always point in positive-x direction
+        # (or positive-y if vertical)
+        ux = dx / length
+        uy = dy / length
+        if ux < -1e-9 or (abs(ux) < 1e-9 and uy < 0):
+            ux, uy = -ux, -uy
+        # Perpendicular offset from origin (signed distance)
+        perp = -uy * x1 + ux * y1
+        # Projection range along axis
+        proj1 = ux * x1 + uy * y1
+        proj2 = ux * x2 + uy * y2
+        pmin = min(proj1, proj2)
+        pmax = max(proj1, proj2)
+        # Angle bucket (rounded to 1 degree)
+        ang = round(math.degrees(math.atan2(uy, ux)))
+        entries.append({
+            "idx": idx, "ux": ux, "uy": uy,
+            "perp": perp, "pmin": pmin, "pmax": pmax,
+            "ang": ang, "ln": ln,
+        })
+
+    # Group by angle bucket (within 2 degrees)
+    from collections import defaultdict
+    angle_groups = defaultdict(list)
+    for e in entries:
+        if e is not None:
+            angle_groups[e["ang"]].append(e)
+
+    merged_out = []
+    used = set()
+
+    for ang_key, group in angle_groups.items():
+        # Sort by perpendicular offset
+        group.sort(key=lambda e: e["perp"])
+        # Sub-group by perpendicular proximity
+        subgroups = [[group[0]]]
+        for k in range(1, len(group)):
+            if abs(group[k]["perp"] - subgroups[-1][-1]["perp"]) <= perp_tol:
+                subgroups[-1].append(group[k])
+            else:
+                subgroups.append([group[k]])
+
+        for sg in subgroups:
+            if len(sg) == 1:
+                # No merge needed
+                continue
+            # Sort by projection start
+            sg.sort(key=lambda e: e["pmin"])
+            # Merge overlapping/touching intervals
+            merged_intervals = []
+            curr_min = sg[0]["pmin"]
+            curr_max = sg[0]["pmax"]
+            curr_members = [sg[0]]
+            for k in range(1, len(sg)):
+                if sg[k]["pmin"] <= curr_max + gap_tol:
+                    curr_max = max(curr_max, sg[k]["pmax"])
+                    curr_members.append(sg[k])
+                else:
+                    merged_intervals.append((curr_min, curr_max, curr_members))
+                    curr_min = sg[k]["pmin"]
+                    curr_max = sg[k]["pmax"]
+                    curr_members = [sg[k]]
+            merged_intervals.append((curr_min, curr_max, curr_members))
+
+            for pmin, pmax, members in merged_intervals:
+                if len(members) < 2:
+                    continue
+                # Mark originals as used, emit one merged line
+                for m in members:
+                    used.add(m["idx"])
+                # Average the perpendicular offset
+                avg_perp = sum(m["perp"] for m in members) / len(members)
+                ux = members[0]["ux"]
+                uy = members[0]["uy"]
+                # Reconstruct endpoints from axis projection + perp offset
+                # Point = proj * (ux, uy) + perp * (-uy, ux)  [since perp = -uy*x + ux*y]
+                # Actually: x = ux*proj + (-uy)*perp, y = uy*proj + ux*perp
+                nx = -uy  # perp direction x
+                ny = ux   # perp direction y
+                x1 = ux * pmin + nx * avg_perp
+                y1 = uy * pmin + ny * avg_perp
+                x2 = ux * pmax + nx * avg_perp
+                y2 = uy * pmax + ny * avg_perp
+                merged_out.append({
+                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                    "layer": members[0]["ln"].get("layer", ""),
+                    "type": "line",
+                })
+
+    # Add non-merged lines
+    for idx, ln in enumerate(lines):
+        if idx not in used:
+            merged_out.append(ln)
+
+    return merged_out
+
+
+def _extend_to_intersections(lines, ext_tol=50.0):
+    """Extend/trim centerlines to meet at intersections with perpendicular lines.
+
+    For each pair of roughly-perpendicular lines whose theoretical intersection
+    is close to both endpoints, extend both lines to the intersection point.
+    This connects walls at corners and T-junctions.
+    """
+    if not lines or len(lines) < 2:
+        return list(lines or [])
+
+    # Parse lines into (x1,y1,x2,y2,ux,uy,length) tuples
+    parsed = []
+    for ln in lines:
+        x1 = float(ln["x1"])
+        y1 = float(ln["y1"])
+        x2 = float(ln["x2"])
+        y2 = float(ln["y2"])
+        dx = x2 - x1
+        dy = y2 - y1
+        length = math.sqrt(dx * dx + dy * dy)
+        if length < 1.0:
+            parsed.append(None)
+            continue
+        parsed.append((x1, y1, x2, y2, dx / length, dy / length, length))
+
+    # For each line, track extension points at each end
+    # end_extensions[i] = {"start": [(x,y),...], "end": [(x,y),...]}
+    end_ext = [{"start": [], "end": []} for _ in lines]
+
+    for i in range(len(lines)):
+        if parsed[i] is None:
+            continue
+        x1i, y1i, x2i, y2i, uxi, uyi, leni = parsed[i]
+        for j in range(i + 1, len(lines)):
+            if parsed[j] is None:
+                continue
+            x1j, y1j, x2j, y2j, uxj, uyj, lenj = parsed[j]
+
+            # Check roughly perpendicular (angle between 60-120 degrees)
+            dot = abs(uxi * uxj + uyi * uyj)
+            if dot > 0.5:  # cos(60°) = 0.5
+                continue
+
+            # Find intersection of infinite lines
+            # Line i: P = (x1i,y1i) + t*(uxi,uyi)
+            # Line j: P = (x1j,y1j) + s*(uxj,uyj)
+            # Solve: x1i + t*uxi = x1j + s*uxj  and  y1i + t*uyi = y1j + s*uyj
+            denom = uxi * uyj - uyi * uxj
+            if abs(denom) < 1e-9:
+                continue
+            dx0 = x1j - x1i
+            dy0 = y1j - y1i
+            t = (dx0 * uyj - dy0 * uxj) / denom
+            s = (dx0 * uyi - dy0 * uxi) / denom
+
+            ix = x1i + t * uxi
+            iy = y1i + t * uyi
+
+            # Check if intersection is near the end of line i (within ext_tol)
+            # t=0 is start, t=leni is end
+            if t < -ext_tol or t > leni + ext_tol:
+                continue
+            if s < -ext_tol or s > lenj + ext_tol:
+                continue
+
+            # Extend line i: if intersection is beyond start/end
+            if t < 0:
+                end_ext[i]["start"].append((ix, iy, -t))
+            elif t > leni:
+                end_ext[i]["end"].append((ix, iy, t - leni))
+            # Similarly for line j
+            if s < 0:
+                end_ext[j]["start"].append((ix, iy, -s))
+            elif s > lenj:
+                end_ext[j]["end"].append((ix, iy, s - lenj))
+
+    # Apply extensions: pick the closest intersection at each end
+    out = []
+    for i, ln in enumerate(lines):
+        if parsed[i] is None:
+            out.append(ln)
+            continue
+        x1, y1, x2, y2 = parsed[i][0], parsed[i][1], parsed[i][2], parsed[i][3]
+        # Extend start (closest intersection)
+        starts = end_ext[i]["start"]
+        if starts:
+            best = min(starts, key=lambda p: p[2])
+            if best[2] <= ext_tol:
+                x1, y1 = best[0], best[1]
+        # Extend end
+        ends = end_ext[i]["end"]
+        if ends:
+            best = min(ends, key=lambda p: p[2])
+            if best[2] <= ext_tol:
+                x2, y2 = best[0], best[1]
+        out.append({
+            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+            "layer": ln.get("layer", ""),
+            "type": "line",
+        })
+    return out
+
+
+def _split_at_crossings(lines, tol=2.0):
+    """Split lines at mutual intersection points to create a connected graph.
+
+    When two non-parallel lines cross each other (not at endpoints), both
+    are split at the crossing point so the graph builder can connect them.
+    """
+    if not lines or len(lines) < 2:
+        return list(lines or [])
+
+    parsed = []
+    for ln in lines:
+        x1 = float(ln["x1"])
+        y1 = float(ln["y1"])
+        x2 = float(ln["x2"])
+        y2 = float(ln["y2"])
+        dx = x2 - x1
+        dy = y2 - y1
+        length = math.sqrt(dx * dx + dy * dy)
+        parsed.append((x1, y1, x2, y2, dx, dy, length))
+
+    # For each line, collect split parameters (0..1)
+    splits = [[] for _ in lines]
+
+    for i in range(len(lines)):
+        x1i, y1i, x2i, y2i, dxi, dyi, leni = parsed[i]
+        if leni < 1.0:
+            continue
+        for j in range(i + 1, len(lines)):
+            x1j, y1j, x2j, y2j, dxj, dyj, lenj = parsed[j]
+            if lenj < 1.0:
+                continue
+
+            # Check not parallel
+            denom = dxi * dyj - dyi * dxj
+            if abs(denom) < 1e-9:
+                continue
+
+            dx0 = x1j - x1i
+            dy0 = y1j - y1i
+            t = (dx0 * dyj - dy0 * dxj) / denom
+            s = (dx0 * dyi - dy0 * dxi) / denom
+
+            # Check intersection is on each segment (with end margin).
+            # A line is only split if the crossing is in its interior
+            # (not at its endpoints). But if line A's interior crosses
+            # line B at B's endpoint, A is still split — only B is skipped.
+            end_margin_i = tol / max(leni, 1.0)
+            t_interior = end_margin_i < t < 1.0 - end_margin_i
+            end_margin_j = tol / max(lenj, 1.0)
+            s_interior = end_margin_j < s < 1.0 - end_margin_j
+            # At least one must be interior; the other must be on-segment
+            t_on = -0.01 <= t <= 1.01
+            s_on = -0.01 <= s <= 1.01
+            if not (t_on and s_on):
+                continue
+            if not (t_interior or s_interior):
+                continue
+
+            if t_interior:
+                splits[i].append(t)
+            if s_interior:
+                splits[j].append(s)
+
+    # Build output with split lines
+    out = []
+    for i, ln in enumerate(lines):
+        if not splits[i]:
+            out.append(ln)
+            continue
+        x1, y1, x2, y2 = parsed[i][0], parsed[i][1], parsed[i][2], parsed[i][3]
+        # Sort split params and add endpoints
+        params = sorted(set(splits[i]))
+        params = [0.0] + params + [1.0]
+        layer = ln.get("layer", "")
+        for k in range(len(params) - 1):
+            t0 = params[k]
+            t1 = params[k + 1]
+            sx1 = x1 + (x2 - x1) * t0
+            sy1 = y1 + (y2 - y1) * t0
+            sx2 = x1 + (x2 - x1) * t1
+            sy2 = y1 + (y2 - y1) * t1
+            seg_len = math.sqrt((sx2 - sx1) ** 2 + (sy2 - sy1) ** 2)
+            if seg_len >= 1.0:
+                out.append({
+                    "x1": sx1, "y1": sy1, "x2": sx2, "y2": sy2,
+                    "layer": layer, "type": "line",
+                })
+    return out
+
+
+def _find_wall_pairs(lines, cfg):
+    """Find parallel line pairs that represent double-line walls.
+
+    Returns (selected_pairs, pair_dists, used_indices) where each pair is (i, j).
+    """
     default_wall = float((cfg or {}).get("default_wall_thickness_cm", 20.0))
     min_dist = float((cfg or {}).get("double_wall_pair_min_cm", max(4.0, default_wall * 0.25)))
     max_dist = float((cfg or {}).get("double_wall_pair_max_cm", max(45.0, default_wall * 2.5)))
     angle_tol = float((cfg or {}).get("double_wall_pair_angle_deg", 8.0))
     min_overlap_cm = float((cfg or {}).get("double_wall_pair_min_overlap_cm", 35.0))
     min_overlap_ratio = float((cfg or {}).get("double_wall_pair_overlap_ratio", 0.60))
-
-    mids_centroid = _centroid_of_line_mids(lines)
 
     candidates = []
     for i in range(len(lines)):
@@ -137,12 +443,7 @@ def _collapse_double_wall_lines(lines, cfg):
             })
 
     if not candidates:
-        return lines, {
-            "input_count": len(lines),
-            "output_count": len(lines),
-            "paired_count": 0,
-            "estimated_wall_thickness_cm": None,
-        }
+        return [], [], set()
 
     candidates.sort(key=lambda x: x["score"])
     used = set()
@@ -159,26 +460,159 @@ def _collapse_double_wall_lines(lines, cfg):
         selected_pairs.append((i, j))
         pair_dists.append(float(c["dist"]))
 
-    out = []
+    return selected_pairs, pair_dists, used
+
+
+def _collapse_to_centerlines(lines, pairs, include_unpaired=True):
+    """Collapse pairs to centerlines (average of the two parallel lines).
+
+    When include_unpaired is False, only centerlines are returned (no noise
+    from door frames, crossbars, or other non-wall geometry).
+    """
     used_in_pairs = set()
-    for i, j in selected_pairs:
+    for i, j in pairs:
         used_in_pairs.add(i)
         used_in_pairs.add(j)
+
+    out = []
+    for i, j in pairs:
         li = lines[i]
         lj = lines[j]
+        ix1, iy1 = float(li["x1"]), float(li["y1"])
+        ix2, iy2 = float(li["x2"]), float(li["y2"])
+        jx1, jy1 = float(lj["x1"]), float(lj["y1"])
+        jx2, jy2 = float(lj["x2"]), float(lj["y2"])
+
+        # Compute centerline position (perpendicular midpoint)
+        dx = ix2 - ix1
+        dy = iy2 - iy1
+        length_i = math.sqrt(dx * dx + dy * dy)
+        if length_i < 1.0:
+            continue
+        ux = dx / length_i
+        uy = dy / length_i
+
+        # Centerline perpendicular position: average of both lines' midpoints
+        # projected onto the normal
+        nx = -uy
+        ny = ux
         mi = _line_mid(li)
         mj = _line_mid(lj)
+        perp_i = mi[0] * nx + mi[1] * ny
+        perp_j = mj[0] * nx + mj[1] * ny
+        center_perp = (perp_i + perp_j) * 0.5
 
-        dci = math.sqrt(((mi[0] - mids_centroid[0]) ** 2) + ((mi[1] - mids_centroid[1]) ** 2))
-        dcj = math.sqrt(((mj[0] - mids_centroid[0]) ** 2) + ((mj[1] - mids_centroid[1]) ** 2))
-        # Keep the inner trace (closer to room centroid) and drop its parallel outer mate.
-        keep = li if dci <= dcj else lj
-        out.append(keep)
+        # Project ALL 4 endpoints onto the axis direction and take max extent
+        projs = [
+            ix1 * ux + iy1 * uy,
+            ix2 * ux + iy2 * uy,
+            jx1 * ux + jy1 * uy,
+            jx2 * ux + jy2 * uy,
+        ]
+        proj_min = min(projs)
+        proj_max = max(projs)
+
+        # Reconstruct endpoints on centerline
+        cx1 = ux * proj_min + nx * center_perp
+        cy1 = uy * proj_min + ny * center_perp
+        cx2 = ux * proj_max + nx * center_perp
+        cy2 = uy * proj_max + ny * center_perp
+
+        out.append({
+            "x1": cx1, "y1": cy1, "x2": cx2, "y2": cy2,
+            "layer": li.get("layer", ""),
+            "type": "line",
+        })
+
+    # Merge overlapping collinear centerlines into maximal segments.
+    # This handles cases where multiple pairs generate overlapping
+    # centerlines for the same physical wall (common in multi-room plans).
+    out = _merge_collinear_overlapping(out, perp_tol=5.0, gap_tol=2.0)
+
+    # Extend centerlines to meet at perpendicular intersections.
+    # This connects walls at corners and T-junctions where endpoints
+    # don't exactly match due to inner/outer wall length differences.
+    out = _extend_to_intersections(out, ext_tol=50.0)
+
+    # Split lines at crossing points so the graph builder connects them.
+    # After merge+extend, centerlines may cross each other in the middle
+    # (e.g., a long wall passing through a perpendicular wall's midpoint).
+    out = _split_at_crossings(out, tol=2.0)
+
+    if include_unpaired:
+        for idx, ln in enumerate(lines):
+            if idx not in used_in_pairs:
+                out.append(ln)
+    return out
+
+
+def _collapse_pick_inner(lines, pairs, centroid):
+    """Pick the inner line from each pair.
+
+    Primary heuristic: the shorter line is the inner wall (outer walls wrap
+    around corners and are typically longer).
+    Tiebreaker: the line closer to *centroid* is the inner wall.
+    """
+    used_in_pairs = set()
+    for i, j in pairs:
+        used_in_pairs.add(i)
+        used_in_pairs.add(j)
+
+    out = []
+    cx, cy = centroid
+    for i, j in pairs:
+        li = lines[i]
+        lj = lines[j]
+        len_i = _line_len(li)
+        len_j = _line_len(lj)
+        # If length difference > 5%, shorter = inner
+        if len_i < len_j * 0.95:
+            out.append(li)
+        elif len_j < len_i * 0.95:
+            out.append(lj)
+        else:
+            # Same length: use centroid distance
+            mi = _line_mid(li)
+            mj = _line_mid(lj)
+            dci = math.sqrt((mi[0] - cx) ** 2 + (mi[1] - cy) ** 2)
+            dcj = math.sqrt((mj[0] - cx) ** 2 + (mj[1] - cy) ** 2)
+            out.append(li if dci <= dcj else lj)
 
     for idx, ln in enumerate(lines):
-        if idx in used_in_pairs:
-            continue
-        out.append(ln)
+        if idx not in used_in_pairs:
+            out.append(ln)
+    return out
+
+
+def _collapse_double_wall_lines(lines, cfg):
+    """Two-pass double-wall collapse that handles L/T/U shapes.
+
+    Pass 1: Collapse to centerlines, find cycle, get polygon centroid.
+    Pass 2: Use centroid to pick correct inner line from each pair.
+    """
+    lines = list(lines or [])
+    if len(lines) < 2:
+        return lines, {
+            "input_count": len(lines),
+            "output_count": len(lines),
+            "paired_count": 0,
+            "estimated_wall_thickness_cm": None,
+            "pairs": [],
+        }
+
+    selected_pairs, pair_dists, used = _find_wall_pairs(lines, cfg)
+
+    if not selected_pairs:
+        return lines, {
+            "input_count": len(lines),
+            "output_count": len(lines),
+            "paired_count": 0,
+            "estimated_wall_thickness_cm": None,
+            "pairs": [],
+        }
+
+    # Use centerlines as initial collapse (works for any shape)
+    centerline_out = _collapse_to_centerlines(lines, selected_pairs)
 
     est = None
     if pair_dists:
@@ -189,11 +623,12 @@ def _collapse_double_wall_lines(lines, cfg):
         else:
             est = (ds[m - 1] + ds[m]) * 0.5
 
-    return out, {
+    return centerline_out, {
         "input_count": len(lines),
-        "output_count": len(out),
+        "output_count": len(centerline_out),
         "paired_count": len(selected_pairs),
         "estimated_wall_thickness_cm": est,
+        "pairs": selected_pairs,
     }
 
 
@@ -964,6 +1399,12 @@ def _opening_from_bridges(bridges, nodes, edges):
 
 
 def _merge_openings(cands, min_sep_cm):
+    """Merge overlapping detections of the same opening, but preserve
+    distinct openings separated by > min_sep_cm.
+
+    After merging overlaps, split back apart if the merged interval
+    is suspiciously wide (> 1.8x the widest contributing candidate).
+    """
     groups = {}
     for c in (cands or []):
         k = (c.get("type"), int(c.get("host_edge", -1)))
@@ -973,9 +1414,12 @@ def _merge_openings(cands, min_sep_cm):
     for _, arr in groups.items():
         arr = sorted(arr, key=lambda x: (x["start_cm"], -x.get("confidence", 0.0)))
         merged = []
+        # Track contributing candidates for each merged group
+        contrib = []
         for c in arr:
             if not merged:
                 merged.append(dict(c))
+                contrib.append([dict(c)])
                 continue
             p = merged[-1]
             if c["start_cm"] <= (p["end_cm"] + min_sep_cm):
@@ -983,9 +1427,20 @@ def _merge_openings(cands, min_sep_cm):
                 p["end_cm"] = max(p["end_cm"], c["end_cm"])
                 p["width_cm"] = p["end_cm"] - p["start_cm"]
                 p["confidence"] = max(p.get("confidence", 0.0), c.get("confidence", 0.0))
+                contrib[-1].append(dict(c))
             else:
                 merged.append(dict(c))
-        out.extend(merged)
+                contrib.append([dict(c)])
+
+        # Split-back: if merged width is >1.8x widest contributor, keep individuals
+        for i, m in enumerate(merged):
+            max_contrib_w = max(c.get("width_cm", 1.0) for c in contrib[i])
+            if m["width_cm"] > max_contrib_w * 1.8 and len(contrib[i]) >= 2:
+                # Restore individual candidates instead of merged blob
+                for c in contrib[i]:
+                    out.append(c)
+            else:
+                out.append(m)
 
     return sorted(out, key=lambda x: (x.get("host_edge", -1), x.get("start_cm", 0.0), x.get("type", "")))
 
@@ -1026,13 +1481,13 @@ def _opening_from_edge_gaps(edges, support_lines, host_tol_cm, min_w, max_w):
                 merged.append([s, t])
 
         cursor = 0.0
+        edge_gaps = []
         for s, t in merged:
             if s > cursor:
                 gw = s - cursor
                 if gw >= min_w and gw <= max_w:
-                    kind = "door" if gw <= 130.0 else "window"
-                    out.append({
-                        "type": kind,
+                    edge_gaps.append({
+                        "type": "door",  # provisional, refined below
                         "host_edge": e["idx"],
                         "start_cm": cursor,
                         "end_cm": s,
@@ -1045,9 +1500,8 @@ def _opening_from_edge_gaps(edges, support_lines, host_tol_cm, min_w, max_w):
         if cursor < e["len"]:
             gw = e["len"] - cursor
             if gw >= min_w and gw <= max_w:
-                kind = "door" if gw <= 130.0 else "window"
-                out.append({
-                    "type": kind,
+                edge_gaps.append({
+                    "type": "door",
                     "host_edge": e["idx"],
                     "start_cm": cursor,
                     "end_cm": e["len"],
@@ -1055,6 +1509,100 @@ def _opening_from_edge_gaps(edges, support_lines, host_tol_cm, min_w, max_w):
                     "confidence": 0.45,
                     "from_gap": True,
                 })
+
+        # Multiple gaps on the same edge are likely all windows, not doors.
+        # A single gap <= 130cm is a door; wider is a window.
+        if len(edge_gaps) >= 2:
+            for g in edge_gaps:
+                g["type"] = "window"
+        else:
+            for g in edge_gaps:
+                g["type"] = "door" if g["width_cm"] <= 130.0 else "window"
+
+        out.extend(edge_gaps)
+
+    return out
+
+
+def _opening_from_window_pattern(all_lines, edges, cfg):
+    """Detect windows from clusters of short lines perpendicular to wall edges.
+
+    Israeli DWG windows typically appear as 2+ short perpendicular lines
+    (glass panes / mullions) within a gap in the wall.
+    """
+    perp_tol = float(cfg.get("window_pattern_perp_angle_tol_deg", 20.0))
+    min_count = int(cfg.get("window_pattern_min_line_count", 2))
+    host_dist = float(cfg.get("window_pattern_host_distance_cm", 30.0))
+    min_w = float(cfg.get("window_pattern_min_width_cm", 40.0))
+    max_w = float(cfg.get("window_pattern_max_width_cm", 200.0))
+    max_line_len = float(cfg.get("window_pattern_max_line_length_cm", 25.0))
+
+    out = []
+    for e in (edges or []):
+        eang = float(e.get("ang", 0.0))
+        ea = e["a"]
+        eb = e["b"]
+        elen = float(e.get("len", 0.0))
+        if elen < min_w:
+            continue
+
+        # Find short lines perpendicular to this edge and close to it
+        perp_projs = []
+        for ln in (all_lines or []):
+            length = _line_len(ln)
+            if length > max_line_len or length < 1.0:
+                continue
+            ang = _line_axis_angle_deg(ln)
+            delta = _angle_delta_axis(ang, eang)
+            if abs(delta - 90.0) > perp_tol:
+                continue
+
+            mx, my = _line_mid(ln)
+            d, _ = _dist_pt_seg(mx, my, ea[0], ea[1], eb[0], eb[1])
+            if d > host_dist:
+                continue
+
+            proj = _project_t_cm(mx, my, ea[0], ea[1], eb[0], eb[1])
+            if proj < -5.0 or proj > elen + 5.0:
+                continue
+            perp_projs.append(proj)
+
+        if len(perp_projs) < min_count:
+            continue
+
+        # Cluster by projection along edge
+        perp_projs.sort()
+        clusters = [[perp_projs[0]]]
+        for k in range(1, len(perp_projs)):
+            if perp_projs[k] - perp_projs[k - 1] <= 20.0:
+                clusters[-1].append(perp_projs[k])
+            else:
+                clusters.append([perp_projs[k]])
+
+        for cluster in clusters:
+            if len(cluster) < min_count:
+                continue
+            span_start = cluster[0]
+            span_end = cluster[-1]
+            width = span_end - span_start
+            if width < min_w * 0.5:
+                # Narrow cluster — estimate window width from pane positions
+                # Assume panes are inside the window, add margins
+                width = max(width + 20.0, min_w)
+                span_start = max(0.0, span_start - 10.0)
+                span_end = min(elen, span_start + width)
+                width = span_end - span_start
+            if width < min_w or width > max_w:
+                continue
+            out.append({
+                "type": "window",
+                "host_edge": e["idx"],
+                "start_cm": max(0.0, span_start),
+                "end_cm": min(elen, span_end),
+                "width_cm": max(1.0, span_end - span_start),
+                "confidence": min(0.75, 0.3 + 0.1 * len(cluster)),
+                "from_window_pattern": True,
+            })
 
     return out
 
@@ -1145,6 +1693,457 @@ def _pick_room_cycle(cycles, nodes, classified, cfg):
     return scored[0]
 
 
+def _match_dimensions_to_edges(edges, dim_lines, cfg):
+    """Match dimension lines to individual polygon edges by parallelism + proximity.
+
+    Returns dict: edge_idx -> measured_length_cm
+    """
+    angle_tol = float((cfg or {}).get("dimension_hint_angle_deg", 18.0))
+    host_tol = float((cfg or {}).get("dimension_hint_host_distance_cm", 180.0))
+
+    result = {}
+    used_dims = set()
+
+    for e in (edges or []):
+        eang = float(e.get("ang", 0.0))
+        elen = float(e.get("len", 0.0))
+        if elen < 1.0:
+            continue
+        ea = e["a"]
+        eb = e["b"]
+        best = None
+
+        for di, ln in enumerate(dim_lines or []):
+            if di in used_dims:
+                continue
+            ln_len, ln_ang, mx, my = _line_len_ang_mid(ln)
+            if ln_len <= 1.0:
+                continue
+            if _angle_delta_axis(ln_ang, eang) > angle_tol:
+                continue
+            d, _ = _dist_pt_seg(mx, my, ea[0], ea[1], eb[0], eb[1])
+            if d > host_tol:
+                continue
+            # Dimension length should be within reasonable ratio of edge
+            ratio = ln_len / max(elen, 1.0)
+            if ratio < 0.3 or ratio > 3.0:
+                continue
+            score = d + abs(ln_len - elen) * 0.1
+            if best is None or score < best[0]:
+                best = (score, di, ln_len)
+
+        if best is not None:
+            used_dims.add(best[1])
+            result[int(e["idx"])] = best[2]
+
+    return result
+
+
+def _match_dimensions_to_openings(openings, edges, dim_lines, cfg):
+    """Match short dimension lines near opening centers to refine opening widths.
+
+    Returns updated openings list and count of matched dimensions.
+    """
+    angle_tol = float((cfg or {}).get("dimension_hint_angle_deg", 18.0))
+    host_tol = float((cfg or {}).get("dimension_hint_host_distance_cm", 180.0))
+
+    edge_map = {}
+    for e in (edges or []):
+        edge_map[int(e["idx"])] = e
+
+    out = []
+    matched = 0
+    for op in (openings or []):
+        c = dict(op)
+        idx = int(c.get("host_edge", -1))
+        e = edge_map.get(idx)
+        if e is None:
+            out.append(c)
+            continue
+
+        ea = e["a"]
+        eb = e["b"]
+        eang = float(e.get("ang", 0.0))
+        elen = float(e.get("len", 0.0))
+
+        s0 = float(c.get("start_cm", 0.0))
+        t0 = float(c.get("end_cm", s0))
+        center0 = (s0 + t0) * 0.5
+        curr_w = max(1.0, float(c.get("width_cm", 1.0)))
+
+        best = None
+        for ln in (dim_lines or []):
+            ln_len, ln_ang, mx, my = _line_len_ang_mid(ln)
+            if ln_len <= 1.0 or ln_len > 350.0:
+                continue
+            if _angle_delta_axis(ln_ang, eang) > angle_tol:
+                continue
+            d, _ = _dist_pt_seg(mx, my, ea[0], ea[1], eb[0], eb[1])
+            if d > host_tol:
+                continue
+
+            tc = _project_t_cm(mx, my, ea[0], ea[1], eb[0], eb[1])
+            # Dimension should be near the opening center
+            if abs(tc - center0) > curr_w * 1.5:
+                continue
+            # Dimension length should be reasonable for an opening
+            if ln_len < curr_w * 0.4 or ln_len > curr_w * 2.5:
+                continue
+
+            score = abs(tc - center0) + d * 0.5
+            if best is None or score < best[0]:
+                best = (score, ln_len)
+
+        if best is not None:
+            new_w = best[1]
+            ns = max(0.0, center0 - new_w * 0.5)
+            nt = min(elen, center0 + new_w * 0.5)
+            if (nt - ns) >= 1.0:
+                c["start_cm"] = ns
+                c["end_cm"] = nt
+                c["width_cm"] = max(1.0, nt - ns)
+                c["from_edge_dimension"] = True
+                matched += 1
+
+        out.append(c)
+
+    return out, matched
+
+
+def _smooth_wall_zigzag(poly, wall_thickness_cm):
+    """Legacy zigzag smoother — kept as fallback for non-paired walls."""
+    if len(poly) < 4:
+        return poly
+    threshold = wall_thickness_cm * 1.8
+    changed = True
+    result = list(poly)
+    for _pass in range(5):
+        if not changed or len(result) < 4:
+            break
+        changed = False
+        new_poly = []
+        n = len(result)
+        for i in range(n):
+            a = result[(i - 1) % n]
+            b = result[i]
+            c = result[(i + 1) % n]
+            ab = math.sqrt((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2)
+            bc = math.sqrt((c[0] - b[0]) ** 2 + (c[1] - b[1]) ** 2)
+            if min(ab, bc) > threshold:
+                new_poly.append(b)
+                continue
+            abx, aby = b[0] - a[0], b[1] - a[1]
+            bcx, bcy = c[0] - b[0], c[1] - b[1]
+            if ab < 1e-9 or bc < 1e-9:
+                new_poly.append(b)
+                continue
+            dot = (abx * bcx + aby * bcy) / (ab * bc)
+            dot = max(-1.0, min(1.0, dot))
+            turn_deg = math.degrees(math.acos(dot))
+            if (turn_deg < 35.0 or turn_deg > 145.0) and min(ab, bc) < threshold:
+                changed = True
+                continue
+            new_poly.append(b)
+        if changed:
+            result = new_poly
+    return result
+
+
+def _snap_poly_to_wall_centers(poly, wall_lines_raw, pairs, wall_thickness_cm):
+    """Snap polygon vertices to wall pair centerlines to remove zigzag.
+
+    When a polygon mixes inner and outer wall traces, it creates a zigzag
+    pattern with ~wall_thickness offsets.  By projecting every vertex onto
+    the centerline of its nearest wall pair, the polygon collapses to a
+    consistent centerline position (ideal for Revit wall placement).
+
+    Corner vertices near two perpendicular wall pairs accumulate both
+    perpendicular shifts so they land at the correct intersection.
+    """
+    if not pairs or len(poly) < 3:
+        return poly
+
+    # Pre-compute pair geometry
+    pair_data = []
+    for pi, pj in pairs:
+        li = wall_lines_raw[pi]
+        lj = wall_lines_raw[pj]
+        ix1, iy1 = float(li["x1"]), float(li["y1"])
+        ix2, iy2 = float(li["x2"]), float(li["y2"])
+        jx1, jy1 = float(lj["x1"]), float(lj["y1"])
+        jx2, jy2 = float(lj["x2"]), float(lj["y2"])
+        # Align endpoints
+        d_same = ((ix1 - jx1) ** 2 + (iy1 - jy1) ** 2
+                  + (ix2 - jx2) ** 2 + (iy2 - jy2) ** 2)
+        d_flip = ((ix1 - jx2) ** 2 + (iy1 - jy2) ** 2
+                  + (ix2 - jx1) ** 2 + (iy2 - jy1) ** 2)
+        if d_flip < d_same:
+            jx1, jy1, jx2, jy2 = jx2, jy2, jx1, jy1
+
+        # Wall direction unit vector
+        dx = ix2 - ix1
+        dy = iy2 - iy1
+        wlen = math.sqrt(dx * dx + dy * dy)
+        if wlen < 1.0:
+            continue
+        ux = dx / wlen
+        uy = dy / wlen
+        # Wall normal (perpendicular, pointing from i toward j)
+        nx = -uy
+        ny = ux
+        # Signed perpendicular distance from i-midpoint to j-midpoint
+        li_mx = (ix1 + ix2) * 0.5
+        li_my = (iy1 + iy2) * 0.5
+        lj_mx = (jx1 + jx2) * 0.5
+        lj_my = (jy1 + jy2) * 0.5
+        d_perp = (lj_mx - li_mx) * nx + (lj_my - li_my) * ny
+        half_d = d_perp * 0.5  # shift from line-i to centerline
+
+        pair_data.append({
+            "li": (ix1, iy1, ix2, iy2),
+            "lj": (jx1, jy1, jx2, jy2),
+            "nx": nx, "ny": ny,
+            "shift_i_x": nx * half_d,
+            "shift_i_y": ny * half_d,
+            "shift_j_x": -nx * half_d,
+            "shift_j_y": -ny * half_d,
+            "ang": math.degrees(math.atan2(uy, ux)),
+        })
+
+    if not pair_data:
+        return poly
+
+    half_wall = wall_thickness_cm * 0.75
+    result = []
+    for vx, vy in poly:
+        # Accumulate shifts from all nearby wall pairs (one per unique angle)
+        shifts = {}  # keyed by rounded wall angle -> (shift_x, shift_y)
+        for pd in pair_data:
+            ix1, iy1, ix2, iy2 = pd["li"]
+            di, _ = _dist_pt_seg(vx, vy, ix1, iy1, ix2, iy2)
+            jx1, jy1, jx2, jy2 = pd["lj"]
+            dj, _ = _dist_pt_seg(vx, vy, jx1, jy1, jx2, jy2)
+
+            matched_shift = None
+            d_min = min(di, dj)
+            if d_min > half_wall:
+                continue
+            if di <= dj:
+                matched_shift = (pd["shift_i_x"], pd["shift_i_y"])
+            else:
+                matched_shift = (pd["shift_j_x"], pd["shift_j_y"])
+
+            # Only keep one shift per wall direction (closest match wins)
+            ang_key = round(pd["ang"] % 180.0)
+            prev = shifts.get(ang_key)
+            if prev is None or d_min < prev[2]:
+                shifts[ang_key] = (matched_shift[0], matched_shift[1], d_min)
+
+        if shifts:
+            sx = sum(v[0] for v in shifts.values())
+            sy = sum(v[1] for v in shifts.values())
+            result.append((vx + sx, vy + sy))
+        else:
+            result.append((vx, vy))
+
+    # Fold removal: when zigzag U-turns snap to the same centerline point,
+    # the polygon revisits a position, creating a fold (A→...→A).
+    # Only remove the loop if it has near-zero area (back-and-forth trace),
+    # not if it contains a large enclosed area.
+    fold_tol = 5.0  # cm
+    changed = True
+    while changed and len(result) >= 3:
+        changed = False
+        for i in range(len(result)):
+            for j in range(i + 2, len(result)):
+                dx = result[i][0] - result[j][0]
+                dy = result[i][1] - result[j][1]
+                if dx * dx + dy * dy < fold_tol * fold_tol:
+                    # Check if the loop i→j has negligible area
+                    loop = result[i:j + 1]
+                    loop_area = 0.0
+                    for k in range(len(loop)):
+                        x1, y1 = loop[k]
+                        x2, y2 = loop[(k + 1) % len(loop)]
+                        loop_area += x1 * y2 - x2 * y1
+                    loop_area = abs(loop_area) * 0.5
+                    # Only remove if loop area is tiny (< wall_thickness^2)
+                    if loop_area < wall_thickness_cm * wall_thickness_cm:
+                        result = result[:i + 1] + result[j + 1:]
+                        changed = True
+                        break
+            if changed:
+                break
+
+    # Clean up: remove near-duplicate consecutive vertices
+    if len(result) < 3:
+        return result
+    cleaned = [result[0]]
+    for k in range(1, len(result)):
+        d = math.sqrt((result[k][0] - cleaned[-1][0]) ** 2
+                      + (result[k][1] - cleaned[-1][1]) ** 2)
+        if d > 2.0:
+            cleaned.append(result[k])
+    if len(cleaned) > 2:
+        d = math.sqrt((cleaned[-1][0] - cleaned[0][0]) ** 2
+                      + (cleaned[-1][1] - cleaned[0][1]) ** 2)
+        if d < 2.0:
+            cleaned.pop()
+
+    # Remove collinear points
+    if len(cleaned) > 3:
+        final = []
+        nc = len(cleaned)
+        for i in range(nc):
+            p = cleaned[(i - 1) % nc]
+            q = cleaned[i]
+            r = cleaned[(i + 1) % nc]
+            cross = abs((q[0] - p[0]) * (r[1] - q[1])
+                        - (q[1] - p[1]) * (r[0] - q[0]))
+            if cross > 5.0:
+                final.append(q)
+        if len(final) >= 3:
+            cleaned = final
+
+    return cleaned
+
+
+def _find_internal_walls(poly, nodes, segs, bridges, snap_tol=2.0, min_len_cm=30.0):
+    """Find graph edges that lie inside the outer polygon but are not on its boundary.
+
+    These are internal partition walls dividing rooms.
+
+    Returns a list of dicts:
+        [{"start": (x, y), "end": (x, y)}, ...]
+    Each represents a wall segment in cm coordinates.
+    """
+    if len(poly) < 3:
+        return []
+
+    # Build set of polygon boundary edges as coordinate pairs (snapped)
+    def _snap(v):
+        return round(v / snap_tol) * snap_tol
+
+    boundary_edges = set()
+    n = len(poly)
+    for i in range(n):
+        ax, ay = poly[i]
+        bx, by = poly[(i + 1) % n]
+        key = ((_snap(ax), _snap(ay)), (_snap(bx), _snap(by)))
+        rev = (key[1], key[0])
+        boundary_edges.add(key)
+        boundary_edges.add(rev)
+
+    # Collect all graph edges (original + bridged)
+    all_segs = list(segs or [])
+    for br in (bridges or []):
+        all_segs.append(br)
+
+    internal = []
+    for seg in all_segs:
+        a_idx = int(seg["a"])
+        b_idx = int(seg["b"])
+        if a_idx >= len(nodes) or b_idx >= len(nodes):
+            continue
+        ax, ay = nodes[a_idx]
+        bx, by = nodes[b_idx]
+
+        # Skip if this edge is on the polygon boundary
+        key = ((_snap(ax), _snap(ay)), (_snap(bx), _snap(by)))
+        if key in boundary_edges:
+            continue
+
+        # Both endpoints must be inside or on the polygon boundary
+        # Use a slightly inflated polygon test — check midpoint is inside
+        mx = (ax + bx) * 0.5
+        my = (ay + by) * 0.5
+        if not _point_in_poly(mx, my, poly):
+            continue
+
+        # Skip very short segments (noise, split artifacts)
+        dx = bx - ax
+        dy = by - ay
+        seg_len = math.sqrt(dx * dx + dy * dy)
+        if seg_len < float(min_len_cm):
+            continue
+
+        internal.append({
+            "start": (ax, ay),
+            "end": (bx, by),
+            "length_cm": seg_len,
+        })
+
+    # Merge collinear connected internal walls into single segments
+    if len(internal) < 2:
+        return internal
+
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(internal)):
+            for j in range(i + 1, len(internal)):
+                wi = internal[i]
+                wj = internal[j]
+                # Check if they share an endpoint (within snap_tol)
+                pts_i = [wi["start"], wi["end"]]
+                pts_j = [wj["start"], wj["end"]]
+                shared = False
+                for pi in pts_i:
+                    for pj in pts_j:
+                        dx = pi[0] - pj[0]
+                        dy = pi[1] - pj[1]
+                        if dx * dx + dy * dy < snap_tol * snap_tol * 4:
+                            shared = True
+                            break
+                    if shared:
+                        break
+                if not shared:
+                    continue
+                # Check collinearity: angle between the two segments
+                dx_i = wi["end"][0] - wi["start"][0]
+                dy_i = wi["end"][1] - wi["start"][1]
+                dx_j = wj["end"][0] - wj["start"][0]
+                dy_j = wj["end"][1] - wj["start"][1]
+                li = math.sqrt(dx_i * dx_i + dy_i * dy_i)
+                lj = math.sqrt(dx_j * dx_j + dy_j * dy_j)
+                if li < 1e-6 or lj < 1e-6:
+                    continue
+                dot = _abs(dx_i * dx_j + dy_i * dy_j) / (li * lj)
+                if dot < 0.996:  # ~5 degrees
+                    continue
+                # Merge: project all 4 endpoints onto the axis and take extremes
+                ux = dx_i / li
+                uy = dy_i / li
+                all_pts = [wi["start"], wi["end"], wj["start"], wj["end"]]
+                projs = [(p[0] * ux + p[1] * uy, p) for p in all_pts]
+                projs.sort(key=lambda x: x[0])
+                new_start = projs[0][1]
+                new_end = projs[-1][1]
+                dx_n = new_end[0] - new_start[0]
+                dy_n = new_end[1] - new_start[1]
+                new_len = math.sqrt(dx_n * dx_n + dy_n * dy_n)
+                internal[i] = {"start": new_start, "end": new_end, "length_cm": new_len}
+                internal.pop(j)
+                merged = True
+                break
+            if merged:
+                break
+
+    # Dedupe near-identical segments after merge.
+    deduped = []
+    seen = set()
+    for w in internal:
+        p1 = (round(float(w["start"][0]), 1), round(float(w["start"][1]), 1))
+        p2 = (round(float(w["end"][0]), 1), round(float(w["end"][1]), 1))
+        key = (p1, p2) if p1 <= p2 else (p2, p1)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(w)
+
+    return deduped
+
+
 def recognize_topology(classified, cfg):
     cfg = cfg or {}
 
@@ -1156,15 +2155,53 @@ def recognize_topology(classified, cfg):
     if not wall_lines:
         raise ValueError("Wall recognition failed: no line candidates")
 
+    pairs = collapse_dbg.get("pairs", [])
     solve_mode = "collapsed"
-    solve_out = _find_room_cycle_from_lines(wall_lines, classified, cfg, relax_gap=False)
+    solve_out = None
 
+    # Strategy 1: Centerlines-only (no unpaired noise like door frames, crossbars).
+    # This gives the cleanest graph for double-wall rooms.
+    if pairs:
+        centerlines_only = _collapse_to_centerlines(wall_lines_raw, pairs, include_unpaired=False)
+        if centerlines_only:
+            solve_out = _find_room_cycle_from_lines(centerlines_only, classified, cfg, relax_gap=False)
+            if solve_out is not None:
+                solve_mode = "centerlines_only"
+
+    # Strategy 2: Inner-wall-only + unpaired lines.
+    # For each pair, pick the shorter line (inner wall is shorter than outer).
+    # This removes outer wall lines that cause zigzag cycles.
+    if solve_out is None and pairs:
+        lines_centroid = _centroid_of_line_mids(wall_lines_raw)
+        inner_lines = _collapse_pick_inner(wall_lines_raw, pairs, lines_centroid)
+        solve_out = _find_room_cycle_from_lines(inner_lines, classified, cfg, relax_gap=False)
+        if solve_out is not None:
+            solve_mode = "inner_walls"
+            wall_lines = inner_lines
+
+    # Strategy 3: Inner walls with relaxed bridging.
+    if solve_out is None and pairs:
+        lines_centroid = _centroid_of_line_mids(wall_lines_raw)
+        inner_lines = _collapse_pick_inner(wall_lines_raw, pairs, lines_centroid)
+        solve_out = _find_room_cycle_from_lines(inner_lines, classified, cfg, relax_gap=True)
+        if solve_out is not None:
+            solve_mode = "inner_walls_relaxed"
+            wall_lines = inner_lines
+
+    # Strategy 4: Centerlines + unpaired lines (original collapsed approach).
+    if solve_out is None:
+        solve_out = _find_room_cycle_from_lines(wall_lines, classified, cfg, relax_gap=False)
+        if solve_out is not None:
+            solve_mode = "collapsed"
+
+    # Strategy 5: Raw lines fallback (both inner and outer wall traces).
     if solve_out is None and wall_lines_raw:
         solve_mode = "raw_fallback"
         solve_out = _find_room_cycle_from_lines(wall_lines_raw, classified, cfg, relax_gap=False)
         if solve_out is not None:
             wall_lines = list(wall_lines_raw)
 
+    # Strategy 6: Raw lines with relaxed bridge tolerance.
     if solve_out is None and wall_lines_raw:
         solve_mode = "raw_relaxed_bridge"
         solve_out = _find_room_cycle_from_lines(wall_lines_raw, classified, cfg, relax_gap=True)
@@ -1181,11 +2218,29 @@ def recognize_topology(classified, cfg):
     cycles = solve_out["cycles"]
 
     poly_raw = picked["poly"]
-    edges_raw = _edge_list(poly_raw)
 
+    # Post-process: remove double-wall zigzag jogs from the polygon.
+    # When inner/outer wall traces both appear, the polygon has short segments
+    # (~wall thickness) connecting them.
     default_wall = float(cfg.get("default_wall_thickness_cm", 20.0))
     estimated_wall = collapse_dbg.get("estimated_wall_thickness_cm")
     wall_thickness_cm = float(estimated_wall) if estimated_wall is not None else default_wall
+
+    # Snap to pair centerlines only when the cycle came from raw traces
+    # (not already on centerlines). Centerlines_only polygons are already
+    # at the correct midpoint position — snapping would push them to
+    # inner/outer wall traces.
+    if pairs and solve_mode in ("collapsed", "raw_fallback", "raw_relaxed_bridge"):
+        poly_raw = _snap_poly_to_wall_centers(
+            poly_raw, wall_lines_raw, pairs, wall_thickness_cm)
+    elif solve_mode not in ("centerlines_only",):
+        poly_raw = _smooth_wall_zigzag(poly_raw, wall_thickness_cm)
+
+    edges_raw = _edge_list(poly_raw)
+    minx_raw = min(p[0] for p in poly_raw)
+    miny_raw = min(p[1] for p in poly_raw)
+    maxx_raw = max(p[0] for p in poly_raw)
+    maxy_raw = max(p[1] for p in poly_raw)
 
     host_tol_cm = float(cfg.get("opening_host_distance_mm", 70.0)) / 10.0
     host_tol_cm = max(host_tol_cm, (wall_thickness_cm * 0.6) + 2.0)
@@ -1194,22 +2249,89 @@ def recognize_topology(classified, cfg):
     openings.extend(_opening_from_lines(classified.get("door_lines") or [], edges_raw, "door", host_tol_cm * 1.5, 60.0, 180.0))
     openings.extend(_opening_from_lines(classified.get("window_lines") or [], edges_raw, "window", host_tol_cm * 1.5, 40.0, 350.0))
     openings.extend(_opening_from_bridges(bridges, nodes, edges_raw))
-    support_lines = _merge_unique_lines(
-        list(classified.get("wall_lines") or []),
-        list(classified.get("unclassified_lines") or []),
-    )
-    openings.extend(
-        _opening_from_edge_gaps(
-            edges_raw,
-            support_lines,
-            host_tol_cm=max(host_tol_cm * 1.5, 20.0),
-            min_w=float(cfg.get("opening_gap_min_cm", 55.0)),
-            max_w=float(cfg.get("opening_gap_max_cm", 260.0)),
-        )
-    )
-    openings = _merge_openings(openings, 2.0)
 
-    dim_lines = list(classified.get("dimension_lines") or [])
+    # Edge gap and window pattern detection: skip for centerlines_only mode
+    # because centerline gaps are topology artifacts (wall pairs don't cover
+    # full extent), not real openings. These methods produce false windows.
+    if solve_mode != "centerlines_only":
+        support_lines = _merge_unique_lines(
+            list(classified.get("wall_lines") or []),
+            list(classified.get("unclassified_lines") or []),
+        )
+        openings.extend(
+            _opening_from_edge_gaps(
+                edges_raw,
+                support_lines,
+                host_tol_cm=max(host_tol_cm * 1.5, 20.0),
+                min_w=float(cfg.get("opening_gap_min_cm", 55.0)),
+                max_w=float(cfg.get("opening_gap_max_cm", 260.0)),
+            )
+        )
+        # Window pattern detection from perpendicular line clusters
+        all_input_lines = _merge_unique_lines(
+            list(classified.get("wall_lines") or []),
+            _merge_unique_lines(
+                list(classified.get("unclassified_lines") or []),
+                list(classified.get("window_lines") or []),
+            ),
+        )
+        openings.extend(_opening_from_window_pattern(all_input_lines, edges_raw, cfg))
+
+    # Reclassify bridge-detected openings: multiple "doors" on collinear edges
+    # are likely windows (you rarely have 3+ doors in a row on the same wall).
+    # Also, a bridge opening near a door arc stays as door; others become windows.
+    door_arcs = classified.get("door_arcs") or []
+    edge_ang_map = {}
+    for e in edges_raw:
+        edge_ang_map[int(e["idx"])] = float(e.get("ang", 0.0))
+    ang_groups = {}
+    for oi, o in enumerate(openings):
+        if o.get("confidence", 0) != 0.55:  # bridge openings have conf=0.55
+            continue
+        eidx = int(o.get("host_edge", -1))
+        eang = edge_ang_map.get(eidx, 0.0) % 180.0
+        akey = round(eang / 10.0) * 10.0
+        ang_groups.setdefault(akey, []).append(oi)
+    for akey, indices in ang_groups.items():
+        if len(indices) < 2:
+            continue
+        # Multiple bridge openings on same wall direction → windows
+        for oi in indices:
+            # Check if a door arc is near this opening (within 50cm of edge midpoint)
+            o = openings[oi]
+            eidx = int(o.get("host_edge", -1))
+            e = None
+            for ed in edges_raw:
+                if int(ed["idx"]) == eidx:
+                    e = ed
+                    break
+            has_door_arc = False
+            if e is not None:
+                emx = (e["a"][0] + e["b"][0]) * 0.5
+                emy = (e["a"][1] + e["b"][1]) * 0.5
+                for arc in door_arcs:
+                    acx = float(arc.get("cx", 0.0))
+                    acy = float(arc.get("cy", 0.0))
+                    d = math.sqrt((acx - emx) ** 2 + (acy - emy) ** 2)
+                    if d < 80.0:
+                        has_door_arc = True
+                        break
+            if not has_door_arc:
+                openings[oi]["type"] = "window"
+
+    openings = _merge_openings(openings, float(cfg.get("opening_merge_min_sep_cm", 15.0)))
+
+    # Filter dimension lines to only those near the room polygon bounding box.
+    # DWGs often contain title block / sheet dims at coordinates far from the room.
+    dim_lines_raw = list(classified.get("dimension_lines") or [])
+    dim_margin = 500.0  # cm margin around room bbox
+    dim_lines = []
+    for ln in dim_lines_raw:
+        mx = (float(ln.get("x1", 0)) + float(ln.get("x2", 0))) * 0.5
+        my = (float(ln.get("y1", 0)) + float(ln.get("y2", 0))) * 0.5
+        if (minx_raw - dim_margin <= mx <= maxx_raw + dim_margin and
+                miny_raw - dim_margin <= my <= maxy_raw + dim_margin):
+            dim_lines.append(ln)
     dim_hints = _pick_dimension_span_hints(poly_raw, edges_raw, dim_lines, cfg)
     scale_u = 1.0
     scale_v = 1.0
@@ -1232,7 +2354,10 @@ def recognize_topology(classified, cfg):
         openings = _scale_openings_by_edge_ratio(openings, edges_raw, edges)
 
     openings, opening_dim_used = _apply_dimension_hints_to_openings(openings, edges, dim_lines, cfg)
-    openings = _merge_openings(openings, 2.0)
+    # Per-segment dimension matching for individual opening widths
+    openings, edge_dim_matched = _match_dimensions_to_openings(openings, edges, dim_lines, cfg)
+    edge_dimensions = _match_dimensions_to_edges(edges, dim_lines, cfg)
+    openings = _merge_openings(openings, float(cfg.get("opening_merge_min_sep_cm", 15.0)))
 
     minx = min([p[0] for p in poly])
     miny = min([p[1] for p in poly])
@@ -1275,14 +2400,18 @@ def recognize_topology(classified, cfg):
 
     wall_segments = []
     for e in edges:
-        wall_segments.append({
+        seg = {
             "start": [e["a"][0], e["a"][1]],
             "end": [e["b"][0], e["b"][1]],
             "length_cm": e["len"],
-        })
+        }
+        measured = edge_dimensions.get(int(e["idx"]))
+        if measured is not None:
+            seg["measured_length_cm"] = measured
+        wall_segments.append(seg)
 
-    # Ensure deterministic defaults when no windows/doors are found.
-    if not any([o for o in openings if o.get("type") == "window"]):
+    # Optional synthetic fallback for demos/debug only.
+    if bool(cfg.get("enable_synthetic_window_fallback", False)) and (not any([o for o in openings if o.get("type") == "window"])):
         # On longest edge, create a default 100cm window 30cm from one side.
         longest = None
         for e in edges:
@@ -1302,6 +2431,17 @@ def recognize_topology(classified, cfg):
                 "synthetic": True,
             })
 
+    # Detect internal partition walls (edges inside the outer polygon)
+    all_bridge_segs = [{"a": br["a"], "b": br["b"], "bridged": True} for br in bridges]
+    internal_walls = _find_internal_walls(
+        poly,
+        nodes,
+        segs,
+        all_bridge_segs,
+        snap_tol=float(cfg.get("internal_wall_snap_tol_cm", 2.0)),
+        min_len_cm=float(cfg.get("internal_wall_min_length_cm", 30.0)),
+    )
+
     measurements_cm = {
         "room_width_cm": max(1.0, room_w),
         "room_height_cm": max(1.0, room_h),
@@ -1315,30 +2455,40 @@ def recognize_topology(classified, cfg):
         "window_sill_cm": default_win_sill,
     }
 
-    return {
+    room_data = {
         "room_polygon_cm": [[p[0], p[1]] for p in poly],
         "wall_segments_cm": wall_segments,
+        "internal_walls_cm": [[w["start"][0], w["start"][1], w["end"][0], w["end"][1]] for w in internal_walls],
         "openings": openings,
         "measurements_cm": measurements_cm,
-        "debug": {
-            "mode": "polygon_v2",
-            "solve_mode": solve_mode,
-            "wall_line_candidates": len(wall_lines),
-            "wall_line_candidates_raw": len(wall_lines_raw),
-            "paired_wall_line_count": int(collapse_dbg.get("paired_count") or 0),
-            "estimated_wall_thickness_cm": collapse_dbg.get("estimated_wall_thickness_cm"),
-            "dimension_line_count": len(dim_lines),
-            "dimension_span_hint_used_count": int(dim_hints.get("used_lines") or 0),
-            "dimension_opening_hint_used_count": int(opening_dim_used),
-            "dimension_target_u_cm": dim_hints.get("target_u_cm"),
-            "dimension_target_v_cm": dim_hints.get("target_v_cm"),
-            "dimension_scale_u": scale_u,
-            "dimension_scale_v": scale_v,
-            "graph_node_count": len(nodes),
-            "graph_segment_count": len(segs),
-            "bridged_count": len(bridges),
-            "cycle_count": len(cycles),
-            "picked_area_cm2": picked["area"],
-            "picked_support": picked["support"],
-        },
     }
+
+    debug = {
+        "mode": "polygon_v2",
+        "solve_mode": solve_mode,
+        "wall_line_candidates": len(wall_lines),
+        "wall_line_candidates_raw": len(wall_lines_raw),
+        "paired_wall_line_count": int(collapse_dbg.get("paired_count") or 0),
+        "estimated_wall_thickness_cm": collapse_dbg.get("estimated_wall_thickness_cm"),
+        "dimension_line_count": len(dim_lines),
+        "dimension_span_hint_used_count": int(dim_hints.get("used_lines") or 0),
+        "dimension_opening_hint_used_count": int(opening_dim_used),
+        "dimension_edge_matched_count": len(edge_dimensions),
+        "dimension_opening_edge_matched_count": int(edge_dim_matched),
+        "dimension_target_u_cm": dim_hints.get("target_u_cm"),
+        "dimension_target_v_cm": dim_hints.get("target_v_cm"),
+        "dimension_scale_u": scale_u,
+        "dimension_scale_v": scale_v,
+        "graph_node_count": len(nodes),
+        "graph_segment_count": len(segs),
+        "bridged_count": len(bridges),
+        "cycle_count": len(cycles),
+        "picked_area_cm2": picked["area"],
+        "picked_support": picked["support"],
+        "internal_wall_count": len(internal_walls),
+    }
+
+    result = dict(room_data)
+    result["rooms"] = [room_data]
+    result["debug"] = debug
+    return result
