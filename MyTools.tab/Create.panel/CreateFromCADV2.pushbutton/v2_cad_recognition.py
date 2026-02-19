@@ -2008,7 +2008,9 @@ def _snap_poly_to_wall_centers(poly, wall_lines_raw, pairs, wall_thickness_cm):
     return cleaned
 
 
-def _find_internal_walls(poly, nodes, segs, bridges, snap_tol=2.0, min_len_cm=30.0):
+def _find_internal_walls(poly, nodes, segs, bridges, snap_tol=2.0, min_len_cm=30.0,
+                         perimeter_parallel_tol_cm=10.0, perimeter_parallel_angle_deg=8.0,
+                         endpoint_snap_cm=6.0, dangling_max_cm=35.0, with_debug=False):
     """Find graph edges that lie inside the outer polygon but are not on its boundary.
 
     These are internal partition walls dividing rooms.
@@ -2017,7 +2019,19 @@ def _find_internal_walls(poly, nodes, segs, bridges, snap_tol=2.0, min_len_cm=30
         [{"start": (x, y), "end": (x, y)}, ...]
     Each represents a wall segment in cm coordinates.
     """
+    stats = {
+        "candidate_count": 0,
+        "rejected_boundary": 0,
+        "rejected_outside": 0,
+        "rejected_short": 0,
+        "rejected_parallel_perimeter": 0,
+        "rejected_dangling": 0,
+        "accepted_premerge": 0,
+        "accepted_count": 0,
+    }
     if len(poly) < 3:
+        if with_debug:
+            return [], stats
         return []
 
     # Build set of polygon boundary edges as coordinate pairs (snapped)
@@ -2039,8 +2053,19 @@ def _find_internal_walls(poly, nodes, segs, bridges, snap_tol=2.0, min_len_cm=30
     for br in (bridges or []):
         all_segs.append(br)
 
+    # Node degree helps reject dangling/noise internal edges.
+    node_deg = {}
+    for seg in all_segs:
+        a_idx = int(seg["a"])
+        b_idx = int(seg["b"])
+        node_deg[a_idx] = int(node_deg.get(a_idx, 0)) + 1
+        node_deg[b_idx] = int(node_deg.get(b_idx, 0)) + 1
+
+    perimeter_edges = _edge_list(poly)
+
     internal = []
     for seg in all_segs:
+        stats["candidate_count"] += 1
         a_idx = int(seg["a"])
         b_idx = int(seg["b"])
         if a_idx >= len(nodes) or b_idx >= len(nodes):
@@ -2051,6 +2076,7 @@ def _find_internal_walls(poly, nodes, segs, bridges, snap_tol=2.0, min_len_cm=30
         # Skip if this edge is on the polygon boundary
         key = ((_snap(ax), _snap(ay)), (_snap(bx), _snap(by)))
         if key in boundary_edges:
+            stats["rejected_boundary"] += 1
             continue
 
         # Both endpoints must be inside or on the polygon boundary
@@ -2058,6 +2084,7 @@ def _find_internal_walls(poly, nodes, segs, bridges, snap_tol=2.0, min_len_cm=30
         mx = (ax + bx) * 0.5
         my = (ay + by) * 0.5
         if not _point_in_poly(mx, my, poly):
+            stats["rejected_outside"] += 1
             continue
 
         # Skip very short segments (noise, split artifacts)
@@ -2065,6 +2092,43 @@ def _find_internal_walls(poly, nodes, segs, bridges, snap_tol=2.0, min_len_cm=30
         dy = by - ay
         seg_len = math.sqrt(dx * dx + dy * dy)
         if seg_len < float(min_len_cm):
+            stats["rejected_short"] += 1
+            continue
+
+        seg_ang = math.degrees(math.atan2(dy, dx))
+        near_parallel_perimeter = False
+        min_dist_a = None
+        min_dist_b = None
+        for pe in perimeter_edges:
+            pa = pe["a"]
+            pb = pe["b"]
+            d_mid, _ = _dist_pt_seg(mx, my, pa[0], pa[1], pb[0], pb[1])
+            if d_mid <= float(perimeter_parallel_tol_cm):
+                if _angle_delta_axis(seg_ang, pe.get("ang", 0.0)) <= float(perimeter_parallel_angle_deg):
+                    near_parallel_perimeter = True
+                    break
+            d_a, _ = _dist_pt_seg(ax, ay, pa[0], pa[1], pb[0], pb[1])
+            d_b, _ = _dist_pt_seg(bx, by, pa[0], pa[1], pb[0], pb[1])
+            if min_dist_a is None or d_a < min_dist_a:
+                min_dist_a = d_a
+            if min_dist_b is None or d_b < min_dist_b:
+                min_dist_b = d_b
+
+        if near_parallel_perimeter:
+            stats["rejected_parallel_perimeter"] += 1
+            continue
+
+        a_on_perimeter = (min_dist_a is not None and min_dist_a <= float(endpoint_snap_cm))
+        b_on_perimeter = (min_dist_b is not None and min_dist_b <= float(endpoint_snap_cm))
+        deg_a = int(node_deg.get(a_idx, 0))
+        deg_b = int(node_deg.get(b_idx, 0))
+
+        # Reject short dangling stubs that do not connect to perimeter/junctions.
+        if (deg_a <= 1 or deg_b <= 1) and seg_len < float(dangling_max_cm) and (not a_on_perimeter) and (not b_on_perimeter):
+            stats["rejected_dangling"] += 1
+            continue
+        if (deg_a <= 1 and deg_b <= 1) and (not a_on_perimeter) and (not b_on_perimeter):
+            stats["rejected_dangling"] += 1
             continue
 
         internal.append({
@@ -2072,9 +2136,13 @@ def _find_internal_walls(poly, nodes, segs, bridges, snap_tol=2.0, min_len_cm=30
             "end": (bx, by),
             "length_cm": seg_len,
         })
+    stats["accepted_premerge"] = len(internal)
 
     # Merge collinear connected internal walls into single segments
     if len(internal) < 2:
+        stats["accepted_count"] = len(internal)
+        if with_debug:
+            return internal, stats
         return internal
 
     merged = True
@@ -2141,7 +2209,37 @@ def _find_internal_walls(poly, nodes, segs, bridges, snap_tol=2.0, min_len_cm=30
         seen.add(key)
         deduped.append(w)
 
+    stats["accepted_count"] = len(deduped)
+    if with_debug:
+        return deduped, stats
     return deduped
+
+
+def _annotate_opening_centers(openings, edges):
+    edge_map = {}
+    for e in (edges or []):
+        edge_map[int(e.get("idx", -1))] = e
+
+    out = []
+    for op in (openings or []):
+        o = dict(op)
+        host_edge = int(o.get("host_edge", -1))
+        e = edge_map.get(host_edge)
+        if e is not None:
+            start_cm = float(o.get("start_cm", 0.0))
+            end_cm = float(o.get("end_cm", start_cm))
+            if end_cm < start_cm:
+                start_cm, end_cm = end_cm, start_cm
+            edge_len = max(1.0e-9, float(e.get("len", 1.0)))
+            center_t = max(0.0, min(edge_len, (start_cm + end_cm) * 0.5))
+            ax, ay = e["a"]
+            bx, by = e["b"]
+            ux = (bx - ax) / edge_len
+            uy = (by - ay) / edge_len
+            o["center_x_cm"] = ax + (ux * center_t)
+            o["center_y_cm"] = ay + (uy * center_t)
+        out.append(o)
+    return out
 
 
 def recognize_topology(classified, cfg):
@@ -2358,6 +2456,7 @@ def recognize_topology(classified, cfg):
     openings, edge_dim_matched = _match_dimensions_to_openings(openings, edges, dim_lines, cfg)
     edge_dimensions = _match_dimensions_to_edges(edges, dim_lines, cfg)
     openings = _merge_openings(openings, float(cfg.get("opening_merge_min_sep_cm", 15.0)))
+    openings = _annotate_opening_centers(openings, edges)
 
     minx = min([p[0] for p in poly])
     miny = min([p[1] for p in poly])
@@ -2433,13 +2532,18 @@ def recognize_topology(classified, cfg):
 
     # Detect internal partition walls (edges inside the outer polygon)
     all_bridge_segs = [{"a": br["a"], "b": br["b"], "bridged": True} for br in bridges]
-    internal_walls = _find_internal_walls(
+    internal_walls, internal_wall_stats = _find_internal_walls(
         poly,
         nodes,
         segs,
         all_bridge_segs,
         snap_tol=float(cfg.get("internal_wall_snap_tol_cm", 2.0)),
         min_len_cm=float(cfg.get("internal_wall_min_length_cm", 30.0)),
+        perimeter_parallel_tol_cm=float(cfg.get("internal_wall_perimeter_parallel_tol_cm", 10.0)),
+        perimeter_parallel_angle_deg=float(cfg.get("internal_wall_perimeter_parallel_angle_deg", 8.0)),
+        endpoint_snap_cm=float(cfg.get("internal_wall_endpoint_snap_cm", 6.0)),
+        dangling_max_cm=float(cfg.get("internal_wall_dangling_max_cm", 35.0)),
+        with_debug=True,
     )
 
     measurements_cm = {
@@ -2486,6 +2590,12 @@ def recognize_topology(classified, cfg):
         "picked_area_cm2": picked["area"],
         "picked_support": picked["support"],
         "internal_wall_count": len(internal_walls),
+        "internal_wall_candidate_count": int(internal_wall_stats.get("candidate_count", 0)),
+        "internal_wall_rejected_boundary_count": int(internal_wall_stats.get("rejected_boundary", 0)),
+        "internal_wall_rejected_outside_count": int(internal_wall_stats.get("rejected_outside", 0)),
+        "internal_wall_rejected_short_count": int(internal_wall_stats.get("rejected_short", 0)),
+        "internal_wall_rejected_parallel_perimeter_count": int(internal_wall_stats.get("rejected_parallel_perimeter", 0)),
+        "internal_wall_rejected_dangling_count": int(internal_wall_stats.get("rejected_dangling", 0)),
     }
 
     result = dict(room_data)

@@ -314,48 +314,108 @@ def get_symbol(category):
     return first_or_none(FilteredElementCollector(doc).OfCategory(category).OfClass(FamilySymbol))
 
 
-def get_symbol_by_width(category, target_width_ft):
-    """Pick the family symbol whose width best matches target_width_ft."""
+def _symbol_display_name(sym):
+    try:
+        fam = sym.Family.Name
+    except Exception:
+        fam = ""
+    try:
+        typ = sym.Name
+    except Exception:
+        typ = ""
+    if fam and typ:
+        return "{} : {}".format(fam, typ)
+    return fam or typ or "<unnamed>"
+
+
+def _symbol_width_ft(sym):
+    for name in ["Width", "width", "Rough Width"]:
+        try:
+            p = sym.LookupParameter(name)
+            if p and p.HasValue:
+                return p.AsDouble()
+        except Exception:
+            pass
+    for bip in [BuiltInParameter.DOOR_WIDTH, BuiltInParameter.WINDOW_WIDTH,
+                BuiltInParameter.GENERIC_WIDTH]:
+        try:
+            p = sym.get_Parameter(bip)
+            if p and p.HasValue:
+                return p.AsDouble()
+        except Exception:
+            pass
+    return None
+
+
+def _symbol_has_visible_bbox(sym):
+    """Best-effort visibility check. None means unknown, not a hard fail."""
+    try:
+        bb = sym.get_BoundingBox(None)
+        if bb is None:
+            return None
+        dx = abs(float(bb.Max.X) - float(bb.Min.X))
+        dy = abs(float(bb.Max.Y) - float(bb.Min.Y))
+        dz = abs(float(bb.Max.Z) - float(bb.Min.Z))
+        return (dx > 1.0e-6) or (dy > 1.0e-6) or (dz > 1.0e-6)
+    except Exception:
+        return None
+
+
+def get_symbol_by_width(category, target_width_ft, cfg=None, audit=None):
+    """Pick a family symbol by width while filtering non-visual opening-only types."""
+    cfg = cfg or {}
+    reject_patterns = list(cfg.get("opening_symbol_reject_name_patterns", ["opening"]) or ["opening"])
+    reject_patterns = [str(p).strip().lower() for p in reject_patterns if str(p).strip()]
+    require_visible = bool(cfg.get("opening_symbol_require_visible_geometry", True))
+
     symbols = list(FilteredElementCollector(doc).OfCategory(category).OfClass(FamilySymbol))
     if not symbols:
         return None
-    if len(symbols) == 1:
-        return symbols[0]
 
-    def _get_width(sym):
-        for name in ["Width", "width", "Rough Width"]:
-            try:
-                p = sym.LookupParameter(name)
-                if p and p.HasValue:
-                    return p.AsDouble()
-            except Exception:
-                pass
-        # Try built-in parameter
-        for bip in [BuiltInParameter.DOOR_WIDTH, BuiltInParameter.WINDOW_WIDTH,
-                     BuiltInParameter.GENERIC_WIDTH]:
-            try:
-                p = sym.get_Parameter(bip)
-                if p and p.HasValue:
-                    return p.AsDouble()
-            except Exception:
-                pass
-        return None
-
-    best = None
-    best_diff = None
-    fallback = None
+    ranked = []
     for sym in symbols:
-        w = _get_width(sym)
-        if w is None:
-            if fallback is None:
-                fallback = sym
-            continue
-        diff = abs(w - target_width_ft)
-        if best is None or diff < best_diff:
-            best = sym
-            best_diff = diff
+        width_ft = _symbol_width_ft(sym)
+        if width_ft is None:
+            diff = 1.0e9
+        else:
+            diff = abs(width_ft - float(target_width_ft))
+        ranked.append((diff, sym, width_ft))
+    ranked.sort(key=lambda x: x[0])
 
-    return best if best is not None else (fallback if fallback is not None else symbols[0])
+    fallback = ranked[0][1]
+    for diff, sym, width_ft in ranked:
+        name = _symbol_display_name(sym)
+        lname = name.lower()
+        blocked = None
+        for pat in reject_patterns:
+            if pat and (pat in lname):
+                blocked = "name_pattern:{}".format(pat)
+                break
+        if blocked is None and require_visible:
+            vis = _symbol_has_visible_bbox(sym)
+            if vis is False:
+                blocked = "no_visible_geometry"
+
+        if blocked is not None:
+            if audit is not None:
+                audit.append({
+                    "symbol": name,
+                    "reason": blocked,
+                    "width_ft": width_ft,
+                    "target_width_ft": float(target_width_ft),
+                })
+            continue
+        return sym
+
+    # If all were rejected, use nearest-width fallback to avoid total failure.
+    if audit is not None and fallback is not None:
+        audit.append({
+            "symbol": _symbol_display_name(fallback),
+            "reason": "fallback_after_all_rejected",
+            "width_ft": _symbol_width_ft(fallback),
+            "target_width_ft": float(target_width_ft),
+        })
+    return fallback
 
 
 def build_loop(points):
@@ -533,6 +593,35 @@ def _project_point_to_wall_axis(wall, xyz):
 
 def _pt_seg_dist_cm(px, py, ax, ay, bx, by):
     return _dist_pt_seg(px, py, ax, ay, bx, by)[0]
+
+
+def _safe_float(v, default=None):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def _nearest_wall_index_for_point_cm(px_cm, py_cm, wall_meta, max_dist_cm=None):
+    best_idx = None
+    best_dist = None
+    for idx, wm in enumerate(wall_meta):
+        d = _pt_seg_dist_cm(
+            px_cm,
+            py_cm,
+            ft_to_cm(wm["center_start"].X),
+            ft_to_cm(wm["center_start"].Y),
+            ft_to_cm(wm["center_end"].X),
+            ft_to_cm(wm["center_end"].Y),
+        )
+        if best_idx is None or d < best_dist:
+            best_idx = idx
+            best_dist = d
+    if best_idx is None:
+        return None, None
+    if max_dist_cm is not None and best_dist is not None and best_dist > float(max_dist_cm):
+        return None, best_dist
+    return best_idx, best_dist
 
 
 def _manual_pick_opening_pairs(kind):
@@ -716,6 +805,9 @@ def build_model_from_topology(level, topology, cfg, snapshot):
     wall_height_ft = cm_to_ft(300.0)
     half = wall_type.Width * 0.5
     min_wall_len_cm = float(cfg.get("model_wall_min_length_cm", 20.0))
+    create_roof = bool(cfg.get("model_create_roof", False))
+    skip_low_conf = bool(cfg.get("model_skip_low_confidence_openings", False))
+    opening_host_fallback_max_cm = float(cfg.get("opening_host_fallback_max_dist_cm", 180.0))
 
     walls = []
     wall_meta = []
@@ -772,29 +864,53 @@ def build_model_from_topology(level, topology, cfg, snapshot):
         internal_wall_errors = []
         min_internal_len_cm = float(cfg.get("internal_wall_min_length_cm", 30.0))
         perimeter_dup_tol_cm = float(cfg.get("internal_wall_perimeter_duplicate_tol_cm", 12.0))
+        perimeter_parallel_tol_cm = float(cfg.get("internal_wall_perimeter_parallel_tol_cm", perimeter_dup_tol_cm))
+        perimeter_parallel_angle_deg = float(cfg.get("internal_wall_perimeter_parallel_angle_deg", 8.0))
+        internal_wall_reject_breakdown = {
+            "too_short": 0,
+            "near_parallel_perimeter": 0,
+            "error": 0,
+        }
         for iw in internal_walls_cm:
             try:
                 x0 = float(iw[0])
                 y0 = float(iw[1])
                 x1 = float(iw[2])
                 y1 = float(iw[3])
+                iw_dx_cm = x1 - x0
+                iw_dy_cm = y1 - y0
+                iw_len_cm = math.sqrt((iw_dx_cm * iw_dx_cm) + (iw_dy_cm * iw_dy_cm))
+                if iw_len_cm < min_internal_len_cm:
+                    internal_wall_rejected += 1
+                    internal_wall_reject_breakdown["too_short"] += 1
+                    continue
+
                 mx = (x0 + x1) * 0.5
                 my = (y0 + y1) * 0.5
-                near_perimeter = False
+                iw_ang = math.degrees(math.atan2(iw_dy_cm, iw_dx_cm))
+                near_parallel_perimeter = False
                 for pm in wall_meta:
+                    pm_x0 = ft_to_cm(pm["center_start"].X)
+                    pm_y0 = ft_to_cm(pm["center_start"].Y)
+                    pm_x1 = ft_to_cm(pm["center_end"].X)
+                    pm_y1 = ft_to_cm(pm["center_end"].Y)
                     d = _pt_seg_dist_cm(
                         mx,
                         my,
-                        ft_to_cm(pm["center_start"].X),
-                        ft_to_cm(pm["center_start"].Y),
-                        ft_to_cm(pm["center_end"].X),
-                        ft_to_cm(pm["center_end"].Y),
+                        pm_x0,
+                        pm_y0,
+                        pm_x1,
+                        pm_y1,
                     )
-                    if d <= perimeter_dup_tol_cm:
-                        near_perimeter = True
+                    if d > perimeter_parallel_tol_cm:
+                        continue
+                    pm_ang = math.degrees(math.atan2(pm_y1 - pm_y0, pm_x1 - pm_x0))
+                    if _angle_delta_axis_deg(iw_ang, pm_ang) <= perimeter_parallel_angle_deg:
+                        near_parallel_perimeter = True
                         break
-                if near_perimeter:
+                if near_parallel_perimeter:
                     internal_wall_rejected += 1
+                    internal_wall_reject_breakdown["near_parallel_perimeter"] += 1
                     continue
 
                 iw_p0 = XYZ(cm_to_ft(x0), cm_to_ft(y0), 0.0)
@@ -802,17 +918,20 @@ def build_model_from_topology(level, topology, cfg, snapshot):
                 iw_dx = iw_p1.X - iw_p0.X
                 iw_dy = iw_p1.Y - iw_p0.Y
                 iw_ln = math.sqrt(iw_dx * iw_dx + iw_dy * iw_dy)
-                if iw_ln <= 1e-9 or ft_to_cm(iw_ln) < min_internal_len_cm:
+                if iw_ln <= 1e-9:
                     internal_wall_rejected += 1
+                    internal_wall_reject_breakdown["too_short"] += 1
                     continue
                 iw_wall = Wall.Create(doc, Line.CreateBound(iw_p0, iw_p1), wall_type.Id, level.Id, wall_height_ft, 0.0, False, False)
                 internal_wall_ids.append(iw_wall.Id.IntegerValue)
             except Exception as ex:
                 internal_wall_errors.append(str(ex))
+                internal_wall_reject_breakdown["error"] += 1
 
         Floor.Create(doc, [build_loop(inner_pts)], floor_type.Id, level.Id)
-        roof = Floor.Create(doc, [build_loop(inner_pts)], floor_type.Id, level.Id)
-        set_param(roof, BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM, wall_height_ft)
+        if create_roof:
+            roof = Floor.Create(doc, [build_loop(inner_pts)], floor_type.Id, level.Id)
+            set_param(roof, BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM, wall_height_ft)
 
         openings = list(topology.get("openings") or [])
         min_opening_conf = float(cfg.get("model_min_opening_confidence", 0.45))
@@ -821,6 +940,9 @@ def build_model_from_topology(level, topology, cfg, snapshot):
         place_synthetic = bool(cfg.get("model_place_synthetic_openings", False))
         opening_errors = []
         opening_attempts = []
+        opening_family_choices = []
+        opening_family_rejects = []
+        opening_host_fallback_count = 0
 
         for op in openings:
             otype = str(op.get("type", "")).lower()
@@ -842,89 +964,138 @@ def build_model_from_topology(level, topology, cfg, snapshot):
                 opening_attempts.append(attempt)
                 continue
 
-            if (not bool(op.get("manual", False))) and attempt["confidence"] < min_opening_conf:
+            if skip_low_conf and (not bool(op.get("manual", False))) and attempt["confidence"] < min_opening_conf:
                 attempt["status"] = "skipped"
                 attempt["reason"] = "low_confidence"
                 opening_attempts.append(attempt)
                 continue
 
-            run_rec = edge_to_run.get(host_edge)
-            if run_rec is None:
-                attempt["status"] = "failed"
-                attempt["reason"] = "host_edge_not_mapped"
-                opening_errors.append("{} edge {}: host edge not mapped".format(otype, host_edge))
-                opening_attempts.append(attempt)
-                continue
+            anchor_x_cm = _safe_float(op.get("center_x_cm"), None)
+            anchor_y_cm = _safe_float(op.get("center_y_cm"), None)
+            if anchor_x_cm is not None and anchor_y_cm is not None:
+                attempt["anchor_xy_cm"] = [anchor_x_cm, anchor_y_cm]
 
-            wall_idx = run_to_wall_idx.get(int(run_rec["run_idx"]))
+            run_rec = edge_to_run.get(host_edge)
+            wall_idx = None
+            if run_rec is not None:
+                wall_idx = run_to_wall_idx.get(int(run_rec["run_idx"]))
+
+            used_host_fallback = False
+            host_fallback_dist_cm = None
+            if (wall_idx is None or wall_idx < 0 or wall_idx >= len(walls)) and anchor_x_cm is not None and anchor_y_cm is not None:
+                wall_idx, host_fallback_dist_cm = _nearest_wall_index_for_point_cm(
+                    anchor_x_cm,
+                    anchor_y_cm,
+                    wall_meta,
+                    max_dist_cm=opening_host_fallback_max_cm,
+                )
+                if wall_idx is not None:
+                    used_host_fallback = True
+                    opening_host_fallback_count += 1
+
             if wall_idx is None or wall_idx < 0 or wall_idx >= len(walls):
                 attempt["status"] = "failed"
-                attempt["reason"] = "host_wall_missing"
-                opening_errors.append("{} edge {}: host wall missing".format(otype, host_edge))
+                if run_rec is None:
+                    attempt["reason"] = "host_edge_not_mapped"
+                    opening_errors.append("{} edge {}: host edge not mapped".format(otype, host_edge))
+                else:
+                    attempt["reason"] = "host_wall_missing"
+                    opening_errors.append("{} edge {}: host wall missing".format(otype, host_edge))
                 opening_attempts.append(attempt)
                 continue
 
             meta = wall_meta[wall_idx]
-            s_cm = float(op.get("start_cm", 0.0))
-            e_cm = float(op.get("end_cm", s_cm))
-            if e_cm < s_cm:
-                s_cm, e_cm = e_cm, s_cm
-            edge_len_cm = max(1.0, float(run_rec.get("len_cm", 1.0)))
-            center_edge_cm = min(edge_len_cm, max(0.0, (s_cm + e_cm) * 0.5))
-            center_run_cm = float(run_rec.get("offset_cm", 0.0)) + center_edge_cm
-            center_t_ft = cm_to_ft(center_run_cm)
-            if meta["len_ft"] > (2.0 * end_clear_ft):
-                center_t_ft = min(meta["len_ft"] - end_clear_ft, max(end_clear_ft, center_t_ft))
+            if anchor_x_cm is not None and anchor_y_cm is not None:
+                px = cm_to_ft(anchor_x_cm)
+                py = cm_to_ft(anchor_y_cm)
+            elif run_rec is not None:
+                s_cm = float(op.get("start_cm", 0.0))
+                e_cm = float(op.get("end_cm", s_cm))
+                if e_cm < s_cm:
+                    s_cm, e_cm = e_cm, s_cm
+                edge_len_cm = max(1.0, float(run_rec.get("len_cm", 1.0)))
+                center_edge_cm = min(edge_len_cm, max(0.0, (s_cm + e_cm) * 0.5))
+                center_run_cm = float(run_rec.get("offset_cm", 0.0)) + center_edge_cm
+                center_t_ft = cm_to_ft(center_run_cm)
+                if meta["len_ft"] > (2.0 * end_clear_ft):
+                    center_t_ft = min(meta["len_ft"] - end_clear_ft, max(end_clear_ft, center_t_ft))
+                else:
+                    center_t_ft = meta["len_ft"] * 0.5
+                px = meta["center_start"].X + (meta["dir_x"] * center_t_ft)
+                py = meta["center_start"].Y + (meta["dir_y"] * center_t_ft)
             else:
-                center_t_ft = meta["len_ft"] * 0.5
+                attempt["status"] = "failed"
+                attempt["reason"] = "missing_anchor"
+                opening_errors.append("{} edge {}: no anchor point".format(otype, host_edge))
+                opening_attempts.append(attempt)
+                continue
 
-            px = meta["center_start"].X + (meta["dir_x"] * center_t_ft)
-            py = meta["center_start"].Y + (meta["dir_y"] * center_t_ft)
             attempt["mapped_wall_idx"] = int(wall_idx)
             attempt["point_xy_ft"] = [px, py]
+            attempt["host_fallback"] = bool(used_host_fallback)
+            if host_fallback_dist_cm is not None:
+                attempt["host_fallback_dist_cm"] = float(host_fallback_dist_cm)
 
             try:
                 if otype == "door":
                     dw = cm_to_ft(float(op.get("width_cm", cfg.get("default_door_width_cm", 100.0))))
                     dh = cm_to_ft(float(op.get("height_cm", cfg.get("default_door_height_cm", 210.0))))
-                    sym = get_symbol_by_width(BuiltInCategory.OST_Doors, dw)
+                    sym = get_symbol_by_width(BuiltInCategory.OST_Doors, dw, cfg=cfg, audit=opening_family_rejects)
                     if sym is None:
                         attempt["status"] = "failed"
                         attempt["reason"] = "door_symbol_missing"
                         opening_errors.append("door edge {}: no door family symbol".format(host_edge))
                         opening_attempts.append(attempt)
                         continue
+                    sym_name = _symbol_display_name(sym)
+                    attempt["symbol"] = sym_name
                     if not sym.IsActive:
                         sym.Activate()
                         doc.Regenerate()
-                    place_pt = _project_point_to_wall_axis(walls[wall_idx], XYZ(px, py, 0.0))
+                    raw_pt = XYZ(px, py, 0.0)
+                    place_pt = _project_point_to_wall_axis(walls[wall_idx], raw_pt)
                     inst = doc.Create.NewFamilyInstance(place_pt, sym, walls[wall_idx], level, Structure.StructuralType.NonStructural)
                     set_opening_size(inst, dw, dh, BuiltInParameter.DOOR_WIDTH, BuiltInParameter.DOOR_HEIGHT)
                     door_ids.append(inst.Id.IntegerValue)
                     attempt["status"] = "placed"
                     attempt["instance_id"] = inst.Id.IntegerValue
+                    opening_family_choices.append({
+                        "type": "door",
+                        "instance_id": inst.Id.IntegerValue,
+                        "symbol": sym_name,
+                        "width_ft": dw,
+                    })
 
                 elif otype == "window":
                     ww = cm_to_ft(float(op.get("width_cm", cfg.get("default_window_width_cm", 100.0))))
                     wh = cm_to_ft(float(op.get("height_cm", cfg.get("default_window_height_cm", 100.0))))
                     sill = cm_to_ft(float(op.get("sill_cm", cfg.get("default_window_sill_cm", 105.0))))
-                    sym = get_symbol_by_width(BuiltInCategory.OST_Windows, ww)
+                    sym = get_symbol_by_width(BuiltInCategory.OST_Windows, ww, cfg=cfg, audit=opening_family_rejects)
                     if sym is None:
                         attempt["status"] = "failed"
                         attempt["reason"] = "window_symbol_missing"
                         opening_errors.append("window edge {}: no window family symbol".format(host_edge))
                         opening_attempts.append(attempt)
                         continue
+                    sym_name = _symbol_display_name(sym)
+                    attempt["symbol"] = sym_name
                     if not sym.IsActive:
                         sym.Activate()
                         doc.Regenerate()
-                    place_pt = _project_point_to_wall_axis(walls[wall_idx], XYZ(px, py, sill))
+                    raw_pt = XYZ(px, py, sill)
+                    place_pt = _project_point_to_wall_axis(walls[wall_idx], raw_pt)
                     inst = doc.Create.NewFamilyInstance(place_pt, sym, walls[wall_idx], level, Structure.StructuralType.NonStructural)
                     set_opening_size(inst, ww, wh, BuiltInParameter.WINDOW_WIDTH, BuiltInParameter.WINDOW_HEIGHT)
                     set_param(inst, BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM, sill)
                     window_ids.append(inst.Id.IntegerValue)
                     attempt["status"] = "placed"
                     attempt["instance_id"] = inst.Id.IntegerValue
+                    opening_family_choices.append({
+                        "type": "window",
+                        "instance_id": inst.Id.IntegerValue,
+                        "symbol": sym_name,
+                        "width_ft": ww,
+                    })
 
             except Exception as ex:
                 attempt["status"] = "failed"
@@ -946,9 +1117,13 @@ def build_model_from_topology(level, topology, cfg, snapshot):
                 "internal_wall_ids": internal_wall_ids,
                 "internal_wall_rejected_count": internal_wall_rejected,
                 "internal_wall_error_count": len(internal_wall_errors),
+                "internal_wall_reject_breakdown": internal_wall_reject_breakdown,
                 "door_ids": door_ids,
                 "window_ids": window_ids,
                 "opening_errors": opening_errors,
+                "opening_host_fallback_count": int(opening_host_fallback_count),
+                "opening_family_choices": opening_family_choices[:120],
+                "opening_family_rejects": opening_family_rejects[:240],
                 "opening_attempt_count": len(opening_attempts),
                 "opening_placed_count": len(placed_attempts),
                 "opening_failed_count": len(failed_attempts),

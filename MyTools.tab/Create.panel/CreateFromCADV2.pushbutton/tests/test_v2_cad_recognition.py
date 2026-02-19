@@ -155,6 +155,35 @@ class CADRecognitionV2Tests(unittest.TestCase):
         self.assertIn("door", types)
         self.assertIn("window", types)
 
+    def test_openings_include_center_anchor_coordinates(self):
+        walls = [
+            {"type": "line", "layer": "A-WALL", "x1": 0, "y1": 0, "x2": 400, "y2": 0},
+            {"type": "line", "layer": "A-WALL", "x1": 400, "y1": 0, "x2": 400, "y2": 260},
+            {"type": "line", "layer": "A-WALL", "x1": 400, "y1": 260, "x2": 0, "y2": 260},
+            {"type": "line", "layer": "A-WALL", "x1": 0, "y1": 260, "x2": 0, "y2": 0},
+        ]
+        door_arc = [{"type": "arc", "layer": "DOOR", "cx": 140.0, "cy": 0.0,
+                     "r": 50.0, "sx": 90.0, "sy": 0.0, "ex": 190.0, "ey": 0.0}]
+        window_line = [{"type": "line", "layer": "WINDOW", "x1": 250.0, "y1": 260.0, "x2": 340.0, "y2": 260.0}]
+        classified = {
+            "wall_lines": walls,
+            "door_lines": [],
+            "window_lines": window_line,
+            "door_arcs": door_arc,
+            "window_arcs": [],
+            "unclassified_lines": [],
+            "unclassified_arcs": [],
+        }
+
+        out = recognize_topology(classified, default_config())
+        openings = list(out.get("openings", []))
+        self.assertGreaterEqual(len(openings), 2, "Expected at least one door and one window")
+        for op in openings:
+            self.assertIn("center_x_cm", op)
+            self.assertIn("center_y_cm", op)
+            self.assertTrue(isinstance(float(op["center_x_cm"]), float))
+            self.assertTrue(isinstance(float(op["center_y_cm"]), float))
+
     def test_fallback_creates_default_100cm_window(self):
         walls = [
             {"type": "line", "layer": "A-WALL", "x1": 0, "y1": 0, "x2": 300, "y2": 0},
