@@ -5,6 +5,7 @@ __doc__ = "CAD to Revit V5 – detect double-wall pairs, build walls/doors/windo
 from Autodesk.Revit.DB import *
 from Autodesk.Revit.DB.Structure import StructuralType
 import math
+import os
 
 try:
     from collections import defaultdict
@@ -26,21 +27,28 @@ uidoc = __revit__.ActiveUIDocument
 MM_TO_FT = 1.0 / 304.8
 
 # Filtering
-MIN_LEN_FT       = 250 * MM_TO_FT
+# Keep short CAD segments (door jambs, small returns) in the pairing stage,
+# but still require a larger minimum when creating wall axes/fragments.
+MIN_RAW_LEN_FT   = 80  * MM_TO_FT
+MIN_AXIS_LEN_FT  = 120 * MM_TO_FT
 ANGLE_TOL_DEG    = 1.0
 
 # Pairing wall side lines
 OVERLAP_MIN      = 0.55
-THICK_MIN_FT     = 70  * MM_TO_FT
+THICK_MIN_FT     = 5   * MM_TO_FT   # lowered: CAD may use thin symbolic lines (10-20mm apart)
 THICK_MAX_FT     = 600 * MM_TO_FT
 THICK_CLUSTER_TOL_FT = 8 * MM_TO_FT
+DEFAULT_WALL_THICK_FT = 200 * MM_TO_FT  # if detected thickness < 50mm, override to this
 
 # Make walls continuous across openings
 MERGE_GAP_MAX_FT = 3000 * MM_TO_FT   # allow merging across openings up to 3m
 COLLINEAR_DIST_TOL_FT = 5 * MM_TO_FT
+AXIS_INTERVAL_MERGE_TOL_FT = 3 * MM_TO_FT   # avoid smoothing small CAD offsets
 
 # Split at intersections
 INTERSECT_TOL_FT      = 5 * MM_TO_FT
+OPENING_SPLIT_SKIP_TOL_FT = 20 * MM_TO_FT   # don't cut wall axes through known openings
+OPENING_CLIP_TOL_FT       = 2  * MM_TO_FT   # tolerate floating-point drift when transferring openings
 
 # Wall creation
 DEFAULT_WALL_HEIGHT_FT = 3000 * MM_TO_FT
@@ -49,6 +57,10 @@ DEFAULT_WALL_HEIGHT_FT = 3000 * MM_TO_FT
 DOOR_ARC_R_MIN_FT = 450 * MM_TO_FT
 DOOR_ARC_R_MAX_FT = 1500 * MM_TO_FT
 HOST_SEARCH_DIST_FT = 350 * MM_TO_FT
+BRIDGE_JAMB_MAX_LEN_FT = 1800 * MM_TO_FT   # short returns/jambs for recessed-door fallback
+BRIDGE_JAMB_PAR_TOL_DEG = 6.0
+BRIDGE_GAP_PERP_DOT_MAX = 0.35             # gap vector should be ~perpendicular to jambs
+BRIDGE_HOST_EXTEND_FT   = 60 * MM_TO_FT    # extend synthetic host into jambs a bit
 
 # Gaps classification
 GAP_MIN_DOOR_FT   = 650 * MM_TO_FT
@@ -56,6 +68,9 @@ GAP_MAX_DOOR_FT   = 1400 * MM_TO_FT
 GAP_MIN_WIN_FT    = 450 * MM_TO_FT
 GAP_MAX_WIN_FT    = 4500 * MM_TO_FT
 ARC_NEAR_GAP_FT   = 450 * MM_TO_FT
+WINDOW_HOST_MIN_THICK_FT = 60 * MM_TO_FT   # avoid hosting on thin symbolic line-pair "walls"
+WINDOW_HOST_THIN_PENALTY_FT = 500 * MM_TO_FT
+WINDOW_HOST_SHORT_PENALTY_FT = 200 * MM_TO_FT
 
 # Curtain threshold (gap width)
 CURTAIN_THRESHOLD_FT = 2400 * MM_TO_FT  # 2.4m+: treat as curtain wall/glazing
@@ -63,7 +78,7 @@ CURTAIN_THRESHOLD_FT = 2400 * MM_TO_FT  # 2.4m+: treat as curtain wall/glazing
 DEFAULT_SILL_FT   = 1000 * MM_TO_FT
 
 # Envelope graph tolerances
-NODE_MERGE_TOL_FT = 80 * MM_TO_FT      # node snapping for graph (80mm)
+NODE_MERGE_TOL_FT = 25 * MM_TO_FT      # tighter node snapping avoids collapsing small corners
 MAX_LOOP_NODES    = 220               # safety limit for loop search
 
 # Toggles
@@ -132,6 +147,41 @@ def line_intersection_param(a0, a1, b0, b1, tol=1e-12):
     return (t, u)
 
 def cross2(a,b): return a[0]*b[1] - a[1]*b[0]
+
+def clamp(v, lo, hi):
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+def closest_point_on_segment_xy(p, a, b):
+    ab = vsub(b, a)
+    ab2 = vdot(ab, ab)
+    if ab2 <= 1e-12:
+        return a
+    t = vdot(vsub(p, a), ab) / ab2
+    t = clamp(t, 0.0, 1.0)
+    return vadd(a, vmul(ab, t))
+
+def dist_point_to_segment_xy(p, a, b):
+    q = closest_point_on_segment_xy(p, a, b)
+    return vlen(vsub(p, q))
+
+def segment_param_xy(p, a, b):
+    ab = vsub(b, a)
+    ab2 = vdot(ab, ab)
+    if ab2 <= 1e-12:
+        return 0.0
+    return vdot(vsub(p, a), ab) / ab2
+
+def scalar_in_intervals(t, intervals, tol=0.0):
+    for (a, b) in intervals:
+        lo = min(a, b) - tol
+        hi = max(a, b) + tol
+        if lo <= t <= hi:
+            return True
+    return False
 
 # ============================================================
 # Spatial grid
@@ -215,10 +265,29 @@ def extract_lines_and_arcs(import_inst):
     opt.DetailLevel = ViewDetailLevel.Fine
     geo = import_inst.get_Geometry(opt)
     lines=[]; arcs=[]
+
+    def add_polyline_segments(pl):
+        try:
+            pts = list(pl.GetCoordinates())
+        except Exception:
+            return
+        if not pts or len(pts) < 2:
+            return
+        for i in range(len(pts) - 1):
+            p0 = pts[i]
+            p1 = pts[i + 1]
+            try:
+                if p0.DistanceTo(p1) > 1e-9:
+                    lines.append(Line.CreateBound(p0, p1))
+            except Exception:
+                continue
+
     def walk(g):
         for obj in g:
             if isinstance(obj, GeometryInstance):
                 walk(obj.GetInstanceGeometry())
+            elif isinstance(obj, PolyLine):
+                add_polyline_segments(obj)
             elif isinstance(obj, Line):
                 lines.append(obj)
             elif isinstance(obj, Arc):
@@ -294,7 +363,7 @@ def build_center_from_pair(a,b,thick):
     if b0>b1: b0,b1=b1,b0
 
     s0=max(a0,b0); s1=min(a1,b1)
-    if (s1-s0) <= MIN_LEN_FT:
+    if (s1-s0) <= MIN_AXIS_LEN_FT:
         return None
 
     pa0=vadd(o, vmul(d,s0))
@@ -326,7 +395,7 @@ def axis_bucket_key(seg):
     db=quant_dir(d)
     n=(-d[1], d[0])
     off=vdot(seg.a, n)
-    qoff=int(round(off / (20*MM_TO_FT))) # 20mm bucket
+    qoff=int(round(off / (10*MM_TO_FT))) # 10mm bucket keeps close parallel axes distinct
     tkey=int(round(seg.thick / THICK_CLUSTER_TOL_FT))
     return (db[0], db[1], qoff, tkey, round(seg.z,6))
 
@@ -359,7 +428,7 @@ def build_wall_axes(center_segs):
             if s0>s1: s0,s1=s1,s0
             intervals.append((s0,s1))
 
-        merged=merge_intervals(intervals, 10*MM_TO_FT) # tiny merge
+        merged=merge_intervals(intervals, AXIS_INTERVAL_MERGE_TOL_FT)
         if not merged:
             continue
 
@@ -410,15 +479,31 @@ def split_axes_at_intersections(axes):
                 p=vadd(s.a, vmul(vsub(s.b,s.a), max(0.0,min(1.0,ta))))
                 t=project_scalar_on_axis(p, s.o, s.d)
                 if s.tmin+1e-6 < t < s.tmax-1e-6:
+                    # Preserve opening spans (doors/windows) on the host wall axis.
+                    # Intersections from jamb/return axes can otherwise split the axis
+                    # and drop the opening metadata due to rounding.
+                    if s.openings and scalar_in_intervals(t, s.openings, OPENING_SPLIT_SKIP_TOL_FT):
+                        continue
                     cuts.append(t)
 
         cuts=sorted(set([round(c,6) for c in cuts]))
         for i in range(len(cuts)-1):
             t0,t1=cuts[i],cuts[i+1]
-            if (t1-t0) < MIN_LEN_FT:
+            if (t1-t0) < MIN_AXIS_LEN_FT:
                 continue
             wa=WallAxis(s.o,s.d,s.z,s.thick,t0,t1)
-            wa.openings=[(a,b) for (a,b) in s.openings if a>=t0 and b<=t1]
+            # Clip overlapping openings onto each split segment to survive
+            # small floating-point drift in intersection cuts.
+            clipped=[]
+            for (a,b) in s.openings:
+                oa=max(a, t0 - OPENING_CLIP_TOL_FT)
+                ob=min(b, t1 + OPENING_CLIP_TOL_FT)
+                if (ob - oa) > (1 * MM_TO_FT):
+                    oa=max(oa, t0)
+                    ob=min(ob, t1)
+                    if (ob - oa) > (1 * MM_TO_FT):
+                        clipped.append((oa,ob))
+            wa.openings=merge_intervals(clipped, OPENING_CLIP_TOL_FT)
             out.append(wa)
     return out
 
@@ -524,48 +609,86 @@ def draw_axes(axes, name):
 
     t=Transaction(doc, name)
     t.Start()
-    for z, items in byz.items():
-        sp=ensure_sketch_plane(items[0].z)
-        for w in items:
-            ln=Line.CreateBound(xy_to_xyz(w.a,w.z), xy_to_xyz(w.b,w.z))
-            doc.Create.NewModelCurve(ln, sp)
-    t.Commit()
+    try:
+        for z, items in byz.items():
+            sp=ensure_sketch_plane(items[0].z)
+            for w in items:
+                ln=Line.CreateBound(xy_to_xyz(w.a,w.z), xy_to_xyz(w.b,w.z))
+                doc.Create.NewModelCurve(ln, sp)
+        t.Commit()
+    except Exception as e:
+        t.RollBack()
+        print("draw_axes '%s' failed: %s" % (name, str(e)))
 
 def draw_points(points_xy, z, name):
     if not points_xy:
         return
-    sp=ensure_sketch_plane(z)
     t=Transaction(doc, name)
     t.Start()
-    s=150*MM_TO_FT
-    for p in points_xy:
-        p1=(p[0]-s,p[1]); p2=(p[0]+s,p[1])
-        p3=(p[0],p[1]-s); p4=(p[0],p[1]+s)
-        doc.Create.NewModelCurve(Line.CreateBound(xy_to_xyz(p1,z), xy_to_xyz(p2,z)), sp)
-        doc.Create.NewModelCurve(Line.CreateBound(xy_to_xyz(p3,z), xy_to_xyz(p4,z)), sp)
-    t.Commit()
+    try:
+        sp=ensure_sketch_plane(z)
+        s=150*MM_TO_FT
+        for p in points_xy:
+            p1=(p[0]-s,p[1]); p2=(p[0]+s,p[1])
+            p3=(p[0],p[1]-s); p4=(p[0],p[1]+s)
+            doc.Create.NewModelCurve(Line.CreateBound(xy_to_xyz(p1,z), xy_to_xyz(p2,z)), sp)
+            doc.Create.NewModelCurve(Line.CreateBound(xy_to_xyz(p3,z), xy_to_xyz(p4,z)), sp)
+        t.Commit()
+    except Exception as e:
+        t.RollBack()
+        print("draw_points '%s' failed: %s" % (name, str(e)))
 
 # ============================================================
 # WallTypes and Walls
 # ============================================================
+def _find_basic_walltype():
+    """Find a Basic (layered) WallType suitable for duplication."""
+    for wt in FilteredElementCollector(doc).OfClass(WallType):
+        try:
+            if wt.Kind == WallKind.Basic:
+                return wt
+        except Exception:
+            continue
+    # fallback: just use first
+    return FilteredElementCollector(doc).OfClass(WallType).FirstElement()
+
+def _safe_elem_name(elem):
+    """IronPython-safe element name getter (WallType.Name can raise `Name`)."""
+    try:
+        return elem.Name
+    except Exception:
+        pass
+    try:
+        return Element.Name.GetValue(elem)
+    except Exception:
+        pass
+    try:
+        p = elem.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)
+        if p:
+            return p.AsString()
+    except Exception:
+        pass
+    return None
+
 def get_or_create_walltype(doc, thick_ft, prefix="CAD_Auto"):
-    base = FilteredElementCollector(doc).OfClass(WallType).FirstElement()
     mm = thick_ft * 304.8
     name = "%s_%dmm" % (prefix, int(round(mm)))
 
     for wt in FilteredElementCollector(doc).OfClass(WallType):
-        if wt.Name == name:
+        if _safe_elem_name(wt) == name:
             return wt
 
+    base = _find_basic_walltype()
     new_type = base.Duplicate(name)
-    cs = new_type.GetCompoundStructure()
-    if cs:
-        n_layers = cs.LayerCount
-        if n_layers > 0:
+    try:
+        cs = new_type.GetCompoundStructure()
+        if cs and cs.LayerCount > 0:
             cs.SetLayerWidth(0, thick_ft)
-            for i in range(1, n_layers):
+            for i in range(1, cs.LayerCount):
                 cs.SetLayerWidth(i, 0.0)
             new_type.SetCompoundStructure(cs)
+    except Exception as e:
+        print("Warning: could not set wall thickness: %s" % str(e))
     return new_type
 
 def create_walls(axes, level, height_ft):
@@ -573,15 +696,19 @@ def create_walls(axes, level, height_ft):
     out=[]
     t=Transaction(doc, "V5 Create Walls")
     t.Start()
-    for w in axes:
-        key=int(round(w.thick/THICK_CLUSTER_TOL_FT))
-        if key not in wt_cache:
-            wt_cache[key]=get_or_create_walltype(doc, w.thick, prefix="CAD_Auto")
-        wt=wt_cache[key]
-        ln=Line.CreateBound(xy_to_xyz(w.a, level.Elevation), xy_to_xyz(w.b, level.Elevation))
-        wall=Wall.Create(doc, ln, wt.Id, level.Id, height_ft, 0.0, False, False)
-        out.append((w, wall))
-    t.Commit()
+    try:
+        for w in axes:
+            key=int(round(w.thick/THICK_CLUSTER_TOL_FT))
+            if key not in wt_cache:
+                wt_cache[key]=get_or_create_walltype(doc, w.thick, prefix="CAD_Auto")
+            wt=wt_cache[key]
+            ln=Line.CreateBound(xy_to_xyz(w.a, level.Elevation), xy_to_xyz(w.b, level.Elevation))
+            wall=Wall.Create(doc, ln, wt.Id, level.Id, height_ft, 0.0, False, False)
+            out.append((w, wall))
+        t.Commit()
+    except Exception as e:
+        t.RollBack()
+        raise Exception("create_walls failed: %s" % str(e))
     return out
 
 # ============================================================
@@ -591,11 +718,35 @@ class WallRef2D(object):
     def __init__(self, axis, wall):
         self.axis=axis
         self.wall=wall
+        try:
+            self.wall_id = wall.Id.IntegerValue
+        except Exception:
+            self.wall_id = str(wall.Id)
         crv=wall.Location.Curve
         p0=crv.GetEndPoint(0); p1=crv.GetEndPoint(1)
         self.a=xyz_to_xy(p0); self.b=xyz_to_xy(p1)
         self.dir=vnorm(vsub(self.b,self.a))
         self.bb=bbox_from_line_xy(self.a,self.b)
+
+def snap_host_point_xy(wr, p_xy):
+    return closest_point_on_segment_xy(p_xy, wr.a, wr.b)
+
+def has_near_point(points_xy, p_xy, tol_ft):
+    for q in points_xy:
+        if vlen(vsub(q, p_xy)) <= tol_ft:
+            return True
+    return False
+
+def has_near_hosted_item(items, wr, p_xy, tol_ft):
+    for it in items:
+        wr2 = it.get("wr", None)
+        if wr2 is None:
+            continue
+        if getattr(wr2, "wall_id", None) != getattr(wr, "wall_id", None):
+            continue
+        if vlen(vsub(it.get("pt"), p_xy)) <= tol_ft:
+            return True
+    return False
 
 def nearest_wall(wall_refs, p_xy, max_dist_ft, exterior_only=None):
     best=None; bestd=1e9
@@ -614,6 +765,173 @@ def nearest_wall(wall_refs, p_xy, max_dist_ft, exterior_only=None):
         return best
     return None
 
+def best_host_wall_for_opening_point(wall_refs, p_xy, axis_dir=None, preferred_wr=None,
+                                     exterior_only=None, max_dist_ft=None,
+                                     min_thick_ft=None, target_opening_gap_ft=None):
+    """
+    Pick the best wall host for an opening point, preferring a wall segment that
+    actually contains the point (not one that only matches by infinite-line distance).
+    This avoids endpoint clamping when walls were split into short segments.
+    """
+    if max_dist_ft is None:
+        max_dist_ft = HOST_SEARCH_DIST_FT
+
+    best = None
+    best_score = 1e18
+
+    for wr in wall_refs:
+        if exterior_only is True and not wr.axis.is_exterior:
+            continue
+        if exterior_only is False and wr.axis.is_exterior:
+            continue
+        if axis_dir is not None and not angle_parallel(axis_dir, wr.dir, 5.0):
+            continue
+        if not (wr.bb[0]-max_dist_ft <= p_xy[0] <= wr.bb[2]+max_dist_ft and
+                wr.bb[1]-max_dist_ft <= p_xy[1] <= wr.bb[3]+max_dist_ft):
+            continue
+
+        q = closest_point_on_segment_xy(p_xy, wr.a, wr.b)
+        d = vlen(vsub(p_xy, q))
+        if d > max_dist_ft:
+            continue
+
+        t = segment_param_xy(p_xy, wr.a, wr.b)
+        seg_len = max(vlen(vsub(wr.b, wr.a)), 1e-9)
+        wr_thick = getattr(getattr(wr, "axis", None), "thick", 0.0)
+        if t < 0.0:
+            overrun = (-t) * seg_len
+        elif t > 1.0:
+            overrun = (t - 1.0) * seg_len
+        else:
+            overrun = 0.0
+
+        # Strongly prefer a segment that actually contains the opening point.
+        score = d + (overrun * 8.0)
+
+        if preferred_wr is not None and getattr(wr, "wall_id", None) != getattr(preferred_wr, "wall_id", None):
+            score += 5 * MM_TO_FT
+
+        # Window/cw placement: penalize thin symbolic segments and very short hosts.
+        if min_thick_ft is not None and wr_thick < min_thick_ft:
+            score += WINDOW_HOST_THIN_PENALTY_FT
+        if target_opening_gap_ft is not None and seg_len < (target_opening_gap_ft + 150 * MM_TO_FT):
+            score += WINDOW_HOST_SHORT_PENALTY_FT
+
+        if score < best_score:
+            best_score = score
+            best = wr
+
+    return best
+
+def nearest_wall_for_door_arc(wall_refs, arc, exterior_only=None):
+    # Primary probe: chord midpoint (normal case)
+    e0 = xyz_to_xy(arc.GetEndPoint(0))
+    e1 = xyz_to_xy(arc.GetEndPoint(1))
+    chord_mid = ((e0[0]+e1[0])/2.0, (e0[1]+e1[1])/2.0)
+    wr = nearest_wall(wall_refs, chord_mid, HOST_SEARCH_DIST_FT, exterior_only=exterior_only)
+    if wr:
+        return wr
+
+    # Fallback probes: hinge/arc center and endpoints. This recovers doors in
+    # recessed openings where the midpoint falls inside a gap between split hosts.
+    probes = [xyz_to_xy(arc.Center), e0, e1]
+    probe_dists = [HOST_SEARCH_DIST_FT, max(HOST_SEARCH_DIST_FT, 650 * MM_TO_FT)]
+
+    for p in probes:
+        for dmax in probe_dists:
+            wr = nearest_wall(wall_refs, p, dmax, exterior_only=exterior_only)
+            if wr:
+                return wr
+    return None
+
+def _quant_pt_key(p, mm=25.0):
+    q = mm * MM_TO_FT
+    return (int(round(p[0] / q)), int(round(p[1] / q)))
+
+def door_data_from_bridge_jamb_pairs(wall_refs, existing_door_points_xy, cad_segs):
+    """
+    Fallback for recessed/internal openings where no wall axis exists across the mouth
+    (e.g. U-shaped wall returns with a door swing drawn between the jambs).
+    """
+    out = []
+    local_pts = []
+
+    n = len(wall_refs)
+    for i in range(n):
+        wr1 = wall_refs[i]
+        if wr1.axis.is_exterior:
+            continue
+        if vlen(vsub(wr1.a, wr1.b)) > BRIDGE_JAMB_MAX_LEN_FT:
+            continue
+
+        for j in range(i + 1, n):
+            wr2 = wall_refs[j]
+            if wr2.axis.is_exterior:
+                continue
+            if vlen(vsub(wr2.a, wr2.b)) > BRIDGE_JAMB_MAX_LEN_FT:
+                continue
+            if not angle_parallel(wr1.dir, wr2.dir, BRIDGE_JAMB_PAR_TOL_DEG):
+                continue
+
+            # Similar wall thicknesses reduce false matches.
+            if abs(getattr(wr1.axis, "thick", DEFAULT_WALL_THICK_FT) -
+                   getattr(wr2.axis, "thick", DEFAULT_WALL_THICK_FT)) > (120 * MM_TO_FT):
+                continue
+
+            for p1 in (wr1.a, wr1.b):
+                for p2 in (wr2.a, wr2.b):
+                    gap_vec = vsub(p2, p1)
+                    gap = vlen(gap_vec)
+                    if gap < GAP_MIN_DOOR_FT or gap > GAP_MAX_DOOR_FT:
+                        continue
+                    gdir = vnorm(gap_vec)
+
+                    # We want the vector between jamb ends, not along the jambs.
+                    if abs(vdot(gdir, wr1.dir)) > BRIDGE_GAP_PERP_DOT_MAX:
+                        continue
+
+                    mid = ((p1[0] + p2[0]) * 0.5, (p1[1] + p2[1]) * 0.5)
+
+                    if has_near_point(existing_door_points_xy, mid, ARC_NEAR_GAP_FT):
+                        continue
+                    if has_near_point(local_pts, mid, 250 * MM_TO_FT):
+                        continue
+
+                    # Require CAD evidence of a door leaf near the opening.
+                    has_leaf = (opening_has_door_leaf_evidence(cad_segs, wr1, mid, gap) or
+                                opening_has_door_leaf_evidence(cad_segs, wr2, mid, gap))
+                    if not has_leaf:
+                        continue
+
+                    # Normalize endpoint order for stable dedupe.
+                    k1 = _quant_pt_key(p1)
+                    k2 = _quant_pt_key(p2)
+                    if k2 < k1:
+                        p1, p2 = p2, p1
+                        gap_vec = vsub(p2, p1)
+                        gdir = vnorm(gap_vec)
+
+                    ext = BRIDGE_HOST_EXTEND_FT
+                    a_host = vadd(p1, vmul(gdir, -ext))
+                    b_host = vadd(p2, vmul(gdir,  ext))
+                    thick = 0.5 * (getattr(wr1.axis, "thick", DEFAULT_WALL_THICK_FT) +
+                                   getattr(wr2.axis, "thick", DEFAULT_WALL_THICK_FT))
+
+                    out.append({
+                        "pt": mid,
+                        "gap": gap,
+                        "side": 0.0,
+                        "ccw": False,
+                        "source": "bridge_jambs",
+                        "bridge_host": {
+                            "a": a_host,
+                            "b": b_host,
+                            "thick": thick
+                        }
+                    })
+                    local_pts.append(mid)
+    return out
+
 # ============================================================
 # Door data from arcs
 # ============================================================
@@ -628,13 +946,14 @@ def door_data_from_arcs(arcs, wall_refs):
         e1=xyz_to_xy(a.GetEndPoint(1))
         chord_mid=((e0[0]+e1[0])/2.0, (e0[1]+e1[1])/2.0)
 
-        wr = nearest_wall(wall_refs, chord_mid, HOST_SEARCH_DIST_FT, exterior_only=None)
+        wr = nearest_wall_for_door_arc(wall_refs, a, exterior_only=None)
         if not wr:
             continue
 
         o=wr.a; d=wr.dir
         t=project_scalar_on_axis(chord_mid, o, d)
         proj=vadd(o, vmul(d,t))
+        proj = snap_host_point_xy(wr, proj)
 
         c=xyz_to_xy(a.Center)
         n=(-d[1], d[0])
@@ -645,12 +964,80 @@ def door_data_from_arcs(arcs, wall_refs):
         z = cross2(v0, v1)
         ccw = (z > 0)
 
+        if has_near_hosted_item(out, wr, proj, 200 * MM_TO_FT):
+            continue
+
         out.append({
             "pt": proj,
             "wall": wr.wall,
+            "wr": wr,
             "side": side,
-            "ccw": ccw
+            "ccw": ccw,
+            "source": "arc"
         })
+    return out
+
+def opening_has_door_leaf_evidence(cad_segs, wr, p_xy, gap_ft):
+    # Door leafs are usually a medium-length line crossing/angling from the wall.
+    # Windows are more often represented with short parallel linework.
+    radius = max(ARC_NEAR_GAP_FT, gap_ft * 0.9)
+    min_leaf = max(300 * MM_TO_FT, gap_ft * 0.35)
+    max_leaf = min(2500 * MM_TO_FT, gap_ft * 1.8)
+    for s in cad_segs:
+        if s.len < min_leaf or s.len > max_leaf:
+            continue
+        if not (min(s.bb[0], s.bb[2]) - radius <= p_xy[0] <= max(s.bb[0], s.bb[2]) + radius and
+                min(s.bb[1], s.bb[3]) - radius <= p_xy[1] <= max(s.bb[1], s.bb[3]) + radius):
+            continue
+        if dist_point_to_segment_xy(p_xy, s.a, s.b) > radius:
+            continue
+        if angle_parallel(s.dir, wr.dir, 12.0):
+            continue
+        da = dist_point_to_infinite_line_xy(s.a, wr.a, wr.dir)
+        db = dist_point_to_infinite_line_xy(s.b, wr.a, wr.dir)
+        if min(da, db) > HOST_SEARCH_DIST_FT * 1.5:
+            continue
+        return True
+    return False
+
+def door_data_from_opening_gaps(wall_refs, existing_door_points_xy, cad_segs):
+    out = []
+    for wr in wall_refs:
+        ax = wr.axis
+        for (g0, g1) in ax.openings:
+            gap = g1 - g0
+            if gap < GAP_MIN_DOOR_FT or gap > GAP_MAX_DOOR_FT:
+                continue
+            mid = (g0 + g1) * 0.5
+            p = vadd(ax.o, vmul(ax.d, mid))
+            p = snap_host_point_xy(wr, p)
+
+            if has_near_point(existing_door_points_xy, p, ARC_NEAR_GAP_FT):
+                continue
+            if has_near_hosted_item(out, wr, p, 200 * MM_TO_FT):
+                continue
+
+            has_leaf = opening_has_door_leaf_evidence(cad_segs, wr, p, gap)
+
+            # Exterior openings need CAD evidence (door leaf/polyline fragment)
+            # to avoid converting narrow windows into doors.
+            if ax.is_exterior and not has_leaf:
+                continue
+
+            # Interior openings are often doors; allow common-width gaps even if
+            # the arc was missed, but avoid very wide gaps without evidence.
+            if (not ax.is_exterior) and (not has_leaf) and gap > (1100 * MM_TO_FT):
+                continue
+
+            out.append({
+                "pt": p,
+                "wall": wr.wall,
+                "wr": wr,
+                "side": 0.0,
+                "ccw": False,
+                "gap": gap,
+                "source": "gap"
+            })
     return out
 
 # ============================================================
@@ -659,6 +1046,8 @@ def door_data_from_arcs(arcs, wall_refs):
 def openings_from_exterior_axes(wall_refs, door_points_xy):
     wins=[]
     curtains=[]
+    win_pts_all = []
+    curtain_pts_all = []
     for wr in wall_refs:
         ax = wr.axis
         if not ax.is_exterior:
@@ -669,6 +1058,25 @@ def openings_from_exterior_axes(wall_refs, door_points_xy):
                 continue
             mid=(g0+g1)*0.5
             p=vadd(ax.o, vmul(ax.d, mid))
+            host_wr = best_host_wall_for_opening_point(
+                wall_refs, p, axis_dir=ax.d, preferred_wr=wr, exterior_only=True,
+                max_dist_ft=max(HOST_SEARCH_DIST_FT, 300 * MM_TO_FT),
+                min_thick_ft=WINDOW_HOST_MIN_THICK_FT,
+                target_opening_gap_ft=gap
+            ) or wr
+
+            # If we still ended up on a thin symbolic host, make one more pass without
+            # preferred-wall bias and with a wider search to catch the real exterior wall.
+            if getattr(host_wr.axis, "thick", 0.0) < WINDOW_HOST_MIN_THICK_FT:
+                host_wr2 = best_host_wall_for_opening_point(
+                    wall_refs, p, axis_dir=ax.d, preferred_wr=None, exterior_only=True,
+                    max_dist_ft=max(HOST_SEARCH_DIST_FT, 600 * MM_TO_FT),
+                    min_thick_ft=WINDOW_HOST_MIN_THICK_FT,
+                    target_opening_gap_ft=gap
+                )
+                if host_wr2 is not None:
+                    host_wr = host_wr2
+            p = snap_host_point_xy(host_wr, p)
 
             near=False
             for dp in door_points_xy:
@@ -678,10 +1086,18 @@ def openings_from_exterior_axes(wall_refs, door_points_xy):
                 continue
 
             if gap >= CURTAIN_THRESHOLD_FT:
-                curtains.append({"pt": p, "wall": wr.wall, "gap": gap})
+                if has_near_point(curtain_pts_all, p, 120 * MM_TO_FT):
+                    continue
+                if not has_near_hosted_item(curtains, host_wr, p, 200 * MM_TO_FT):
+                    curtains.append({"pt": p, "wall": host_wr.wall, "wr": host_wr, "gap": gap})
+                    curtain_pts_all.append(p)
             else:
                 if gap <= GAP_MAX_WIN_FT:
-                    wins.append({"pt": p, "wall": wr.wall, "gap": gap})
+                    if has_near_point(win_pts_all, p, 120 * MM_TO_FT):
+                        continue
+                    if not has_near_hosted_item(wins, host_wr, p, 200 * MM_TO_FT):
+                        wins.append({"pt": p, "wall": host_wr.wall, "wr": host_wr, "gap": gap})
+                        win_pts_all.append(p)
     return wins, curtains
 
 # ============================================================
@@ -711,6 +1127,25 @@ def get_symbol_by_width(symbols, target_ft):
             best = s
     return best
 
+def symbol_is_opening_only(sym):
+    parts = []
+    try:
+        parts.append(safe_strtype(sym.FamilyName))
+    except Exception:
+        pass
+    try:
+        parts.append(safe_strtype(_safe_elem_name(sym)))
+    except Exception:
+        pass
+    txt = " ".join(parts).lower()
+    return ("opening" in txt) or ("void" in txt) or (u"פתח" in txt)
+
+def choose_door_symbol(symbols, target_ft):
+    real_door_symbols = [s for s in symbols if not symbol_is_opening_only(s)]
+    if real_door_symbols:
+        return get_symbol_by_width(real_door_symbols, target_ft) or real_door_symbols[0]
+    return get_symbol_by_width(symbols, target_ft) or (symbols[0] if symbols else None)
+
 def ensure_active(sym):
     if sym and not sym.IsActive:
         sym.Activate()
@@ -724,32 +1159,81 @@ def place_doors(door_data, level):
     if not symbols:
         raise Exception("No Door FamilySymbol in project.")
     sym_default = symbols[0]
+    bridge_walltype_cache = {}
+    bridge_host_cache = {}
 
     t=Transaction(doc, "V5 Place Doors")
     t.Start()
-    placed=0
-    for d in door_data:
-        sym = get_symbol_by_width(symbols, 900*MM_TO_FT) or sym_default
-        ensure_active(sym)
+    try:
+        placed=0
+        for d in door_data:
+            try:
+                target_w = d.get("gap", 900*MM_TO_FT)
+                sym = choose_door_symbol(symbols, target_w) or sym_default
+                ensure_active(sym)
 
-        pt = xy_to_xyz(d["pt"], level.Elevation)
-        fi = doc.Create.NewFamilyInstance(pt, sym, d["wall"], level,
-                                          StructuralType.NonStructural)
+                wr = d.get("wr", None)
+                host_wall = d.get("wall", None)
 
-        try:
-            if d["side"] > 0:
-                fi.flipFacing()
-        except Exception:
-            pass
+                if (host_wall is None) and d.get("bridge_host"):
+                    bh = d["bridge_host"]
+                    a = bh["a"]; b = bh["b"]
+                    thick = bh.get("thick", DEFAULT_WALL_THICK_FT)
+                    kpts = sorted([_quant_pt_key(a, 10.0), _quant_pt_key(b, 10.0)])
+                    k = (kpts[0], kpts[1], int(round(thick / THICK_CLUSTER_TOL_FT)))
 
-        try:
-            if d["ccw"]:
-                fi.flipHand()
-        except Exception:
-            pass
+                    if k in bridge_host_cache:
+                        host_wall, wr = bridge_host_cache[k]
+                    else:
+                        wt_key = int(round(thick / THICK_CLUSTER_TOL_FT))
+                        if wt_key not in bridge_walltype_cache:
+                            bridge_walltype_cache[wt_key] = get_or_create_walltype(doc, thick, prefix="CAD_Auto")
+                        wt = bridge_walltype_cache[wt_key]
 
-        placed += 1
-    t.Commit()
+                        ln = Line.CreateBound(xy_to_xyz(a, level.Elevation), xy_to_xyz(b, level.Elevation))
+                        host_wall = Wall.Create(doc, ln, wt.Id, level.Id, DEFAULT_WALL_HEIGHT_FT, 0.0, False, False)
+
+                        axis_dir = vnorm(vsub(b, a))
+                        axis_len = vlen(vsub(b, a))
+                        fake_axis = WallAxis(a, axis_dir, level.Elevation, thick, 0.0, axis_len)
+                        fake_axis.is_exterior = False
+                        wr = WallRef2D(fake_axis, host_wall)
+                        bridge_host_cache[k] = (host_wall, wr)
+
+                    d["wall"] = host_wall
+                    d["wr"] = wr
+
+                if host_wall is None:
+                    continue
+
+                pt_xy = d["pt"]
+                if wr is not None:
+                    pt_xy = snap_host_point_xy(wr, pt_xy)
+                pt = xy_to_xyz(pt_xy, level.Elevation)
+                fi = doc.Create.NewFamilyInstance(pt, sym, host_wall, level,
+                                                  StructuralType.NonStructural)
+
+                try:
+                    if d["side"] > 0:
+                        fi.flipFacing()
+                except Exception:
+                    pass
+
+                try:
+                    if d["ccw"]:
+                        fi.flipHand()
+                except Exception:
+                    pass
+
+                placed += 1
+            except Exception as door_err:
+                print("Skipping door (%s): %s" % (d.get("source", "?"), str(door_err)))
+                continue
+        t.Commit()
+    except Exception as e:
+        t.RollBack()
+        print("place_doors failed: %s" % str(e))
+        placed = 0
     return placed
 
 # ============================================================
@@ -763,21 +1247,30 @@ def place_windows(win_data, level):
 
     t=Transaction(doc, "V5 Place Windows")
     t.Start()
-    placed=0
-    for w in win_data:
-        sym = get_symbol_by_width(symbols, w["gap"]) or sym_default
-        ensure_active(sym)
+    try:
+        placed=0
+        for w in win_data:
+            sym = get_symbol_by_width(symbols, w["gap"]) or sym_default
+            ensure_active(sym)
 
-        pt = xy_to_xyz(w["pt"], level.Elevation)
-        fi = doc.Create.NewFamilyInstance(pt, sym, w["wall"], level,
-                                          StructuralType.NonStructural)
+            pt_xy = w["pt"]
+            wr = w.get("wr", None)
+            if wr is not None:
+                pt_xy = snap_host_point_xy(wr, pt_xy)
+            pt = xy_to_xyz(pt_xy, level.Elevation)
+            fi = doc.Create.NewFamilyInstance(pt, sym, w["wall"], level,
+                                              StructuralType.NonStructural)
 
-        p_sill = fi.LookupParameter("Sill Height") or fi.LookupParameter("Sill")
-        if p_sill and not p_sill.IsReadOnly:
-            p_sill.Set(DEFAULT_SILL_FT)
+            p_sill = fi.LookupParameter("Sill Height") or fi.LookupParameter("Sill")
+            if p_sill and not p_sill.IsReadOnly:
+                p_sill.Set(DEFAULT_SILL_FT)
 
-        placed += 1
-    t.Commit()
+            placed += 1
+        t.Commit()
+    except Exception as e:
+        t.RollBack()
+        print("place_windows failed: %s" % str(e))
+        placed = 0
     return placed
 
 # ============================================================
@@ -800,22 +1293,27 @@ def create_curtain_walls(curtain_data, level):
 
     t=Transaction(doc, "V5 Create Curtain Walls")
     t.Start()
-    created=0
-    for c in curtain_data:
-        wall = c["wall"]
-        crv = wall.Location.Curve
-        p0 = crv.GetEndPoint(0); p1 = crv.GetEndPoint(1)
-        d = vnorm(vsub(xyz_to_xy(p1), xyz_to_xy(p0)))
+    try:
+        created=0
+        for c in curtain_data:
+            wall = c["wall"]
+            crv = wall.Location.Curve
+            p0 = crv.GetEndPoint(0); p1 = crv.GetEndPoint(1)
+            d = vnorm(vsub(xyz_to_xy(p1), xyz_to_xy(p0)))
 
-        half = c["gap"] * 0.5
-        mid = c["pt"]
-        a = vadd(mid, vmul(d, -half))
-        b = vadd(mid, vmul(d,  half))
+            half = c["gap"] * 0.5
+            mid = c["pt"]
+            a = vadd(mid, vmul(d, -half))
+            b = vadd(mid, vmul(d,  half))
 
-        ln = Line.CreateBound(xy_to_xyz(a, level.Elevation), xy_to_xyz(b, level.Elevation))
-        Wall.Create(doc, ln, wt.Id, level.Id, DEFAULT_WALL_HEIGHT_FT, 0.0, False, False)
-        created += 1
-    t.Commit()
+            ln = Line.CreateBound(xy_to_xyz(a, level.Elevation), xy_to_xyz(b, level.Elevation))
+            Wall.Create(doc, ln, wt.Id, level.Id, DEFAULT_WALL_HEIGHT_FT, 0.0, False, False)
+            created += 1
+        t.Commit()
+    except Exception as e:
+        t.RollBack()
+        print("create_curtain_walls failed: %s" % str(e))
+        created = 0
     return created
 
 # ============================================================
@@ -830,13 +1328,59 @@ if not isinstance(imp, ImportInstance):
     raise Exception("Selection is not an ImportInstance.")
 
 raw_lines, raw_arcs = extract_lines_and_arcs(imp)
-segs = [Seg(l) for l in raw_lines if l.Length >= MIN_LEN_FT]
+
+diag = []
+diag.append("Raw lines: %d, Raw arcs: %d" % (len(raw_lines), len(raw_arcs)))
+
+if raw_lines:
+    lengths_ft = sorted([l.Length for l in raw_lines])
+    diag.append("Line len range: %.4f..%.4f ft (%.1f..%.1f mm)" % (
+        lengths_ft[0], lengths_ft[-1], lengths_ft[0]*304.8, lengths_ft[-1]*304.8))
+    diag.append("MIN_RAW_LEN_FT=%.4f ft (%.1f mm)" % (MIN_RAW_LEN_FT, MIN_RAW_LEN_FT*304.8))
+    diag.append("MIN_AXIS_LEN_FT=%.4f ft (%.1f mm)" % (MIN_AXIS_LEN_FT, MIN_AXIS_LEN_FT*304.8))
+    for i, l in enumerate(raw_lines[:3]):
+        p0 = l.GetEndPoint(0); p1 = l.GetEndPoint(1)
+        diag.append("  L%d: (%.2f,%.2f)->(%.2f,%.2f) len=%.4f ft" % (
+            i, p0.X, p0.Y, p1.X, p1.Y, l.Length))
+
+segs = [Seg(l) for l in raw_lines if l.Length >= MIN_RAW_LEN_FT]
+diag.append("Segs after filter: %d" % len(segs))
+
+if segs:
+    sample_dists = []
+    for i in range(min(len(segs), 20)):
+        for j in range(i+1, min(len(segs), 20)):
+            if angle_parallel(segs[i].dir, segs[j].dir, ANGLE_TOL_DEG):
+                d = dist_point_to_infinite_line_xy(segs[j].a, segs[i].a, segs[i].dir)
+                if d > 0.001:
+                    sample_dists.append(d)
+    if sample_dists:
+        sample_dists.sort()
+        diag.append("Parallel dists (ft): %s" % [round(d,4) for d in sample_dists[:10]])
+        diag.append("Parallel dists (mm): %s" % [round(d*304.8,1) for d in sample_dists[:10]])
+    diag.append("THICK range: %.4f..%.4f ft (%.1f..%.1f mm)" % (
+        THICK_MIN_FT, THICK_MAX_FT, THICK_MIN_FT*304.8, THICK_MAX_FT*304.8))
+
+# Write diagnostics to file regardless of outcome
+_diag_path = os.path.join(os.environ.get("TEMP", "C:\\\\Temp"), "c2rv5_diag.txt")
+try:
+    with open(_diag_path, "w") as _f:
+        _f.write("\n".join(diag))
+except Exception:
+    pass
 
 pairs = find_parallel_pairs(segs)
 if not pairs:
-    raise Exception("No wall pairs found. Check units/scale/line duplication.")
+    msg = "No wall pairs found.\n" + "\n".join(diag)
+    raise Exception(msg)
 
 clusters = cluster_thickness([t for (_,_,t) in pairs], THICK_CLUSTER_TOL_FT)
+
+# If all detected thicknesses are tiny (symbolic lines), override to real wall thickness
+if all(c < 50 * MM_TO_FT for c in clusters):
+    print("Detected symbolic line spacing (%.1f mm). Overriding wall thickness to %.0f mm." % (
+        clusters[0]*304.8, DEFAULT_WALL_THICK_FT*304.8))
+    clusters = [DEFAULT_WALL_THICK_FT]
 
 center_segs=[]
 for a,b,t in pairs:
@@ -874,6 +1418,14 @@ wall_refs = [WallRef2D(axis, wall) for (axis, wall) in walls_axes_and_walls]
 
 # doors
 door_data = door_data_from_arcs(raw_arcs, wall_refs)
+gap_door_data = door_data_from_opening_gaps(wall_refs, [d["pt"] for d in door_data], segs)
+if gap_door_data:
+    door_data.extend(gap_door_data)
+    print("Doors inferred from gaps (arc missed): %d" % len(gap_door_data))
+bridge_door_data = door_data_from_bridge_jamb_pairs(wall_refs, [d["pt"] for d in door_data], segs)
+if bridge_door_data:
+    door_data.extend(bridge_door_data)
+    print("Doors inferred from jamb pairs (recessed openings): %d" % len(bridge_door_data))
 door_pts = [d["pt"] for d in door_data]
 
 if PREVIEW_DOOR_POINTS:
