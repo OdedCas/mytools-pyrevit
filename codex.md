@@ -2,65 +2,64 @@
 
 ## Project
 - Name: `mytools-pyrevit`
-- Main command: `Create From CAD V2`
-- Runtime: pyRevit (IronPython) + Revit API
+- Active command: `C2Rv5` (pyRevit pushbutton)
 - Dev repo: `/home/cassu/mytools-pyrevit`
-- Live extension: `/mnt/c/Users/cassu/AppData/Roaming/pyRevit/extensions/MyTools.extension`
+- Live pyRevit extension: `/mnt/c/Users/cassu/AppData/Roaming/pyRevit/extensions/MyTools.extension`
 
-## Current Implementation Status (2026-02-19)
-- Double-wall recognition: implemented.
-- Perimeter wall creation: merged collinear runs before wall creation (continuous walls).
-- Openings (door/window):
-  - strict category placement (`door -> OST_Doors`, `window -> OST_Windows`)
-  - projected to host wall axis
-  - clamped away from wall ends
-  - per-opening diagnostics recorded in snapshot summary
-- Internal walls:
-  - recognized as internal graph edges (inside polygon, non-boundary, min-length)
-  - collinear merge + dedupe
-  - created in model with duplicate-to-perimeter rejection
+## Current Active Mode (2026-03-05)
+- Script: `MyTools.tab/Create.panel/C2Rv5.pushbutton/script.py`
+- Build id: `C2Rv5.2-build-2026-03-04-0021`
+- `MARK_ONLY_MODE = True`
+- `PHASE1_WALLS_ONLY = True`
 
-## Files That Matter Most
-- `MyTools.tab/Create.panel/CreateFromCADV2.pushbutton/script.py`
-- `MyTools.tab/Create.panel/CreateFromCADV2.pushbutton/v2_cad_recognition.py`
-- `MyTools.tab/Create.panel/CreateFromCADV2.pushbutton/v2_cad_extract.py`
-- `MyTools.tab/Create.panel/CreateFromCADV2.pushbutton/cad_config.json`
-- `MyTools.tab/Create.panel/CreateFromCADV2.pushbutton/tests/test_v2_cad_recognition.py`
+Meaning:
+- No walls are created.
+- No doors/windows are placed.
+- Tool places only text markers in active view:
+  - `D` = detected door candidate
+  - `W` = detected window candidate
 
-## Snapshot Fields for Debug
-- `03_topology.json`
-  - `openings`
-  - `internal_walls_cm`
-  - `debug.solve_mode`
-- `08_geometry_summary.json`
-  - `opening_attempt_count`
-  - `opening_placed_count`
-  - `opening_failed_count`
-  - `opening_skipped_count`
-  - `opening_errors`
-  - `opening_attempts`
-  - `internal_wall_ids`
-  - `internal_wall_rejected_count`
+## Detection Strategy (Mark-Only)
+1. Topology-first:
+   - infer wall axes from CAD wall layers
+   - infer opening candidates from topology gaps/opening structure
+   - classify candidates using gap and arc evidence
+2. Layer fallback:
+   - if topology gives none, derive markers from `A-DOORS` / `A-WINDOWS` primitives
+   - fallback window guess can use `A-DOORS` when window layer is missing
 
-## Important Config Knobs
-- `model_wall_merge_angle_deg`
-- `model_wall_join_tol_cm`
-- `model_wall_min_length_cm`
-- `model_min_opening_confidence`
-- `model_opening_end_clearance_cm`
-- `model_place_synthetic_openings`
-- `enable_synthetic_window_fallback`
-- `internal_wall_min_length_cm`
-- `internal_wall_perimeter_duplicate_tol_cm`
+## Required CAD Layer Contract
+- Walls exterior: `A-WALL-EXT`
+- Walls interior: `A-WALL-INT`
+- Doors symbols: `A-DOORS`
+- Windows symbols: `A-WINDOWS`
 
-## Validation Commands
+Normalized matching is used (case/space/hyphen/underscore insensitive).
+
+## Key Files
+- `MyTools.tab/Create.panel/C2Rv5.pushbutton/script.py`
+- `README.md`
+- `codex.md`
+
+## Run / Validate in Revit
+1. pyRevit -> Reload
+2. Select one CAD `ImportInstance`
+3. Run `C2Rv5`
+4. Verify output contains:
+   - `Running C2Rv5.2-build-2026-03-04-0021`
+   - `Mode: MARK ONLY (no walls/doors/windows are created).`
+   - `MARK-ONLY: topology candidates D=... W=...`
+   - `MARK-ONLY mode: placed D marks=..., W marks=...`
+
+## Deploy to Live pyRevit Extension
 ```bash
-cd /home/cassu/mytools-pyrevit/MyTools.tab/Create.panel/CreateFromCADV2.pushbutton/tests
-python3 -m unittest -q
+cp /home/cassu/mytools-pyrevit/MyTools.tab/Create.panel/C2Rv5.pushbutton/script.py \
+  /mnt/c/Users/cassu/AppData/Roaming/pyRevit/extensions/MyTools.extension/MyTools.tab/Create.panel/C2Rv5.pushbutton/script.py
 ```
 
-## Deploy to Live Extension
-```bash
-cp /home/cassu/mytools-pyrevit/MyTools.tab/Create.panel/CreateFromCADV2.pushbutton/{script.py,v2_cad_recognition.py,v2_cad_extract.py,cad_config.json} \
-  /mnt/c/Users/cassu/AppData/Roaming/pyRevit/extensions/MyTools.extension/MyTools.tab/Create.panel/CreateFromCADV2.pushbutton/
-```
+## Commit Scope Rule
+When committing from this state, include only:
+- `codex.md`
+- `MyTools.tab/Create.panel/C2Rv5.pushbutton/script.py`
+
+Do not include unrelated pending files unless explicitly requested.

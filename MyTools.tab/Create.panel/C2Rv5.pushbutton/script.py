@@ -20,7 +20,7 @@ except ImportError:
 
 doc = __revit__.ActiveUIDocument.Document
 uidoc = __revit__.ActiveUIDocument
-BUILD_ID = "C2Rv5.2-build-2026-03-01-0225"
+BUILD_ID = "C2Rv5.2-build-2026-03-04-0021"
 
 # ============================================================
 # PARAMETERS (TUNE)
@@ -104,6 +104,7 @@ MAX_LOOP_NODES    = 220
 SINGLE_LINE_AXIS_MIN_LEN_FT = 900 * MM_TO_FT
 SINGLE_LINE_NEAR_AXIS_TOL_FT = 120 * MM_TO_FT
 SINGLE_LINE_DEFAULT_THICK_FT = 100 * MM_TO_FT
+ENABLE_SINGLE_LINE_AUGMENT = False
 
 # V5.2: Window jamb-pair detection (symbols, not gaps)
 WIN_JAMB_MAX_LEN_FT = 500 * MM_TO_FT
@@ -129,13 +130,39 @@ DOOR_REJECT_NAME_TOKENS = [
 ]
 DOOR_PREFERRED_FAMILY_TOKEN = u"עץ-ציר"
 DOOR_DEBUG_LIST_ON_PREFERRED_MISS = True
-DOOR_END_CLEARANCE_FT = 120 * MM_TO_FT
+AVOID_KNOWN_BROKEN_DOOR_FAMILIES = True
+BROKEN_DOOR_FAMILY_TOKENS = [u"עץ-ציר"]
+DOOR_END_CLEARANCE_FT = 80 * MM_TO_FT
 AXIS_OVERLAP_SUPPRESS_DIST_FT = 90 * MM_TO_FT
 OPENING_CONFLICT_CLEARANCE_FT = 900 * MM_TO_FT
 DOOR_REHOST_MAX_DIST_FT = 700 * MM_TO_FT
 ENABLE_AXIS_SPLIT_AT_INTERSECTIONS = False
 STRICT_OPENING_HOST_MODE = True
 STRICT_ARC_DOOR_REQUIRE_AXIS_GAP = True
+
+# CAD layer-first mode (room6 standard)
+USE_CAD_LAYER_WALLS = True
+USE_CAD_LAYER_OPENINGS = True
+USE_CAD_LAYER_CLASSIFICATION = True
+ENABLE_TOPOLOGY_FALLBACK_IF_LAYER_EMPTY = True
+STRICT_LAYER_FIRST_WALLS = True
+PHASE1_WALLS_ONLY = True
+MARK_ONLY_MODE = True
+MARK_USE_TOPOLOGY_FIRST = True
+
+CAD_LAYER_WALL_EXT_KEYS = ["a-wall-ext", "awallext"]
+CAD_LAYER_WALL_INT_KEYS = ["a-wall-int", "awallint"]
+CAD_LAYER_DOOR_KEYS = ["a-doors", "adoors"]
+CAD_LAYER_WINDOW_KEYS = ["a-windows", "awindows"]
+
+OPENING_BLOCK_COMPONENT_GAP_FT = 180 * MM_TO_FT
+OPENING_LAYER_HOST_SEARCH_FT = 1200 * MM_TO_FT
+
+# Remove small disconnected wall-axis "islands" (typically door/window symbols).
+SMALL_COMPONENT_TOTAL_LEN_MAX_FT = 2800 * MM_TO_FT
+SMALL_COMPONENT_MAX_DIM_FT = 1400 * MM_TO_FT
+SMALL_COMPONENT_MAX_AXES = 5
+ENABLE_SMALL_COMPONENT_REMOVAL = False
 
 # Keep strict double-line wall mode by default.
 ENABLE_SINGLE_LINE_FALLBACK = False
@@ -151,6 +178,24 @@ BUILD_CURTAIN_WALLS = True
 
 PREVIEW_DOOR_POINTS   = True
 PREVIEW_WINDOW_POINTS = True
+
+if PHASE1_WALLS_ONLY:
+    BUILD_DOORS = False
+    BUILD_WINDOWS = False
+    BUILD_CURTAIN_WALLS = False
+    PREVIEW_DOOR_POINTS = False
+    PREVIEW_WINDOW_POINTS = False
+    ENABLE_TOPOLOGY_FALLBACK_IF_LAYER_EMPTY = False
+
+if MARK_ONLY_MODE:
+    BUILD_WALLS = False
+    BUILD_DOORS = False
+    BUILD_WINDOWS = False
+    BUILD_CURTAIN_WALLS = False
+    PREVIEW_WALL_AXES = False
+    PREVIEW_EXTERIOR_AXES = False
+    PREVIEW_DOOR_POINTS = False
+    PREVIEW_WINDOW_POINTS = False
 
 # ============================================================
 # 2D helpers
@@ -240,6 +285,53 @@ def scalar_in_intervals(t, intervals, tol=0.0):
             return True
     return False
 
+def normalize_name_key(txt):
+    if txt is None:
+        return ""
+    try:
+        s = txt.lower()
+    except Exception:
+        try:
+            s = str(txt).lower()
+        except Exception:
+            return ""
+    for ch in [" ", "-", "_", "\t", "\r", "\n"]:
+        s = s.replace(ch, "")
+    return s
+
+def _in_key_list(name, keys):
+    k = normalize_name_key(name)
+    for x in (keys or []):
+        if k == normalize_name_key(x):
+            return True
+    return False
+
+def layer_role_from_name(layer_name):
+    if _in_key_list(layer_name, CAD_LAYER_WALL_EXT_KEYS):
+        return "wall_ext"
+    if _in_key_list(layer_name, CAD_LAYER_WALL_INT_KEYS):
+        return "wall_int"
+    if _in_key_list(layer_name, CAD_LAYER_DOOR_KEYS):
+        return "door"
+    if _in_key_list(layer_name, CAD_LAYER_WINDOW_KEYS):
+        return "window"
+    return "other"
+
+def geometry_layer_name(obj):
+    try:
+        sid = obj.GraphicsStyleId
+        if sid is None or sid == ElementId.InvalidElementId:
+            return None
+        gs = doc.GetElement(sid)
+        if gs is None:
+            return None
+        cat = gs.GraphicsStyleCategory
+        if cat is None:
+            return None
+        return cat.Name
+    except Exception:
+        return None
+
 # ============================================================
 # Spatial grid
 # ============================================================
@@ -278,7 +370,7 @@ class SpatialGrid(object):
 # ============================================================
 _SEG_ID = 0
 class Seg(object):
-    def __init__(self, revit_line):
+    def __init__(self, revit_line, wall_class=None):
         global _SEG_ID
         _SEG_ID += 1
         self.id = _SEG_ID
@@ -291,14 +383,16 @@ class Seg(object):
         self.len = vlen(self.v)
         self.dir = vnorm(self.v)
         self.bb = bbox_from_line_xy(self.a, self.b)
+        self.wall_class = wall_class
 
 class CenterSeg(object):
-    def __init__(self, a_xy, b_xy, z, thick_ft):
+    def __init__(self, a_xy, b_xy, z, thick_ft, is_exterior_hint=None):
         self.a=a_xy; self.b=b_xy; self.z=z; self.thick=thick_ft
         self.v=vsub(self.b,self.a)
         self.len=vlen(self.v)
         self.dir=vnorm(self.v)
         self.bb=bbox_from_line_xy(self.a,self.b)
+        self.is_exterior_hint = is_exterior_hint
 
 class WallAxis(object):
     def __init__(self, origin, axis_dir, z, thick_ft, tmin, tmax):
@@ -322,8 +416,40 @@ def extract_lines_and_arcs(import_inst):
     opt.DetailLevel = ViewDetailLevel.Fine
     geo = import_inst.get_Geometry(opt)
     lines=[]; arcs=[]
+    by_role = {
+        "wall_lines": [],
+        "wall_ext_lines": [],
+        "wall_int_lines": [],
+        "door_lines": [],
+        "door_arcs": [],
+        "window_lines": [],
+        "window_arcs": []
+    }
+    role_counts = defaultdict(int)
 
-    def add_polyline_segments(pl):
+    def _add_line(ln, role):
+        lines.append(ln)
+        role_counts[role] += 1
+        if role in ("wall_ext", "wall_int"):
+            by_role["wall_lines"].append(ln)
+        if role == "wall_ext":
+            by_role["wall_ext_lines"].append(ln)
+        elif role == "wall_int":
+            by_role["wall_int_lines"].append(ln)
+        elif role == "door":
+            by_role["door_lines"].append(ln)
+        elif role == "window":
+            by_role["window_lines"].append(ln)
+
+    def _add_arc(ac, role):
+        arcs.append(ac)
+        role_counts[role] += 1
+        if role == "door":
+            by_role["door_arcs"].append(ac)
+        elif role == "window":
+            by_role["window_arcs"].append(ac)
+
+    def add_polyline_segments(pl, role):
         try:
             pts = list(pl.GetCoordinates())
         except Exception:
@@ -335,22 +461,26 @@ def extract_lines_and_arcs(import_inst):
             p1 = pts[i + 1]
             try:
                 if p0.DistanceTo(p1) > 1e-9:
-                    lines.append(Line.CreateBound(p0, p1))
+                    _add_line(Line.CreateBound(p0, p1), role)
             except Exception:
                 continue
 
-    def walk(g):
+    def walk(g, parent_layer_name=None):
         for obj in g:
             if isinstance(obj, GeometryInstance):
-                walk(obj.GetInstanceGeometry())
+                inst_layer = geometry_layer_name(obj) or parent_layer_name
+                walk(obj.GetInstanceGeometry(), inst_layer)
             elif isinstance(obj, PolyLine):
-                add_polyline_segments(obj)
+                layer_name = geometry_layer_name(obj) or parent_layer_name
+                add_polyline_segments(obj, layer_role_from_name(layer_name))
             elif isinstance(obj, Line):
-                lines.append(obj)
+                layer_name = geometry_layer_name(obj) or parent_layer_name
+                _add_line(obj, layer_role_from_name(layer_name))
             elif isinstance(obj, Arc):
-                arcs.append(obj)
-    walk(geo)
-    return lines, arcs
+                layer_name = geometry_layer_name(obj) or parent_layer_name
+                _add_arc(obj, layer_role_from_name(layer_name))
+    walk(geo, None)
+    return lines, arcs, by_role, role_counts
 
 # ============================================================
 # Pairing wall side lines -> candidates
@@ -513,7 +643,20 @@ def build_center_from_pair(a,b,thick):
 
     c0=vadd(pa0, vmul(n, thick*0.5))
     c1=vadd(pa1, vmul(n, thick*0.5))
-    return CenterSeg(c0,c1,a.z,thick)
+
+    ext_hint = None
+    ac = getattr(a, "wall_class", None)
+    bc = getattr(b, "wall_class", None)
+    if ac == "ext" and bc == "ext":
+        ext_hint = True
+    elif ac == "int" and bc == "int":
+        ext_hint = False
+    elif ac == "ext" or bc == "ext":
+        ext_hint = True
+    elif ac == "int" or bc == "int":
+        ext_hint = False
+
+    return CenterSeg(c0, c1, a.z, thick, is_exterior_hint=ext_hint)
 
 # ============================================================
 # Build continuous WallAxes + openings
@@ -558,6 +701,10 @@ def build_wall_axes(center_segs):
         # thickness = median of bucket (stable)
         thicks = sorted([s.thick for s in segs])
         thick = thicks[len(thicks)//2]
+        hint_vals = [s.is_exterior_hint for s in segs if s.is_exterior_hint is not None]
+        ext_hint = None
+        if hint_vals:
+            ext_hint = (sum(1 for v in hint_vals if v) >= sum(1 for v in hint_vals if not v))
 
         intervals=[]
         for s in segs:
@@ -584,12 +731,22 @@ def build_wall_axes(center_segs):
             else:
                 wa=WallAxis(o0,d0,z0,thick,run_start,run_end)
                 wa.openings=list(run_open)
+                if ext_hint is not None:
+                    wa.is_exterior = bool(ext_hint)
+                    wa.has_layer_class = True
+                else:
+                    wa.has_layer_class = False
                 axes.append(wa)
                 run_start, run_end = merged[i+1]
                 run_open=[]
 
         wa=WallAxis(o0,d0,z0,thick,run_start,run_end)
         wa.openings=list(run_open)
+        if ext_hint is not None:
+            wa.is_exterior = bool(ext_hint)
+            wa.has_layer_class = True
+        else:
+            wa.has_layer_class = False
         axes.append(wa)
 
     return axes
@@ -764,12 +921,14 @@ def merge_collinear_axes_for_creation(axes):
         merged = merge_intervals(intervals, AXIS_INTERVAL_MERGE_TOL_FT)
         merged_open = merge_intervals(all_openings, OPENING_CLIP_TOL_FT)
         ext_flag = any(getattr(g, "is_exterior", False) for g in group)
+        has_layer_class = any(getattr(g, "has_layer_class", False) for g in group)
 
         for (t0, t1) in merged:
             if (t1 - t0) < MIN_AXIS_LEN_FT:
                 continue
             wa = WallAxis(o, d, z, thick, t0, t1)
             wa.is_exterior = ext_flag
+            wa.has_layer_class = has_layer_class
             clipped = []
             for (a, b) in merged_open:
                 oa = max(a, t0)
@@ -827,6 +986,65 @@ def suppress_overlapping_axes(axes):
     if removed:
         print("Suppressed %d overlapping axes before wall creation." % removed)
     return kept
+
+def remove_small_isolated_components(axes):
+    if not axes:
+        return axes
+
+    nodes = []
+    node_ids = []
+    node_to_axes = defaultdict(list)
+    for i, ax in enumerate(axes):
+        n0 = merge_node(nodes, ax.a, NODE_MERGE_TOL_FT)
+        n1 = merge_node(nodes, ax.b, NODE_MERGE_TOL_FT)
+        node_ids.append((n0, n1))
+        node_to_axes[n0].append(i)
+        node_to_axes[n1].append(i)
+
+    seen = set()
+    keep = [True] * len(axes)
+    removed = 0
+
+    for i in range(len(axes)):
+        if i in seen:
+            continue
+
+        comp = []
+        stack = [i]
+        seen.add(i)
+        while stack:
+            cur = stack.pop()
+            comp.append(cur)
+            n0, n1 = node_ids[cur]
+            for n in (n0, n1):
+                for j in node_to_axes.get(n, []):
+                    if j not in seen:
+                        seen.add(j)
+                        stack.append(j)
+
+        if not comp:
+            continue
+
+        total_len = 0.0
+        bb = [1e9, 1e9, -1e9, -1e9]
+        for idx in comp:
+            ax = axes[idx]
+            total_len += vlen(vsub(ax.a, ax.b))
+            bb[0] = min(bb[0], ax.bb[0]); bb[1] = min(bb[1], ax.bb[1])
+            bb[2] = max(bb[2], ax.bb[2]); bb[3] = max(bb[3], ax.bb[3])
+
+        max_dim = max(bb[2] - bb[0], bb[3] - bb[1])
+        if (len(comp) <= SMALL_COMPONENT_MAX_AXES and
+                total_len <= SMALL_COMPONENT_TOTAL_LEN_MAX_FT and
+                max_dim <= SMALL_COMPONENT_MAX_DIM_FT):
+            for idx in comp:
+                keep[idx] = False
+            removed += len(comp)
+
+    out = [axes[i] for i in range(len(axes)) if keep[i]]
+    if removed:
+        print("Removed %d axes from small isolated components." % removed)
+    return out
 
 # ============================================================
 # V5.2: Add single-line interior axes (fallback)
@@ -1013,6 +1231,40 @@ def draw_points(points_xy, z, name):
         t.RollBack()
         print("draw_points '%s' failed: %s" % (name, str(e)))
 
+def _first_text_note_type_id():
+    try:
+        tnt = FilteredElementCollector(doc).OfClass(TextNoteType).FirstElement()
+        if tnt is not None:
+            return tnt.Id
+    except Exception:
+        pass
+    return ElementId.InvalidElementId
+
+def draw_text_marks(points_xy, z, text_value, name):
+    if not points_xy:
+        return
+    view = doc.ActiveView
+    if view is None:
+        print("draw_text_marks '%s' skipped: no active view." % name)
+        return
+
+    type_id = _first_text_note_type_id()
+    if type_id == ElementId.InvalidElementId:
+        print("draw_text_marks '%s' skipped: no TextNoteType in project." % name)
+        return
+
+    t = Transaction(doc, name)
+    t.Start()
+    try:
+        opts = TextNoteOptions(type_id)
+        for p in points_xy:
+            at = XYZ(p[0], p[1], z)
+            TextNote.Create(doc, view.Id, at, text_value, opts)
+        t.Commit()
+    except Exception as e:
+        t.RollBack()
+        print("draw_text_marks '%s' failed: %s" % (name, str(e)))
+
 # ============================================================
 # WallTypes and Walls
 # ============================================================
@@ -1155,10 +1407,40 @@ def get_or_create_walltype(doc, thick_ft, prefix="CAD_Auto", is_exterior=False, 
     base_name = "%s_%s_%s_%dmm" % (prefix, role, mat_tag, int(round(mm)))
 
     all_types = list(FilteredElementCollector(doc).OfClass(WallType))
-    existing_names = set([_safe_elem_name(wt) for wt in all_types if _safe_elem_name(wt)])
+    existing_by_name = {}
+    for wt in all_types:
+        n = _safe_elem_name(wt)
+        if n:
+            existing_by_name[n] = wt
+
+    def _clear_type_mark(wt):
+        try:
+            p = wt.get_Parameter(BuiltInParameter.ALL_MODEL_TYPE_MARK)
+            if p and (not p.IsReadOnly):
+                p.Set("")
+        except Exception:
+            pass
+
+    # Reuse existing CAD_Auto type if available to avoid endless v2/v3/... proliferation.
+    if base_name in existing_by_name:
+        existing = existing_by_name[base_name]
+        _set_walltype_structure(existing, thick_ft, mat_id=mat_id)
+        _clear_type_mark(existing)
+        return existing
+    v_matches = []
+    for n, wt in existing_by_name.items():
+        if n.startswith(base_name + "_v"):
+            v_matches.append((n, wt))
+    if v_matches:
+        v_matches.sort(key=lambda x: x[0])
+        existing = v_matches[0][1]
+        _set_walltype_structure(existing, thick_ft, mat_id=mat_id)
+        _clear_type_mark(existing)
+        return existing
 
     base = _find_basic_walltype()
     new_name = base_name
+    existing_names = set(existing_by_name.keys())
     if new_name in existing_names:
         idx = 2
         while ("%s_v%d" % (base_name, idx)) in existing_names:
@@ -1167,6 +1449,7 @@ def get_or_create_walltype(doc, thick_ft, prefix="CAD_Auto", is_exterior=False, 
 
     new_type = base.Duplicate(new_name)
     _set_walltype_structure(new_type, thick_ft, mat_id=mat_id)
+    _clear_type_mark(new_type)
     return new_type
 
 def create_walls(axes, level, height_ft):
@@ -1176,6 +1459,18 @@ def create_walls(axes, level, height_ft):
     t=Transaction(doc, "V5.2 Create Walls")
     t.Start()
     try:
+        # Suppress "duplicate Type Mark" warnings from copied wall types.
+        for wt in FilteredElementCollector(doc).OfClass(WallType):
+            n = _safe_elem_name(wt) or ""
+            if not n.startswith("CAD_Auto"):
+                continue
+            try:
+                p = wt.get_Parameter(BuiltInParameter.ALL_MODEL_TYPE_MARK)
+                if p and (not p.IsReadOnly):
+                    p.Set("")
+            except Exception:
+                pass
+
         for w in axes:
             m, mtag = _pick_wall_material(getattr(w, "is_exterior", False), w.thick)
             mid = m.Id if m is not None else None
@@ -1316,11 +1611,11 @@ def dedupe_openings(items, kind):
     if kind == "door":
         pt_tol = DOOR_DUP_CENTER_TOL_FT
         gap_tol = 180 * MM_TO_FT
-        priority = {"arc": 0, "gap": 1, "bridge_jambs": 2, "cad_jamb_pair": 3}
+        priority = {"layer_block": 0, "arc": 1, "gap": 2, "bridge_jambs": 3, "cad_jamb_pair": 4}
     else:
         pt_tol = WINDOW_DUP_CENTER_TOL_FT
         gap_tol = OPENING_DUP_GAP_TOL_FT
-        priority = {"gap": 0, "jamb_pair": 1}
+        priority = {"layer_block": 0, "gap": 1, "jamb_pair": 2}
 
     ordered = sorted(items, key=lambda x: priority.get(str(x.get("source", "")), 99))
     kept = []
@@ -1426,7 +1721,11 @@ def rehost_and_validate_doors(door_data, wall_refs):
                 continue
             t_host = segment_param_xy(pt, host.a, host.b)
             end_clear = min(t_host, 1.0 - t_host) * host_len
-            min_end_clear = max((160 * MM_TO_FT) if getattr(host.axis, "is_exterior", False) else (80 * MM_TO_FT), 0.12 * gap)
+            min_end_clear = max(
+                (120 * MM_TO_FT) if getattr(host.axis, "is_exterior", False) else (60 * MM_TO_FT),
+                0.08 * gap,
+                DOOR_END_CLEARANCE_FT
+            )
             if end_clear < min_end_clear:
                 rej["too_near_wall_end"] += 1
                 continue
@@ -1583,6 +1882,227 @@ def best_host_wall_for_opening_point(wall_refs, p_xy, axis_dir=None, preferred_w
             best = wr
 
     return best
+
+def bboxes_touch_with_gap(bb1, bb2, gap_ft):
+    return not (bb1[2] + gap_ft < bb2[0] or bb2[2] + gap_ft < bb1[0] or
+                bb1[3] + gap_ft < bb2[1] or bb2[3] + gap_ft < bb1[1])
+
+def cluster_opening_primitives(prims, gap_ft):
+    if not prims:
+        return []
+    out = []
+    used = set()
+    for i in range(len(prims)):
+        if i in used:
+            continue
+        stack = [i]
+        used.add(i)
+        comp = []
+        while stack:
+            j = stack.pop()
+            comp.append(prims[j])
+            bbj = prims[j]["bb"]
+            for k in range(len(prims)):
+                if k in used:
+                    continue
+                if bboxes_touch_with_gap(bbj, prims[k]["bb"], gap_ft):
+                    used.add(k)
+                    stack.append(k)
+        out.append(comp)
+    return out
+
+def _dedupe_points(points_xy, tol_ft):
+    out = []
+    for p in (points_xy or []):
+        keep = True
+        for q in out:
+            if vlen(vsub(p, q)) <= tol_ft:
+                keep = False
+                break
+        if keep:
+            out.append(p)
+    return out
+
+def opening_mark_points_from_layer_components(layer_lines, layer_arcs, kind):
+    prims = []
+    for ln in (layer_lines or []):
+        try:
+            p0 = xyz_to_xy(ln.GetEndPoint(0))
+            p1 = xyz_to_xy(ln.GetEndPoint(1))
+            prims.append({"pts": [p0, p1], "bb": bbox_from_line_xy(p0, p1)})
+        except Exception:
+            continue
+    for ac in (layer_arcs or []):
+        try:
+            p0 = xyz_to_xy(ac.GetEndPoint(0))
+            p1 = xyz_to_xy(ac.GetEndPoint(1))
+            c = xyz_to_xy(ac.Center)
+            bb = (min(p0[0], p1[0], c[0]), min(p0[1], p1[1], c[1]),
+                  max(p0[0], p1[0], c[0]), max(p0[1], p1[1], c[1]))
+            prims.append({"pts": [p0, p1, c], "bb": bb})
+        except Exception:
+            continue
+
+    if not prims:
+        return []
+
+    # Mark mode should be permissive: cluster with a tighter gap to avoid merging
+    # many nearby symbols into one giant component.
+    comps = cluster_opening_primitives(prims, 60 * MM_TO_FT)
+    marks = []
+    all_centroids = []
+    for comp in comps:
+        pts = []
+        x0 = 1e9; y0 = 1e9; x1 = -1e9; y1 = -1e9
+        for p in comp:
+            pts.extend(p.get("pts", []))
+            bb = p.get("bb", None)
+            if bb is not None:
+                x0 = min(x0, bb[0]); y0 = min(y0, bb[1]); x1 = max(x1, bb[2]); y1 = max(y1, bb[3])
+        if len(pts) < 2:
+            continue
+        cx = sum(p[0] for p in pts) / float(len(pts))
+        cy = sum(p[1] for p in pts) / float(len(pts))
+        all_centroids.append((cx, cy))
+        width = max(0.0, x1 - x0)
+        height = max(0.0, y1 - y0)
+        span = max(width, height)
+
+        if kind == "door":
+            if span < (200 * MM_TO_FT) or span > (3800 * MM_TO_FT):
+                continue
+        else:
+            if span < (200 * MM_TO_FT) or span > (5000 * MM_TO_FT):
+                continue
+
+        marks.append((cx, cy))
+
+    tol = (220 * MM_TO_FT) if kind == "door" else (260 * MM_TO_FT)
+    marks = _dedupe_points(marks, tol)
+    if marks:
+        return marks
+    # Fallback: if filters were still too strict, at least mark component centroids.
+    return _dedupe_points(all_centroids, tol)
+
+class _MarkAxisRef(object):
+    def __init__(self, ax):
+        self.axis = ax
+        self.a = ax.a
+        self.b = ax.b
+        self.dir = vnorm(vsub(self.b, self.a))
+        self.bb = bbox_from_line_xy(self.a, self.b)
+
+def opening_mark_points_from_topology_axes(axes, cad_arcs):
+    d_marks = []
+    w_marks = []
+    for ax in (axes or []):
+        opens = list(getattr(ax, "openings", []) or [])
+        if not opens:
+            continue
+        wr = _MarkAxisRef(ax)
+        is_ext = bool(getattr(ax, "is_exterior", False))
+        for (g0, g1) in opens:
+            gap = abs(g1 - g0)
+            if gap < (320 * MM_TO_FT):
+                continue
+            mid = (g0 + g1) * 0.5
+            pt = vadd(ax.o, vmul(ax.d, mid))
+
+            if is_ext:
+                if GAP_MIN_DOOR_FT <= gap <= GAP_MAX_DOOR_FT and opening_has_door_arc_evidence(cad_arcs, wr, pt, gap):
+                    d_marks.append(pt)
+                elif gap <= (WIN_GAP_MAX_FT * 1.2):
+                    w_marks.append(pt)
+            else:
+                if gap <= (GAP_MAX_DOOR_FT * 1.8):
+                    d_marks.append(pt)
+
+    d_marks = _dedupe_points(d_marks, 240 * MM_TO_FT)
+    w_marks = _dedupe_points(w_marks, 280 * MM_TO_FT)
+    return d_marks, w_marks
+
+def openings_from_layer_components(wall_refs, layer_lines, layer_arcs, kind):
+    prims = []
+    for ln in (layer_lines or []):
+        try:
+            p0 = xyz_to_xy(ln.GetEndPoint(0))
+            p1 = xyz_to_xy(ln.GetEndPoint(1))
+            prims.append({"pts": [p0, p1], "bb": bbox_from_line_xy(p0, p1)})
+        except Exception:
+            continue
+    for ac in (layer_arcs or []):
+        try:
+            p0 = xyz_to_xy(ac.GetEndPoint(0))
+            p1 = xyz_to_xy(ac.GetEndPoint(1))
+            c = xyz_to_xy(ac.Center)
+            bb = (min(p0[0], p1[0], c[0]), min(p0[1], p1[1], c[1]),
+                  max(p0[0], p1[0], c[0]), max(p0[1], p1[1], c[1]))
+            prims.append({"pts": [p0, p1, c], "bb": bb})
+        except Exception:
+            continue
+    if not prims:
+        return []
+
+    comps = cluster_opening_primitives(prims, OPENING_BLOCK_COMPONENT_GAP_FT)
+    out = []
+    for comp in comps:
+        pts = []
+        for p in comp:
+            pts.extend(p.get("pts", []))
+        if len(pts) < 2:
+            continue
+        cx = sum(p[0] for p in pts) / float(len(pts))
+        cy = sum(p[1] for p in pts) / float(len(pts))
+        cxy = (cx, cy)
+
+        host = best_host_wall_for_opening_point(
+            wall_refs, cxy, axis_dir=None, preferred_wr=None,
+            exterior_only=(True if kind == "window" else None),
+            max_dist_ft=OPENING_LAYER_HOST_SEARCH_FT,
+            min_thick_ft=REAL_WALL_MIN_THICK_FT,
+            target_opening_gap_ft=None
+        )
+        if host is None:
+            continue
+        cxy = snap_host_point_xy(host, cxy)
+
+        scalars = [project_scalar_on_axis(p, host.a, host.dir) for p in pts]
+        if not scalars:
+            continue
+        gap = max(scalars) - min(scalars)
+
+        if kind == "door":
+            if gap < GAP_MIN_DOOR_FT:
+                gap = GAP_MIN_DOOR_FT
+            if gap > GAP_MAX_DOOR_FT:
+                continue
+            if has_near_hosted_item(out, host, cxy, DOOR_DUP_CENTER_TOL_FT):
+                continue
+            out.append({
+                "pt": cxy,
+                "wall": host.wall,
+                "wr": host,
+                "side": 0.0,
+                "ccw": False,
+                "gap": gap,
+                "source": "layer_block",
+                "door_class": ("exterior" if getattr(host.axis, "is_exterior", False) else "interior")
+            })
+        else:
+            if gap < GAP_MIN_WIN_FT:
+                gap = GAP_MIN_WIN_FT
+            if gap > WIN_GAP_MAX_FT:
+                continue
+            if has_near_hosted_item(out, host, cxy, WINDOW_DUP_CENTER_TOL_FT):
+                continue
+            out.append({
+                "pt": cxy,
+                "wall": host.wall,
+                "wr": host,
+                "gap": gap,
+                "source": "layer_block"
+            })
+    return out
 
 # ============================================================
 # Door data from arcs + gaps + recessed jamb-bridge
@@ -2202,6 +2722,25 @@ def symbol_matches_preferred_door(sym):
         return True
     return False
 
+def symbol_matches_token(sym, token):
+    txt = symbol_text(sym)
+    n = normalize_token_text(txt)
+    tok = normalize_token_text(token)
+    if tok and (tok in n):
+        return True
+    tok_rev = normalize_token_text((token or "")[::-1])
+    if tok_rev and (tok_rev in n):
+        return True
+    return False
+
+def symbol_is_known_broken_door(sym):
+    if not AVOID_KNOWN_BROKEN_DOOR_FAMILIES:
+        return False
+    for tok in (BROKEN_DOOR_FAMILY_TOKENS or []):
+        if symbol_matches_token(sym, tok):
+            return True
+    return False
+
 def log_door_symbol_inventory(symbols, limit=20):
     try:
         uniq = []
@@ -2271,9 +2810,12 @@ def choose_door_symbol(symbols, target_ft):
 def choose_door_symbol_candidates(symbols, target_ft):
     if not symbols:
         return []
-    candidates = [s for s in symbols if (not symbol_is_opening_only(s)) and (not symbol_is_bad_door(s))]
+    candidates = [
+        s for s in symbols
+        if (not symbol_is_opening_only(s)) and (not symbol_is_bad_door(s)) and (not symbol_is_known_broken_door(s))
+    ]
     if not candidates:
-        candidates = [s for s in symbols if not symbol_is_bad_door(s)]
+        candidates = [s for s in symbols if (not symbol_is_bad_door(s)) and (not symbol_is_known_broken_door(s))]
     if not candidates:
         candidates = list(symbols)
 
@@ -2505,6 +3047,10 @@ def create_curtain_walls(curtain_data, level):
 # ============================================================
 sel = list(uidoc.Selection.GetElementIds())
 print("Running %s" % BUILD_ID)
+if MARK_ONLY_MODE:
+    print("Mode: MARK ONLY (no walls/doors/windows are created).")
+if PHASE1_WALLS_ONLY:
+    print("Mode: PHASE 1 (walls only) - doors/windows are skipped; walls stay continuous.")
 if len(sel) != 1:
     raise Exception("Select one ImportInstance (CAD link) and run again.")
 
@@ -2512,13 +3058,53 @@ imp = doc.GetElement(sel[0])
 if not isinstance(imp, ImportInstance):
     raise Exception("Selection is not an ImportInstance.")
 
-raw_lines, raw_arcs = extract_lines_and_arcs(imp)
-segs = [Seg(l) for l in raw_lines if l.Length >= MIN_RAW_LEN_FT]
+raw_lines, raw_arcs, geom_by_role, role_counts = extract_lines_and_arcs(imp)
+
+wall_ext_lines = list(geom_by_role.get("wall_ext_lines", []) or [])
+wall_int_lines = list(geom_by_role.get("wall_int_lines", []) or [])
+wall_layer_lines = list(geom_by_role.get("wall_lines", []) or [])
+door_layer_lines = list(geom_by_role.get("door_lines", []) or [])
+door_layer_arcs = list(geom_by_role.get("door_arcs", []) or [])
+window_layer_lines = list(geom_by_role.get("window_lines", []) or [])
+window_layer_arcs = list(geom_by_role.get("window_arcs", []) or [])
+
+if USE_CAD_LAYER_WALLS:
+    if len(wall_layer_lines) > 0:
+        wall_source_lines = wall_layer_lines
+        print("Wall layers detected: ext_lines=%d int_lines=%d (using layer-first walls)" % (len(wall_ext_lines), len(wall_int_lines)))
+    else:
+        if STRICT_LAYER_FIRST_WALLS:
+            raise Exception(
+                "No wall lines found on expected CAD layers (A-WALL-EXT / A-WALL-INT). "
+                "Fix CAD layer names or set STRICT_LAYER_FIRST_WALLS = False."
+            )
+        wall_source_lines = raw_lines
+        print("Wall layers missing/empty. Using all CAD lines for wall inference.")
+else:
+    wall_source_lines = raw_lines
+    print("Layer-first walls disabled. Using all CAD lines for wall inference.")
+print("Layer geometry counts: %s" % dict(role_counts))
+
+ext_line_ids = set([id(x) for x in wall_ext_lines])
+int_line_ids = set([id(x) for x in wall_int_lines])
+segs = []
+for l in wall_source_lines:
+    if l.Length < MIN_RAW_LEN_FT:
+        continue
+    wc = None
+    lid = id(l)
+    if lid in ext_line_ids:
+        wc = "ext"
+    elif lid in int_line_ids:
+        wc = "int"
+    segs.append(Seg(l, wall_class=wc))
+
+cad_segs_all = [Seg(l) for l in raw_lines if l.Length >= MIN_RAW_LEN_FT]
 
 _diag_path = os.path.join(os.environ.get("TEMP", "C:\\Temp"), "c2rv5_2_diag.txt")
 try:
     with open(_diag_path, "w") as _f:
-        _f.write("Raw lines=%d arcs=%d segs=%d\n" % (len(raw_lines), len(raw_arcs), len(segs)))
+        _f.write("Raw lines=%d arcs=%d wall_segs=%d all_segs=%d\n" % (len(raw_lines), len(raw_arcs), len(segs), len(cad_segs_all)))
 except Exception:
     pass
 
@@ -2547,6 +3133,13 @@ if pairs:
     axes = filter_orphan_short_axes(axes, ORPHAN_AXIS_MIN_LEN_FT)
     axes = merge_collinear_axes_for_creation(axes)
     axes = suppress_overlapping_axes(axes)
+    if ENABLE_SINGLE_LINE_AUGMENT:
+        axes = add_single_line_interior_axes(segs, axes)
+        axes = dedup_overlapping_axes(axes)
+        axes = merge_collinear_axes_for_creation(axes)
+        axes = suppress_overlapping_axes(axes)
+    if ENABLE_SMALL_COMPONENT_REMOVAL:
+        axes = remove_small_isolated_components(axes)
 else:
     if not ENABLE_SINGLE_LINE_FALLBACK:
         raise Exception("No valid double-line wall pairs found. Check CAD scale/layers or enable single-line fallback.")
@@ -2559,6 +3152,8 @@ else:
     axes = filter_orphan_short_axes(axes, ORPHAN_AXIS_MIN_LEN_FT)
     axes = merge_collinear_axes_for_creation(axes)
     axes = suppress_overlapping_axes(axes)
+    if ENABLE_SMALL_COMPONENT_REMOVAL:
+        axes = remove_small_isolated_components(axes)
 
 if not axes:
     raise Exception("No candidate wall axes found. Check CAD import scale and linework quality.")
@@ -2573,7 +3168,16 @@ except Exception:
     pass
 
 # classify exterior
-classify_exterior_axes_v5(axes)
+layer_class_axes = [a for a in axes if getattr(a, "has_layer_class", False)]
+if USE_CAD_LAYER_CLASSIFICATION and layer_class_axes:
+    unknown = 0
+    for a in axes:
+        if not getattr(a, "has_layer_class", False):
+            a.is_exterior = False
+            unknown += 1
+    print("Exterior classification: using CAD wall layers (known=%d unknown->interior=%d)." % (len(layer_class_axes), unknown))
+else:
+    classify_exterior_axes_v5(axes)
 normalize_exterior_wall_thickness(axes, clusters)
 
 # level from view
@@ -2581,6 +3185,34 @@ view = doc.ActiveView
 level = getattr(view, "GenLevel", None)
 if level is None:
     level = FilteredElementCollector(doc).OfClass(Level).FirstElement()
+
+if MARK_ONLY_MODE:
+    mark_z = level.Elevation if level is not None else 0.0
+    topo_d, topo_w = opening_mark_points_from_topology_axes(axes, raw_arcs)
+    layer_d = opening_mark_points_from_layer_components(door_layer_lines, door_layer_arcs, "door")
+    layer_w = opening_mark_points_from_layer_components(window_layer_lines, window_layer_arcs, "window")
+    if (len(layer_w) == 0 and (len(window_layer_lines) + len(window_layer_arcs) == 0) and
+            (len(door_layer_lines) + len(door_layer_arcs) > 0)):
+        layer_w = opening_mark_points_from_layer_components(door_layer_lines, door_layer_arcs, "window")
+        if layer_w:
+            print("MARK-ONLY: windows fallback from A-DOORS symbols: %d" % len(layer_w))
+
+    if MARK_USE_TOPOLOGY_FIRST:
+        door_marks = topo_d if topo_d else layer_d
+        win_marks = topo_w if topo_w else layer_w
+    else:
+        door_marks = layer_d if layer_d else topo_d
+        win_marks = layer_w if layer_w else topo_w
+
+    print("MARK-ONLY: topology candidates D=%d W=%d" % (len(topo_d), len(topo_w)))
+    print("MARK-ONLY: layer primitives door=%d window=%d" % (
+        len(door_layer_lines) + len(door_layer_arcs),
+        len(window_layer_lines) + len(window_layer_arcs)))
+    draw_text_marks(door_marks, mark_z, "D", "V5.2 Mark Doors")
+    draw_text_marks(win_marks, mark_z, "W", "V5.2 Mark Windows")
+    print("MARK-ONLY mode: placed D marks=%d, W marks=%d" % (len(door_marks), len(win_marks)))
+    print("Done V5.2 mark-only.")
+    raise SystemExit
 
 # previews
 if PREVIEW_WALL_AXES:
@@ -2611,22 +3243,29 @@ if not wall_refs:
 
 # doors (reliable sources first, arcs as fallback)
 door_data = []
-gap_door_data = door_data_from_opening_gaps(wall_refs, [], segs, raw_arcs)
-if gap_door_data:
-    door_data.extend(gap_door_data)
-    print("Doors inferred from gaps (arc missed): %d" % len(gap_door_data))
-bridge_door_data = door_data_from_bridge_jamb_pairs(wall_refs, [d["pt"] for d in door_data], segs)
-if bridge_door_data:
-    door_data.extend(bridge_door_data)
-    print("Doors inferred from jamb pairs (recessed openings): %d" % len(bridge_door_data))
-cad_jamb_door_data = door_data_from_cad_jamb_pairs(wall_refs, [d["pt"] for d in door_data], segs)
-if cad_jamb_door_data:
-    door_data.extend(cad_jamb_door_data)
-    print("Doors inferred from CAD jamb pairs: %d" % len(cad_jamb_door_data))
-arc_door_data = door_data_from_arcs(raw_arcs, wall_refs, segs, [d["pt"] for d in door_data])
-if arc_door_data:
-    door_data.extend(arc_door_data)
-    print("Doors inferred from arcs: %d" % len(arc_door_data))
+if USE_CAD_LAYER_OPENINGS:
+    layer_door_data = openings_from_layer_components(wall_refs, door_layer_lines, door_layer_arcs, "door")
+    if layer_door_data:
+        door_data.extend(layer_door_data)
+        print("Doors inferred from A-doors layer components: %d" % len(layer_door_data))
+need_door_fallback = ((not USE_CAD_LAYER_OPENINGS) or ((len(door_data) == 0) and ENABLE_TOPOLOGY_FALLBACK_IF_LAYER_EMPTY))
+if need_door_fallback:
+    gap_door_data = door_data_from_opening_gaps(wall_refs, [d["pt"] for d in door_data], cad_segs_all, raw_arcs)
+    if gap_door_data:
+        door_data.extend(gap_door_data)
+        print("Doors inferred from gaps (fallback): %d" % len(gap_door_data))
+    bridge_door_data = door_data_from_bridge_jamb_pairs(wall_refs, [d["pt"] for d in door_data], cad_segs_all)
+    if bridge_door_data:
+        door_data.extend(bridge_door_data)
+        print("Doors inferred from jamb pairs (fallback): %d" % len(bridge_door_data))
+    cad_jamb_door_data = door_data_from_cad_jamb_pairs(wall_refs, [d["pt"] for d in door_data], cad_segs_all)
+    if cad_jamb_door_data:
+        door_data.extend(cad_jamb_door_data)
+        print("Doors inferred from CAD jamb pairs (fallback): %d" % len(cad_jamb_door_data))
+    arc_door_data = door_data_from_arcs(raw_arcs, wall_refs, cad_segs_all, [d["pt"] for d in door_data])
+    if arc_door_data:
+        door_data.extend(arc_door_data)
+        print("Doors inferred from arcs (fallback): %d" % len(arc_door_data))
 door_data = dedupe_openings(door_data, "door")
 door_data = rehost_and_validate_doors(door_data, wall_refs)
 door_data = dedupe_openings(door_data, "door")
@@ -2643,16 +3282,34 @@ if BUILD_DOORS and door_data:
 ext_openings = sum(len(a.openings) for a in axes if a.is_exterior)
 ext_count = sum(1 for a in axes if a.is_exterior)
 
-if ext_openings == 0:
-    print("WARNING: exterior openings = 0 (DWG probably uses window symbols). Skipping gap-windows and trying jamb fallback.")
-    win_data, curtain_data = [], []
+if USE_CAD_LAYER_OPENINGS:
+    win_data = openings_from_layer_components(wall_refs, window_layer_lines, window_layer_arcs, "window")
+    curtain_data = []
+    if (len(win_data) == 0 and
+            len(window_layer_lines) == 0 and len(window_layer_arcs) == 0 and
+            (len(door_layer_lines) > 0 or len(door_layer_arcs) > 0)):
+        mixed_win = openings_from_layer_components(wall_refs, door_layer_lines, door_layer_arcs, "window")
+        if mixed_win:
+            win_data.extend(mixed_win)
+            print("Windows inferred from A-doors mixed symbols: %d" % len(mixed_win))
+    if win_data:
+        print("Windows inferred from A-windows layer components: %d" % len(win_data))
 else:
-    win_data, curtain_data = openings_from_axes(wall_refs, door_pts, segs, exterior_only=True)
+    win_data = []
+    curtain_data = []
 
-# V5.2: if no window found from geometric gaps, try jamb-pair detection as fallback
-if ENABLE_WINDOW_JAMB_PAIR_FALLBACK and len(win_data) == 0:
-    win_data2 = windows_from_jamb_pairs(wall_refs, segs, door_pts)
-    win_data.extend(win_data2)
+need_window_fallback = ((not USE_CAD_LAYER_OPENINGS) or ((len(win_data) == 0) and ENABLE_TOPOLOGY_FALLBACK_IF_LAYER_EMPTY))
+if need_window_fallback:
+    if ext_openings == 0:
+        print("WARNING: exterior openings = 0 (DWG probably uses window symbols). Skipping gap-windows and trying jamb fallback.")
+        win_data, curtain_data = [], []
+    else:
+        win_data, curtain_data = openings_from_axes(wall_refs, door_pts, cad_segs_all, exterior_only=True)
+
+    # if no window found from geometric gaps, try jamb-pair detection as fallback
+    if ENABLE_WINDOW_JAMB_PAIR_FALLBACK and len(win_data) == 0:
+        win_data2 = windows_from_jamb_pairs(wall_refs, cad_segs_all, door_pts)
+        win_data.extend(win_data2)
 
 win_data = dedupe_openings(win_data, "window")
 win_data, curtain_data = resolve_opening_conflicts(door_data, win_data, curtain_data)
@@ -2674,4 +3331,7 @@ print("Exterior axes: %d / %d total (with %d openings)" % (ext_count, len(axes),
 print("Interior axes: %d" % int_count)
 print("Windows found: %d, Curtains: %d" % (len(win_data), len(curtain_data)))
 print("Thickness clusters (mm): %s" % [round(c*304.8,1) for c in clusters])
-print("Done V5.2.")
+if PHASE1_WALLS_ONLY:
+    print("Done V5.2 Phase 1 (continuous walls only).")
+else:
+    print("Done V5.2.")
