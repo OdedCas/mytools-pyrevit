@@ -8,10 +8,20 @@ import sys
 import math
 
 from Autodesk.Revit import DB
-from Autodesk.Revit.DB import ImportInstance
+from Autodesk.Revit.DB import (
+    BuiltInCategory,
+    ElementId,
+    FamilySymbol,
+    FilteredElementCollector,
+    ImportInstance,
+    WallType,
+)
+from Autodesk.Revit.DB.Structure import StructuralType
 from Autodesk.Revit.Exceptions import OperationCanceledException
 from Autodesk.Revit.UI import TaskDialog
 from Autodesk.Revit.UI.Selection import ISelectionFilter, ObjectType
+
+import re
 
 
 SCRIPT_DIR = os.path.dirname(__file__)
@@ -698,6 +708,50 @@ def _pick_wall_type(v2, target_cm, name_tokens):
     return v2.get_wall_type_nearest(target_ft)
 
 
+def _measure_local_thickness(centerline, raw_lines, max_search_cm=50.0):
+    """Measure wall thickness at a centerline by finding the two closest
+    parallel raw wall-face lines on opposite sides."""
+    cl_data = _line_axis_data(centerline)
+    if cl_data is None:
+        return None
+    cx, cy = _line_mid_cm(centerline)
+    cl_ux, cl_uy = cl_data[4], cl_data[5]
+    # Normal direction
+    nx, ny = -cl_uy, cl_ux
+
+    pos_dist = None  # closest on positive normal side
+    neg_dist = None  # closest on negative normal side
+
+    for raw in raw_lines:
+        rd = _line_axis_data(raw)
+        if rd is None:
+            continue
+        # Check parallel
+        dot = abs(cl_ux * rd[4] + cl_uy * rd[5])
+        if dot < 0.95:
+            continue
+        # Check overlap along the line axis
+        ratio, _ = _overlap_ratio_parallel(centerline, raw)
+        if ratio < 0.3:
+            continue
+        # Perpendicular signed distance from centerline to raw line midpoint
+        rmx, rmy = _line_mid_cm(raw)
+        perp = (rmx - cx) * nx + (rmy - cy) * ny
+        d = abs(perp)
+        if d < 1.0 or d > max_search_cm:
+            continue  # skip nearly-coincident lines
+        if perp > 0:
+            if pos_dist is None or d < pos_dist:
+                pos_dist = d
+        else:
+            if neg_dist is None or d < neg_dist:
+                neg_dist = d
+
+    if pos_dist is not None and neg_dist is not None:
+        return pos_dist + neg_dist
+    return None
+
+
 def _create_walls_from_lines(v2, lines_cm, level, wall_type, min_len_cm):
     ids = []
     if wall_type is None:
@@ -716,6 +770,63 @@ def _create_walls_from_lines(v2, lines_cm, level, wall_type, min_len_cm):
             ids.append(wall.Id.IntegerValue)
         except Exception:
             continue
+    return ids
+
+
+def _create_walls_per_thickness(v2, lines_cm, raw_lines, level, fallback_thick_cm,
+                                 name_tokens, min_len_cm, snapshot=None):
+    """Create interior walls with per-segment thickness from the raw DWG data."""
+    if not lines_cm:
+        return []
+
+    # Measure local thickness for each centerline
+    thickness_map = {}
+    for i, cl in enumerate(lines_cm):
+        t = _measure_local_thickness(cl, raw_lines)
+        if t is not None:
+            # Round to nearest cm for grouping
+            t_rounded = round(t)
+            t_rounded = max(5, t_rounded)
+        else:
+            t_rounded = int(round(fallback_thick_cm))
+        thickness_map[i] = t_rounded
+
+    # Group lines by thickness
+    groups = {}
+    for i, cl in enumerate(lines_cm):
+        t = thickness_map[i]
+        groups.setdefault(t, []).append(cl)
+
+    if snapshot:
+        try:
+            counts = {}
+            for t in thickness_map.values():
+                counts[t] = counts.get(t, 0) + 1
+            snapshot.log("Interior wall thickness groups: {}".format(
+                ", ".join("{}cm x{}".format(t, n) for t, n in sorted(counts.items()))))
+        except Exception:
+            pass
+
+    # Create walls per thickness group
+    ids = []
+    for t_cm, group_lines in sorted(groups.items()):
+        wt = _pick_wall_type(v2, t_cm, name_tokens)
+        if wt is None:
+            continue
+        for ln in group_lines:
+            if _line_len_cm(ln) < float(min_len_cm):
+                continue
+            p0 = v2.XYZ(v2.cm_to_ft(float(ln["x1"])), v2.cm_to_ft(float(ln["y1"])), 0.0)
+            p1 = v2.XYZ(v2.cm_to_ft(float(ln["x2"])), v2.cm_to_ft(float(ln["y2"])), 0.0)
+            try:
+                wall = v2.Wall.Create(v2.doc, v2.Line.CreateBound(p0, p1), wt.Id, level.Id, v2.cm_to_ft(300.0), 0.0, False, False)
+                try:
+                    v2.set_wall_location_centerline(wall)
+                except Exception:
+                    pass
+                ids.append(wall.Id.IntegerValue)
+            except Exception:
+                continue
     return ids
 
 
@@ -831,7 +942,560 @@ def _extract_from_selected_import(v2, selected_import, view, cfg):
     out["lines"] = _dedupe_lines(out["lines"], min_len_cm)
     out["meta"]["line_count"] = len(out["lines"])
     out["meta"]["arc_count"] = 0
+    # Cache raw data so opening detection can access A-DOORS/A-WINDOWS lines later.
+    _RAW_CAD_CACHE["data"] = out
     return out
+
+
+# ---------------------------------------------------------------------------
+# Opening detection (from A-DOORS / A-WINDOWS layers)
+# ---------------------------------------------------------------------------
+_RAW_CAD_CACHE = {"data": None}
+
+
+def _norm_layer_name(name):
+    return re.sub(r"[^A-Z0-9]", "", str(name or "").upper())
+
+
+def _is_opening_layer(layer_name, kind):
+    n = _norm_layer_name(layer_name)
+    if kind == "door":
+        return "ADOOR" in n
+    if kind == "window":
+        return "AWINDOW" in n
+    return False
+
+
+def _opening_bbox(lines):
+    if not lines:
+        return None
+    xs = []
+    ys = []
+    for ln in lines:
+        xs.append(float(ln.get("x1", 0)))
+        xs.append(float(ln.get("x2", 0)))
+        ys.append(float(ln.get("y1", 0)))
+        ys.append(float(ln.get("y2", 0)))
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _bbox_center_cm(bb):
+    return ((bb[0] + bb[2]) * 0.5, (bb[1] + bb[3]) * 0.5)
+
+
+def _bbox_max_dim(bb):
+    return max(bb[2] - bb[0], bb[3] - bb[1])
+
+
+def _bbox_dist_cm(a, b):
+    dx = max(0.0, max(a[0], b[0]) - min(a[2], b[2]))
+    dy = max(0.0, max(a[1], b[1]) - min(a[3], b[3]))
+    return math.sqrt(dx * dx + dy * dy)
+
+
+def _merge_bbox(a, b):
+    return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+
+
+def _detect_opening_markers(raw_lines, kind):
+    """Cluster lines from A-DOORS or A-WINDOWS into opening markers.
+    Returns list of {center_cm, width_cm, kind}."""
+    filtered = []
+    for ln in (raw_lines or []):
+        if _is_opening_layer(ln.get("layer", ""), kind):
+            x1 = float(ln.get("x1", 0))
+            y1 = float(ln.get("y1", 0))
+            x2 = float(ln.get("x2", 0))
+            y2 = float(ln.get("y2", 0))
+            bb = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+            seg_len = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            filtered.append({"ln": ln, "bbox": bb, "len": seg_len})
+
+    if not filtered:
+        return []
+
+    # Single-pass union-find: merge all primitives within 120cm.
+    # Door blocks have two jamb frames ~100cm apart + a swing line,
+    # so 120cm is needed to merge all parts of one door.
+    merge_dist = 120.0 if kind == "door" else 60.0
+    parent = list(range(len(filtered)))
+
+    def _find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def _union(i, j):
+        ri, rj = _find(i), _find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    for i in range(len(filtered)):
+        for j in range(i + 1, len(filtered)):
+            if _bbox_dist_cm(filtered[i]["bbox"], filtered[j]["bbox"]) <= merge_dist:
+                _union(i, j)
+
+    groups = {}
+    for idx in range(len(filtered)):
+        groups.setdefault(_find(idx), []).append(filtered[idx])
+
+    markers = []
+    for group in groups.values():
+        # Merge all bboxes in the group.
+        bb = group[0]["bbox"]
+        for ent in group[1:]:
+            bb = _merge_bbox(bb, ent["bbox"])
+
+        # Separate frame/jamb lines (short, <= 50cm) from swing arcs (long).
+        frame_xs = []
+        frame_ys = []
+        swing_line = None
+        max_seg_len = 0.0
+        for ent in group:
+            if ent["len"] > max_seg_len:
+                max_seg_len = ent["len"]
+                swing_line = ent["ln"]
+            if ent["len"] <= 50.0:  # frame/jamb lines only
+                frame_xs.append(float(ent["ln"].get("x1", 0)))
+                frame_xs.append(float(ent["ln"].get("x2", 0)))
+                frame_ys.append(float(ent["ln"].get("y1", 0)))
+                frame_ys.append(float(ent["ln"].get("y2", 0)))
+
+        bb_w = bb[2] - bb[0]
+        bb_h = bb[3] - bb[1]
+
+        if kind == "door":
+            # Width = swing arc length = actual door leaf width.
+            # The jamb-to-jamb bbox is wider (includes jamb blocks on both sides).
+            # Swing arc is the longest line in the cluster (>= 80cm typically).
+            if max_seg_len > 50.0:
+                width = max(40.0, min(200.0, max_seg_len))
+            elif frame_xs and frame_ys:
+                # Fallback: jamb-to-jamb minus estimated jamb thickness (~5cm each side)
+                jw = max(max(frame_xs) - min(frame_xs),
+                         max(frame_ys) - min(frame_ys))
+                width = max(40.0, min(200.0, jw - 10.0))
+            else:
+                width = max(40.0, min(200.0, max_seg_len))
+        else:
+            # Window: shorter bbox dim is the frame width along the wall.
+            width = max(30.0, min(300.0, min(bb_w, bb_h) if min(bb_w, bb_h) > 10.0 else max(bb_w, bb_h)))
+
+        # Center: midpoint of all frame line endpoints = center between jambs.
+        if frame_xs and frame_ys:
+            center = ((min(frame_xs) + max(frame_xs)) * 0.5,
+                      (min(frame_ys) + max(frame_ys)) * 0.5)
+        else:
+            center = _bbox_center_cm(bb)
+
+        # Swing arc data for door orientation matching.
+        swing_data = None
+        if kind == "door" and swing_line is not None and max_seg_len > 50.0:
+            sx1 = float(swing_line.get("x1", 0))
+            sy1 = float(swing_line.get("y1", 0))
+            sx2 = float(swing_line.get("x2", 0))
+            sy2 = float(swing_line.get("y2", 0))
+            # The swing arc goes from hinge (near a jamb) toward open position.
+            # Midpoint of the arc indicates which side the door swings into.
+            swing_mid = ((sx1 + sx2) * 0.5, (sy1 + sy2) * 0.5)
+            # Hinge is the arc endpoint closest to center (between jambs).
+            d1 = math.sqrt((sx1 - center[0]) ** 2 + (sy1 - center[1]) ** 2)
+            d2 = math.sqrt((sx2 - center[0]) ** 2 + (sy2 - center[1]) ** 2)
+            if d1 <= d2:
+                hinge_pt = (sx1, sy1)
+                open_pt = (sx2, sy2)
+            else:
+                hinge_pt = (sx2, sy2)
+                open_pt = (sx1, sy1)
+            swing_data = {
+                "hinge_cm": hinge_pt,
+                "open_cm": open_pt,
+                "swing_mid_cm": swing_mid,
+            }
+
+        markers.append({
+            "kind": kind,
+            "center_cm": center,
+            "width_cm": width,
+            "swing": swing_data,
+        })
+
+    # Dedupe markers closer than 60cm
+    out = []
+    for mk in markers:
+        dup = False
+        for ex in out:
+            dx = mk["center_cm"][0] - ex["center_cm"][0]
+            dy = mk["center_cm"][1] - ex["center_cm"][1]
+            if math.sqrt(dx * dx + dy * dy) <= 60.0:
+                dup = True
+                break
+        if not dup:
+            out.append(mk)
+    return out
+
+
+def _find_host_wall(v2, all_wall_ids, center_cm, level_elevation_ft):
+    """Find the Revit wall whose location line is closest to center_cm.
+    Returns (wall, point_on_wall_ft, distance_ft) or (None, None, 1e9)."""
+    cx = v2.cm_to_ft(float(center_cm[0]))
+    cy = v2.cm_to_ft(float(center_cm[1]))
+    pt = v2.XYZ(cx, cy, level_elevation_ft)
+
+    best_wall = None
+    best_pt = None
+    best_dist = 1.0e9
+    for wid in all_wall_ids:
+        try:
+            wall = v2.doc.GetElement(ElementId(wid))
+        except Exception:
+            continue
+        if wall is None:
+            continue
+        loc = wall.Location
+        if loc is None:
+            continue
+        try:
+            curve = loc.Curve
+        except Exception:
+            continue
+        if curve is None:
+            continue
+        try:
+            result = curve.Project(pt)
+            if result is not None and result.Distance < best_dist:
+                best_dist = result.Distance
+                best_wall = wall
+                best_pt = result.XYZPoint
+        except Exception:
+            continue
+    return best_wall, best_pt, best_dist
+
+
+def _get_family_types(v2, category):
+    """Get all loaded FamilySymbol entries for a BuiltInCategory."""
+    out = []
+    try:
+        col = FilteredElementCollector(v2.doc).OfCategory(category).OfClass(FamilySymbol)
+        for fs in col:
+            out.append(fs)
+    except Exception:
+        pass
+    return out
+
+
+def _pick_family_type_by_width(v2, family_types, target_width_cm):
+    """Pick the family type whose width parameter is closest to target."""
+    target_ft = v2.cm_to_ft(float(target_width_cm))
+    best = None
+    best_delta = 1.0e9
+    for fs in family_types:
+        try:
+            # Try common width parameters
+            w = None
+            for pname in ["Width", "width", "Rough Width"]:
+                p = fs.LookupParameter(pname)
+                if p is not None:
+                    w = p.AsDouble()
+                    break
+            if w is None:
+                w = target_ft  # assume match if no width param
+            d = abs(w - target_ft)
+            if d < best_delta:
+                best = fs
+                best_delta = d
+        except Exception:
+            if best is None:
+                best = fs
+    return best
+
+
+def _set_sill_height(v2, inst, height_cm):
+    """Set sill height on a window instance."""
+    height_ft = v2.cm_to_ft(float(height_cm))
+    for pname in ["Sill Height", "sill height", "Sill_Height"]:
+        try:
+            p = inst.LookupParameter(pname)
+            if p is not None and not p.IsReadOnly:
+                p.Set(height_ft)
+                return True
+        except Exception:
+            continue
+    # Try built-in sill height parameter
+    try:
+        p = inst.get_Parameter(DB.BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM)
+        if p is not None and not p.IsReadOnly:
+            p.Set(height_ft)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _pick_door_type_for_wall(v2, family_types, target_width_cm, is_interior, snapshot=None):
+    """Pick a door family type appropriate for interior or exterior walls."""
+    target_ft = v2.cm_to_ft(float(target_width_cm))
+
+    # Split into interior and exterior candidates by name heuristic.
+    # Check EXTERIOR first since names like "Exterior-Single" contain "Single".
+    int_types = []
+    ext_types = []
+    for fs in family_types:
+        try:
+            name = (fs.Family.Name or "").upper()
+        except Exception:
+            name = ""
+        if "EXTERIOR" in name or "EXT-" in name or "-EXT" in name:
+            ext_types.append(fs)
+        else:
+            int_types.append(fs)
+
+    if snapshot:
+        try:
+            int_names = [fs.Family.Name for fs in int_types]
+            ext_names = [fs.Family.Name for fs in ext_types]
+            snapshot.log("Door types: {} interior ({}), {} exterior ({})".format(
+                len(int_types), ", ".join(set(int_names))[:200],
+                len(ext_types), ", ".join(set(ext_names))[:200]))
+        except Exception:
+            pass
+
+    candidates = int_types if is_interior else ext_types
+    if not candidates:
+        candidates = family_types  # fallback to all
+
+    # Prefer user/custom families over Revit defaults (M_ prefix).
+    # If any custom families exist, use ONLY those.
+    custom = []
+    default = []
+    for fs in candidates:
+        try:
+            nm = (fs.Family.Name or "").upper()
+        except Exception:
+            nm = ""
+        if nm.startswith("M_") or nm.startswith("M "):
+            default.append(fs)
+        else:
+            custom.append(fs)
+    ranked = custom if custom else default
+
+    # Pick by closest width, preferring earlier (custom) entries on ties
+    best = None
+    best_delta = 1.0e9
+    for fs in ranked:
+        try:
+            w = None
+            for pname in ["Width", "width", "Rough Width"]:
+                p = fs.LookupParameter(pname)
+                if p is not None:
+                    w = p.AsDouble()
+                    break
+            if w is None:
+                w = target_ft
+            d = abs(w - target_ft)
+            if d < best_delta:
+                best = fs
+                best_delta = d
+        except Exception:
+            if best is None:
+                best = fs
+    return best
+
+
+def _match_door_swing(v2, inst, wall, swing, center_cm, snapshot=None):
+    """Flip door hand/facing to match DWG swing arc direction.
+
+    swing dict has: hinge_cm, open_cm, swing_mid_cm.
+    We compare the DWG swing direction against Revit's actual door orientation
+    and flip as needed.
+    """
+    try:
+        curve = wall.Location.Curve
+        ws = curve.GetEndPoint(0)
+        we = curve.GetEndPoint(1)
+    except Exception:
+        return
+    wall_dx = we.X - ws.X
+    wall_dy = we.Y - ws.Y
+    wall_len = math.sqrt(wall_dx * wall_dx + wall_dy * wall_dy)
+    if wall_len < 1e-9:
+        return
+    # Wall unit tangent and normal
+    wtx = wall_dx / wall_len
+    wty = wall_dy / wall_len
+    wnx = -wty  # normal (left of wall direction)
+    wny = wtx
+
+    hinge = swing["hinge_cm"]
+    open_pt = swing["open_cm"]
+    cx, cy = center_cm
+
+    # --- DWG swing direction ---
+    # Vector from door center to the open endpoint of the swing arc.
+    # This tells us which side of the wall the door swings into.
+    open_dx = v2.cm_to_ft(open_pt[0] - cx)
+    open_dy = v2.cm_to_ft(open_pt[1] - cy)
+    # Project onto wall normal: positive = normal side, negative = opposite
+    dwg_facing_dot = open_dx * wnx + open_dy * wny
+    # Project onto wall tangent: tells us which direction the door opens along the wall
+    dwg_tang_dot = open_dx * wtx + open_dy * wty
+
+    # --- DWG hinge side ---
+    # Project hinge position onto wall tangent relative to door center.
+    hinge_dx = v2.cm_to_ft(hinge[0] - cx)
+    hinge_dy = v2.cm_to_ft(hinge[1] - cy)
+    dwg_hinge_tang = hinge_dx * wtx + hinge_dy * wty
+
+    # --- Revit current orientation ---
+    # FacingOrientation: direction the door faces (normal side)
+    # HandOrientation: direction from hinge to latch along the wall
+    try:
+        facing_dir = inst.FacingOrientation
+        hand_dir = inst.HandOrientation
+    except Exception:
+        return
+
+    # Compare DWG facing side with Revit facing side
+    # If the DWG open-point is on the opposite side from Revit's facing, flip facing
+    revit_facing_dot = facing_dir.X * wnx + facing_dir.Y * wny
+    need_flip_facing = (dwg_facing_dot * revit_facing_dot < 0)
+
+    # Compare DWG hinge side with Revit hand direction
+    # HandOrientation points from hinge toward latch.
+    # DWG hinge is at dwg_hinge_tang along wall; latch is opposite.
+    # So DWG "hand direction" along wall tangent = -sign(dwg_hinge_tang)
+    revit_hand_tang = hand_dir.X * wtx + hand_dir.Y * wty
+    dwg_hand_dir = -1 if dwg_hinge_tang > 0 else 1
+    need_flip_hand = (dwg_hand_dir * revit_hand_tang < 0)
+
+    if need_flip_facing:
+        inst.flipFacing()
+    if need_flip_hand:
+        inst.flipHand()
+
+    if snapshot:
+        try:
+            snapshot.log("  swing: facing_dot={:.2f} vs revit={:.2f} flip_facing={}, "
+                         "hinge_tang={:.2f} hand_tang={:.2f} flip_hand={}".format(
+                dwg_facing_dot, revit_facing_dot, need_flip_facing,
+                dwg_hinge_tang, revit_hand_tang, need_flip_hand))
+        except Exception:
+            pass
+
+
+def _place_openings_in_walls(v2, level, ext_wall_ids, int_wall_ids, markers,
+                              category, snapshot, sill_height_cm=None):
+    """Place door or window family instances into host walls.
+    sill_height_cm: for windows, the sill height above floor (e.g. 105).
+    Returns list of created element IDs."""
+    all_wall_ids = list(ext_wall_ids or []) + list(int_wall_ids or [])
+    if not markers or not all_wall_ids:
+        return []
+
+    int_wall_set = set(int_wall_ids or [])
+    cat_name = "door" if category == BuiltInCategory.OST_Doors else "window"
+    family_types = _get_family_types(v2, category)
+    if not family_types:
+        if snapshot:
+            try:
+                snapshot.log("No {} family types loaded, skipping placement.".format(cat_name))
+            except Exception:
+                pass
+        return []
+
+    # Get level elevation for correct Z coordinate
+    level_elev_ft = 0.0
+    try:
+        level_elev_ft = float(level.Elevation)
+    except Exception:
+        pass
+
+    max_snap_ft = v2.cm_to_ft(150.0)  # max 150cm snap distance
+    ids = []
+    errors = []
+
+    if snapshot:
+        try:
+            snapshot.log("Placing {} {}s, {} family types available, level elev={:.2f}ft".format(
+                len(markers), cat_name, len(family_types), level_elev_ft))
+        except Exception:
+            pass
+
+    for mk in markers:
+        wall, pt, dist = _find_host_wall(v2, all_wall_ids, mk["center_cm"], level_elev_ft)
+        if wall is None or dist > max_snap_ft:
+            errors.append("No host wall within 150cm for {} at ({:.0f}, {:.0f}), best dist={:.1f}ft".format(
+                cat_name, mk["center_cm"][0], mk["center_cm"][1], dist))
+            continue
+
+        is_interior = wall.Id.IntegerValue in int_wall_set
+
+        if category == BuiltInCategory.OST_Doors:
+            fs = _pick_door_type_for_wall(v2, family_types, mk["width_cm"], is_interior, snapshot)
+        else:
+            fs = _pick_family_type_by_width(v2, family_types, mk["width_cm"])
+
+        if fs is None:
+            errors.append("No {} family type available".format(cat_name))
+            continue
+
+        try:
+            if not fs.IsActive:
+                fs.Activate()
+                v2.doc.Regenerate()
+        except Exception:
+            pass
+
+        try:
+            # Place at level elevation Z
+            place_pt = v2.XYZ(pt.X, pt.Y, level_elev_ft)
+            inst = v2.doc.Create.NewFamilyInstance(
+                place_pt, fs, wall, level, StructuralType.NonStructural)
+
+            # Set sill height for windows
+            if sill_height_cm is not None and category == BuiltInCategory.OST_Windows:
+                _set_sill_height(v2, inst, sill_height_cm)
+
+            # Match door swing direction from DWG
+            if category == BuiltInCategory.OST_Doors and mk.get("swing"):
+                try:
+                    _match_door_swing(v2, inst, wall, mk["swing"], mk["center_cm"], snapshot)
+                except Exception:
+                    pass
+
+            ids.append(inst.Id.IntegerValue)
+            if snapshot:
+                try:
+                    wall_loc = wall.Location.Curve
+                    w_start = wall_loc.GetEndPoint(0)
+                    w_end = wall_loc.GetEndPoint(1)
+                    snapshot.log(
+                        "{} placed id={} at ({:.0f},{:.0f})cm on {} wall {} "
+                        "({:.0f},{:.0f})->({:.0f},{:.0f})ft dist={:.1f}cm width={:.0f}cm type={}".format(
+                            cat_name, inst.Id.IntegerValue,
+                            mk["center_cm"][0], mk["center_cm"][1],
+                            "INT" if is_interior else "EXT",
+                            wall.Id.IntegerValue,
+                            w_start.X, w_start.Y, w_end.X, w_end.Y,
+                            v2.ft_to_cm(dist),
+                            mk["width_cm"],
+                            fs.Family.Name))
+                except Exception:
+                    pass
+        except Exception as ex:
+            errors.append("Failed placing {} at ({:.0f}, {:.0f}): {}".format(
+                cat_name, mk["center_cm"][0], mk["center_cm"][1], str(ex)))
+
+    if snapshot:
+        try:
+            snapshot.log("Placed {} of {} {}s".format(len(ids), len(markers), cat_name))
+            for e in errors:
+                snapshot.log(e)
+        except Exception:
+            pass
+
+    return ids
 
 
 def _apply_layer_first_wall_mode(v2, selected_import):
@@ -1015,11 +1679,8 @@ def _apply_layer_first_wall_mode(v2, selected_import):
         int_center = _dedupe_lines(int_center, min_len_cm)
 
         ext_type = _pick_wall_type(v2, ext_thick_cm, ["EXTERIOR", "EXT"])
-        int_type = _pick_wall_type(v2, int_thick_cm, ["INTERIOR", "INT", "PARTITION"])
         if ext_type is None:
             raise Exception("No Basic wall type found for exterior walls.")
-        if int_type is None:
-            int_type = ext_type
 
         wall_ids = []
         internal_wall_ids = []
@@ -1027,7 +1688,10 @@ def _apply_layer_first_wall_mode(v2, selected_import):
         t.Start()
         try:
             wall_ids = _create_walls_from_lines(v2, ext_center, level, ext_type, min_len_cm)
-            internal_wall_ids = _create_walls_from_lines(v2, int_center, level, int_type, min_len_cm)
+            # Interior walls: per-segment thickness measured from raw DWG pairs
+            internal_wall_ids = _create_walls_per_thickness(
+                v2, int_center, int_raw, level, int_thick_cm,
+                ["INTERIOR", "INT", "PARTITION"], min_len_cm, snapshot)
             t.Commit()
         except Exception:
             try:
@@ -1036,16 +1700,66 @@ def _apply_layer_first_wall_mode(v2, selected_import):
                 pass
             raise
 
+        # --- Opening detection and placement ---
+        door_ids = []
+        window_ids = []
+        opening_errors = []
+        raw_data = _RAW_CAD_CACHE.get("data")
+        if raw_data is not None:
+            raw_lines = raw_data.get("lines") or []
+            door_markers = _detect_opening_markers(raw_lines, "door")
+            window_markers = _detect_opening_markers(raw_lines, "window")
+
+            if snapshot:
+                try:
+                    snapshot.log("Opening markers detected: {} doors, {} windows".format(
+                        len(door_markers), len(window_markers)))
+                    for i, mk in enumerate(door_markers):
+                        sw = mk.get("swing") or {}
+                        snapshot.log("  door[{}] center=({:.0f},{:.0f}) width={:.0f}cm hinge={} open={}".format(
+                            i, mk["center_cm"][0], mk["center_cm"][1], mk["width_cm"],
+                            sw.get("hinge_cm", "?"), sw.get("open_cm", "?")))
+                    for i, mk in enumerate(window_markers):
+                        snapshot.log("  win[{}] center=({:.0f},{:.0f}) width={:.0f}cm".format(
+                            i, mk["center_cm"][0], mk["center_cm"][1], mk["width_cm"]))
+                except Exception:
+                    pass
+
+            if door_markers or window_markers:
+                t2 = v2.Transaction(v2.doc, "C2Rv6_C Place Openings")
+                t2.Start()
+                try:
+                    if door_markers:
+                        door_ids = _place_openings_in_walls(
+                            v2, level, wall_ids, internal_wall_ids,
+                            door_markers,
+                            BuiltInCategory.OST_Doors, snapshot,
+                            sill_height_cm=0.0)
+                    if window_markers:
+                        window_ids = _place_openings_in_walls(
+                            v2, level, wall_ids, internal_wall_ids,
+                            window_markers,
+                            BuiltInCategory.OST_Windows, snapshot,
+                            sill_height_cm=105.0)
+                    t2.Commit()
+                except Exception as ex:
+                    opening_errors.append(str(ex))
+                    try:
+                        t2.RollBack()
+                    except Exception:
+                        pass
+
         if snapshot is not None:
             try:
-                snapshot.log("Layer-first walls created: ext={} int={}".format(len(wall_ids), len(internal_wall_ids)))
+                snapshot.log("Layer-first walls created: ext={} int={}, doors={} windows={}".format(
+                    len(wall_ids), len(internal_wall_ids), len(door_ids), len(window_ids)))
                 snapshot.save_json("08_geometry_summary.json", {
                     "geometry": {
                         "wall_ids": wall_ids,
                         "internal_wall_ids": internal_wall_ids,
-                        "door_ids": [],
-                        "window_ids": [],
-                        "opening_errors": [],
+                        "door_ids": door_ids,
+                        "window_ids": window_ids,
+                        "opening_errors": opening_errors,
                         "perimeter_wall_thickness_cm": float(ext_thick_cm),
                         "internal_wall_thickness_cm": float(int_thick_cm),
                     }
@@ -1057,15 +1771,15 @@ def _apply_layer_first_wall_mode(v2, selected_import):
             "geometry": {
                 "wall_ids": wall_ids,
                 "internal_wall_ids": internal_wall_ids,
-                "door_ids": [],
-                "window_ids": [],
-                "opening_errors": [],
+                "door_ids": door_ids,
+                "window_ids": window_ids,
+                "opening_errors": opening_errors,
                 "perimeter_wall_thickness_cm": float(ext_thick_cm),
                 "internal_wall_thickness_cm": float(int_thick_cm),
             },
             "dimensions": {
                 "ok": False,
-                "note": "Dimensions disabled in C2Rv6 layer-first wall mode.",
+                "note": "Dimensions disabled in C2Rv6_C layer-first wall mode.",
             }
         }
 
