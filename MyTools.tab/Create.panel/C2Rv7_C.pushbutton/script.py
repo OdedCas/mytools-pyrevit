@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-__title__ = "C2Rv6_C"
-__doc__ = "CAD to Revit V6C. Improved stepped wall handling for A-WALL-EXT / A-WALL-INT layers."
+__title__ = "C2Rv7_C"
+__doc__ = "CAD to Revit V7C. Layer-first walls (A-WALL-EXT/A-WALL-INT) + doors, windows, floors, rooms, dimensions. Optional LLM QA on interior fragments."
 
 import imp
 import os
@@ -54,6 +54,7 @@ SCRIPT_DIR = os.path.dirname(__file__)
 PANEL_DIR = os.path.dirname(SCRIPT_DIR)
 V2_DIR = os.path.join(PANEL_DIR, "CreateFromCADV2.pushbutton")
 _REC_MOD = None
+_LLM_QA_MOD = None
 
 if V2_DIR not in sys.path:
     sys.path.append(V2_DIR)
@@ -62,7 +63,7 @@ if V2_DIR not in sys.path:
 def _load_v2_module():
     path = os.path.join(V2_DIR, "script.py")
     try:
-        return imp.load_source("c2rv6_v2_delegate", path)
+        return imp.load_source("c2rv7_v2_delegate", path)
     except Exception as ex:
         raise Exception("Failed loading CreateFromCADV2 module: {} ({})".format(path, ex))
 
@@ -73,10 +74,25 @@ def _load_recognition_helpers():
         return _REC_MOD
     path = os.path.join(V2_DIR, "v2_cad_recognition.py")
     try:
-        _REC_MOD = imp.load_source("c2rv6_v2_recognition_helpers", path)
+        _REC_MOD = imp.load_source("c2rv7_v2_recognition_helpers", path)
     except Exception as ex:
         raise Exception("Failed loading recognition helpers: {} ({})".format(path, ex))
     return _REC_MOD
+
+
+def _load_llm_qa():
+    """Load the LLM QA sidecar if present. Returns module or None; never raises."""
+    global _LLM_QA_MOD
+    if _LLM_QA_MOD is not None:
+        return _LLM_QA_MOD
+    path = os.path.join(SCRIPT_DIR, "c2rv7_llm_qa.py")
+    if not os.path.isfile(path):
+        return None
+    try:
+        _LLM_QA_MOD = imp.load_source("c2rv7_llm_qa", path)
+    except Exception:
+        _LLM_QA_MOD = None
+    return _LLM_QA_MOD
 
 
 class _DwgImportFilter(ISelectionFilter):
@@ -95,7 +111,7 @@ def _pick_dwg_import(uidoc):
         picked = uidoc.Selection.PickObject(
             ObjectType.Element,
             _DwgImportFilter(),
-            "Select DWG import/link for C2Rv6",
+            "Select DWG import/link for C2Rv7_C",
         )
     except OperationCanceledException:
         return None
@@ -2263,7 +2279,7 @@ def _pick_floor_types(v2):
 
     floor_types = _collect_floor_types(v2.doc)
     if not floor_types:
-        TaskDialog.Show("C2Rv6_C", "No floor types found in the project.")
+        TaskDialog.Show("C2Rv7_C", "No floor types found in the project.")
         return None
 
     # Get names using .NET interop to preserve Hebrew
@@ -2639,7 +2655,7 @@ def _create_rooms_and_tags(v2, level, snapshot=None):
     tag_ids = []
 
     # --- Create rooms from plan topology circuits ---
-    t = Transaction(v2.doc, "C2Rv6_C Create Rooms")
+    t = Transaction(v2.doc, "C2Rv7_C Create Rooms")
     t.Start()
     try:
         plan_topo = v2.doc.get_PlanTopology(level)
@@ -2701,7 +2717,7 @@ def _create_rooms_and_tags(v2, level, snapshot=None):
         return room_ids, tag_ids
 
     # --- Place room tags ---
-    t2 = Transaction(v2.doc, "C2Rv6_C Create Room Tags")
+    t2 = Transaction(v2.doc, "C2Rv7_C Create Room Tags")
     t2.Start()
     try:
         from Autodesk.Revit.DB import LinkElementId
@@ -2982,7 +2998,7 @@ def _create_exterior_dimensions(v2, level, wall_ids, door_ids, window_ids,
 
     # --- Create dimensions per cardinal side ---
     sides_created = 0
-    t = Transaction(v2.doc, "C2Rv6_C Create Dimensions")
+    t = Transaction(v2.doc, "C2Rv7_C Create Dimensions")
     t.Start()
     try:
         for card_key in ("N", "S", "E", "W"):
@@ -3316,7 +3332,7 @@ def _create_floors(v2, level, ext_inner_lines_cm, concrete_type, tile_type,
     def _make_floor(v2, polygon, floor_type, level, label, offset_ft, snapshot):
         """Create a single floor from polygon points. Returns element id or None."""
         pts = [v2.XYZ(x, y, 0.0) for x, y in polygon]
-        t = v2.Transaction(v2.doc, "C2Rv6_C Create {} Floor".format(label))
+        t = v2.Transaction(v2.doc, "C2Rv7_C Create {} Floor".format(label))
         t.Start()
         try:
             loop = v2.build_loop(pts)
@@ -3361,6 +3377,21 @@ def _create_floors(v2, level, ext_inner_lines_cm, concrete_type, tile_type,
             tile_floor_ids.append(fid)
 
     return floor_ids, tile_floor_ids
+
+
+def _line_keys_set(lines):
+    return set(_line_key(ln) for ln in (lines or []))
+
+
+def _diff_removed_lines(before, after):
+    after_keys = _line_keys_set(after)
+    return [ln for ln in (before or []) if _line_key(ln) not in after_keys]
+
+
+def _group_removed_as_fragments(removed_lines, tol_cm):
+    if not removed_lines:
+        return []
+    return _connected_components(removed_lines, tol_cm)
 
 
 def _apply_layer_first_wall_mode(v2, selected_import):
@@ -3429,6 +3460,20 @@ def _apply_layer_first_wall_mode(v2, selected_import):
         concrete_type = floor_choice[0] if floor_choice else None
         tile_type = floor_choice[1] if floor_choice else None
 
+        llm_qa = _load_llm_qa()
+        qa_report = {
+            "enabled": bool(llm_qa is not None and llm_qa.qa_enabled(cfg)),
+            "envelope": None,
+            "fragments": None,
+            "thickness": None,
+            "restored_fragment_lines": 0,
+        }
+        if snapshot is not None:
+            try:
+                snapshot.log("LLM-QA enabled={}".format(qa_report["enabled"]))
+            except Exception:
+                pass
+
         min_len_cm = float(cfg.get("model_wall_min_length_cm", 20.0))
         raw_min_len_cm = float(cfg.get("raw_dedup_min_len_cm", 5.0))
         close_gap_ext_cm = float(cfg.get("continuous_gap_close_cm_ext", 180.0))
@@ -3442,6 +3487,24 @@ def _apply_layer_first_wall_mode(v2, selected_import):
         # Safety: if CAD came in duplicated (translated copy), keep one model footprint.
         ext_all = [ln for ln in wall_lines if str(ln.get("layer", "")).strip().upper() == "A-WALL-EXT"]
         ext_main = _largest_component_lines(ext_all, tol_cm=6.0)
+
+        # Hook 1: validate exterior envelope looks like a real building footprint.
+        if qa_report["enabled"]:
+            try:
+                env_res = llm_qa.validate_exterior_envelope(cfg, ext_main, snapshot=snapshot)
+                qa_report["envelope"] = env_res
+                if env_res.get("verdict") == "reject" and float(env_res.get("confidence", 0.0)) >= 0.7:
+                    if snapshot is not None:
+                        try:
+                            snapshot.log("LLM-QA envelope REJECT (conf {:.2f}): {}".format(
+                                float(env_res.get("confidence", 0.0)),
+                                env_res.get("reason", "")[:160],
+                            ))
+                        except Exception:
+                            pass
+            except Exception:
+                qa_report["envelope"] = {"verdict": "no_opinion", "error": "exception"}
+
         ext_bbox = _bbox_of_lines(ext_main)
         if ext_bbox:
             wall_lines = _keep_lines_in_bbox(wall_lines, ext_bbox, margin_cm=180.0)
@@ -3475,6 +3538,16 @@ def _apply_layer_first_wall_mode(v2, selected_import):
         int_fallback_cm = float(cfg.get("default_internal_wall_thickness_cm", min(15.0, max(10.0, ext_thick_cm * 0.7))))
         int_thick_cm = _estimate_thickness_cm(int_dbg, int_fallback_cm)
 
+        # Hook 3: thickness sanity check (informational only, never changes numbers).
+        if qa_report["enabled"]:
+            try:
+                thk_res = llm_qa.sanity_check_thicknesses(
+                    cfg, ext_thick_cm, int_thick_cm, ext_center, int_center, snapshot=snapshot,
+                )
+                qa_report["thickness"] = thk_res
+            except Exception:
+                qa_report["thickness"] = {"verdict": "no_opinion", "error": "exception"}
+
         def _dump_lines(label, lines):
             if snapshot is None:
                 return
@@ -3499,6 +3572,7 @@ def _apply_layer_first_wall_mode(v2, selected_import):
         int_center = _prune_short_leaf_lines(int_center, cleanup_tol_cm, max(70.0, int_thick_cm * 2.0))
         _dump_lines("02_int_after_prune_leaf", int_center)
         ext_center = _largest_component_lines(ext_center, cleanup_tol_cm)
+        int_before_removal = list(int_center)
         int_center = _remove_small_components(int_center, cleanup_tol_cm, max(220.0, int_thick_cm * 6.0), max(110.0, int_thick_cm * 2.5))
         _dump_lines("03_int_after_remove_small", int_center)
         int_center = _remove_small_interior_fragments(
@@ -3509,6 +3583,43 @@ def _apply_layer_first_wall_mode(v2, selected_import):
             max(60.0, int_thick_cm * 1.4),
         )
         _dump_lines("04_int_after_remove_frag", int_center)
+
+        # Hook 2: ask Claude whether any removed fragment was a legitimate short wall.
+        if qa_report["enabled"]:
+            try:
+                removed = _diff_removed_lines(int_before_removal, int_center)
+                fragments = _group_removed_as_fragments(removed, cleanup_tol_cm)
+                fragments = [
+                    frag for frag in fragments
+                    if frag and sum(_line_len_cm(ln) for ln in frag) >= max(10.0, 0.5 * cleanup_tol_cm)
+                ]
+                if fragments:
+                    frag_res = llm_qa.classify_interior_fragments(
+                        cfg, int_center, fragments, snapshot=snapshot,
+                    )
+                    qa_report["fragments"] = {
+                        "count_considered": len(fragments),
+                        "verdicts": frag_res.get("verdicts", {}),
+                        "confidences": frag_res.get("confidences", {}),
+                        "reasons": frag_res.get("reasons", {}),
+                    }
+                    restored = 0
+                    for i, frag in enumerate(fragments):
+                        verdict = frag_res.get("verdicts", {}).get(str(i), "unsure")
+                        conf = float(frag_res.get("confidences", {}).get(str(i), 0.0))
+                        if verdict == "keep" and conf >= 0.6:
+                            int_center.extend(frag)
+                            restored += len(frag)
+                    qa_report["restored_fragment_lines"] = restored
+                    if snapshot is not None:
+                        try:
+                            snapshot.log("LLM-QA fragments: reviewed={} restored_lines={}".format(
+                                len(fragments), restored,
+                            ))
+                        except Exception:
+                            pass
+            except Exception:
+                qa_report["fragments"] = {"error": "exception"}
 
         # Final consolidation on centerlines after pairing.
         ext_center = rec._merge_collinear_overlapping(ext_center, perp_tol=6.0, gap_tol=4.0)
@@ -3568,7 +3679,7 @@ def _apply_layer_first_wall_mode(v2, selected_import):
 
         wall_ids = []
         internal_wall_ids = []
-        t = v2.Transaction(v2.doc, "Create Model From CAD V2 (C2Rv6_C Layer-First Walls)")
+        t = v2.Transaction(v2.doc, "Create Model From CAD V2 (C2Rv7_C Layer-First Walls)")
         t.Start()
         try:
             wall_ids = _create_walls_from_lines(v2, ext_center, level, ext_type, min_len_cm)
@@ -3610,7 +3721,7 @@ def _apply_layer_first_wall_mode(v2, selected_import):
                     pass
 
             if door_markers or window_markers:
-                t2 = v2.Transaction(v2.doc, "C2Rv6_C Place Openings")
+                t2 = v2.Transaction(v2.doc, "C2Rv7_C Place Openings")
                 # Suppress "Can't make type" dialogs — auto-delete failing elements
                 fho = t2.GetFailureHandlingOptions()
                 fho.SetFailuresPreprocessor(_SwallowTypeErrors())
@@ -3703,7 +3814,8 @@ def _apply_layer_first_wall_mode(v2, selected_import):
                         "opening_errors": opening_errors,
                         "perimeter_wall_thickness_cm": float(ext_thick_cm),
                         "internal_wall_thickness_cm": float(int_thick_cm),
-                    }
+                    },
+                    "llm_qa": qa_report,
                 })
             except Exception:
                 pass
@@ -3723,10 +3835,7 @@ def _apply_layer_first_wall_mode(v2, selected_import):
                 "perimeter_wall_thickness_cm": float(ext_thick_cm),
                 "internal_wall_thickness_cm": float(int_thick_cm),
             },
-            "dimensions": {
-                "ok": False,
-                "note": "Dimensions disabled in C2Rv6_C layer-first wall mode.",
-            }
+            "llm_qa": qa_report,
         }
 
     v2.build_model_from_topology = _build_layer_first
@@ -3735,12 +3844,12 @@ def _apply_layer_first_wall_mode(v2, selected_import):
 def main():
     uidoc = __revit__.ActiveUIDocument
     if uidoc is None:
-        TaskDialog.Show("C2Rv6", "No active Revit document.")
+        TaskDialog.Show("C2Rv7_C", "No active Revit document.")
         return
 
     selected_import = _pick_dwg_import(uidoc)
     if selected_import is None:
-        TaskDialog.Show("C2Rv6", "Canceled: no DWG import selected.")
+        TaskDialog.Show("C2Rv7_C", "Canceled: no DWG import selected.")
         return
 
     v2 = _load_v2_module()

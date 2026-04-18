@@ -30,25 +30,32 @@ Instead of applying a single global median thickness to all interior walls, each
 
 ### 5. Opening detection and placement
 
-Doors and windows are detected from raw CAD data (cached during extraction) using layer-based filtering (`A-DOORS`, `A-WINDOWS`) and union-find clustering.
+Doors and windows are detected from raw CAD data (cached during extraction) using layer-based filtering (`A-DOORS`, `A-WINDOWS`) and union-find clustering. `C2Rv6_C` now keeps real DWG arcs from the selected import instead of flattening everything to lines.
 
-**Door detection**: Lines on `A-DOORS` layer are clustered with 120cm merge distance (door blocks have two jamb frames ~100cm apart + a swing arc line). Width = swing arc length (the longest line in the cluster, typically the door leaf width). Center = midpoint of all frame/jamb line endpoints (lines <= 50cm), excluding the swing arc.
+**Door detection**:
+- Door primitives are clustered with 120cm merge distance.
+- If a real DWG door swing arc exists, width comes from the arc radius, which is the door leaf width.
+- If no arc exists, width falls back to the longest swing line or jamb bbox heuristic.
+- Center stays at the midpoint between jamb/frame lines when those are available.
 
-**Window detection**: Lines on `A-WINDOWS` layer are clustered with 60cm merge distance. Width = shorter bbox dimension.
+**Window detection**: Window primitives are clustered with 60cm merge distance. Width = shorter bbox dimension.
 
 **Placement pipeline**:
 1. Find the nearest Revit wall (by curve projection) within 150cm
 2. Classify wall as interior/exterior based on which ID list it belongs to
-3. Pick family type: exterior doors get `EXTERIOR`-named families, interior doors prefer custom-loaded families (non-M_ prefix) over Revit defaults. Width matching selects closest available size.
-4. Place with `NewFamilyInstance(point, symbol, wall, level, NonStructural)`
-5. Windows: sill height 105cm via `INSTANCE_SILL_HEIGHT_PARAM`
-6. Doors: placed at floor level (0cm)
+3. Pick family type: exterior doors get `EXTERIOR`-named families, interior doors prefer custom-loaded families (non-M_ prefix) over Revit defaults
+4. If the chosen door family has a writable width parameter, reuse an existing exact-width type from that family or duplicate the selected type and set its width to the DWG width
+5. Place with `NewFamilyInstance(point, symbol, wall, level, NonStructural)`
+6. Windows: sill height 105cm via `INSTANCE_SILL_HEIGHT_PARAM`
+7. Doors: placed at floor level (0cm)
 
 ### 6. Door swing matching
 
-After placement, `_match_door_swing()` reads the DWG swing arc direction and adjusts the Revit door orientation to match:
-- The swing arc's open endpoint determines which side of the wall the door swings into. Compared against Revit's `FacingOrientation` — flips `flipFacing()` if mismatched.
-- The swing arc's hinge endpoint (closest to door center) determines which end of the opening the hinge sits at. Compared against Revit's `HandOrientation` — flips `flipHand()` if mismatched.
+After placement, `_match_door_swing()` adjusts the Revit door orientation to match the DWG:
+- If a real DWG arc exists, the arc center is used as the hinge, and the open endpoint is inferred relative to the host wall axis.
+- The open endpoint determines which side of the wall the door swings into. Compared against Revit's `FacingOrientation` — flips `flipFacing()` if mismatched.
+- The hinge location determines which end of the opening the hinge sits at. Compared against Revit's `HandOrientation` — flips `flipHand()` if mismatched.
+- If no arc exists, the older longest-line swing heuristic is still used as a fallback.
 
 ## Why the box artifact occurred (historical)
 
