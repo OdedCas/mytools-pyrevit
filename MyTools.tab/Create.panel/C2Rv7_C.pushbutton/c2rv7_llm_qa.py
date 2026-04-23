@@ -52,9 +52,13 @@ import time
 try:
     import urllib.request as _urlreq
     import urllib.error as _urlerr
-except ImportError:  # pragma: no cover - IronPython safety
-    _urlreq = None
-    _urlerr = None
+except ImportError:
+    try:
+        import urllib2 as _urlreq  # IronPython 2.7
+        import urllib2 as _urlerr
+    except ImportError:
+        _urlreq = None
+        _urlerr = None
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +362,65 @@ def _render_with_pillow(groups, bbox, px_long):
         return None
 
 
-def _render_png(groups, bbox, px_long):
+def _render_with_system_drawing(groups, bbox, px_long):
+    """IronPython/.NET renderer using System.Drawing — always available in pyRevit."""
+    _err = []
+    try:
+        import clr
+        clr.AddReference("System.Drawing")
+        from System.Drawing import Bitmap, Graphics, Color, Pen
+        from System.Drawing.Imaging import ImageFormat, PixelFormat
+
+        minx, miny, maxx, maxy = bbox
+        pad_cm = max(50.0, 0.05 * max(maxx - minx, maxy - miny))
+        minx -= pad_cm; miny -= pad_cm; maxx += pad_cm; maxy += pad_cm
+        span_x = max(1.0, maxx - minx)
+        span_y = max(1.0, maxy - miny)
+        if span_x >= span_y:
+            W = int(px_long)
+            H = max(32, int(px_long * span_y / span_x))
+        else:
+            H = int(px_long)
+            W = max(32, int(px_long * span_x / span_y))
+
+        bmp = Bitmap(W, H, PixelFormat.Format32bppArgb)
+        g = Graphics.FromImage(bmp)
+        g.Clear(Color.White)
+
+        def _px(x, y):
+            px = (float(x) - minx) / span_x * (W - 1)
+            py = (H - 1) - (float(y) - miny) / span_y * (H - 1)
+            return px, py
+
+        for grp in groups:
+            hex_color = (grp.get("color") or "#111111").lstrip("#")
+            r = int(hex_color[0:2], 16)
+            gc = int(hex_color[2:4], 16)
+            b = int(hex_color[4:6], 16)
+            width = max(1.0, float(grp.get("width", 1.0)))
+            pen = Pen(Color.FromArgb(255, r, gc, b), width)
+            for ln in grp.get("lines", []) or []:
+                x1, y1 = _px(ln.get("x1", 0.0), ln.get("y1", 0.0))
+                x2, y2 = _px(ln.get("x2", 0.0), ln.get("y2", 0.0))
+                g.DrawLine(pen, float(x1), float(y1), float(x2), float(y2))
+            pen.Dispose()
+
+        g.Dispose()
+        tmp = os.path.join(os.environ.get("TEMP", os.environ.get("TMP", "")), "_c2rv7_qa_render.png")
+        bmp.Save(tmp, ImageFormat.Png)
+        bmp.Dispose()
+        with open(tmp, "rb") as fh:
+            data = fh.read()
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return data, None
+    except Exception as ex:
+        return None, str(ex)
+
+
+def _render_png(groups, bbox, px_long, snapshot=None):
     if _have_matplotlib():
         out = _render_with_matplotlib(groups, bbox, px_long)
         if out:
@@ -367,6 +429,10 @@ def _render_png(groups, bbox, px_long):
         out = _render_with_pillow(groups, bbox, px_long)
         if out:
             return out, "pillow"
+    out, err = _render_with_system_drawing(groups, bbox, px_long)
+    if out:
+        return out, "system.drawing"
+    _log(snapshot, "system.drawing render failed: {}".format(err))
     return None, None
 
 
@@ -400,28 +466,33 @@ def _call_claude(model, png_bytes, user_text, timeout_s, system_text=None, max_t
         payload["system"] = system_text
 
     data = json.dumps(payload).encode("utf-8")
+    # Build request compatible with both urllib.request (Py3) and urllib2 (IronPython 2.7).
     req = _urlreq.Request(
         "https://api.anthropic.com/v1/messages",
         data=data,
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        method="POST",
     )
+    req.add_header("x-api-key", api_key)
+    req.add_header("anthropic-version", "2023-06-01")
+    req.add_header("content-type", "application/json")
+    # urllib2 doesn't support method= kwarg; POST is implied by data being set.
     try:
-        with _urlreq.urlopen(req, timeout=timeout_s) as resp:
-            raw = resp.read()
+        resp = _urlreq.urlopen(req, timeout=timeout_s)
+        raw = resp.read()
+        try:
+            resp.close()
+        except Exception:
+            pass
     except socket.timeout:
         return None, "timeout"
-    except _urlerr.HTTPError as ex:
+    except Exception as ex:
+        # Catch HTTPError (both urllib.error.HTTPError and urllib2.HTTPError)
         try:
             body = ex.read().decode("utf-8", errors="replace")
         except Exception:
             body = ""
-        return None, "http_error_{}: {}".format(ex.code, body[:400])
-    except Exception as ex:
+        code = getattr(ex, "code", None)
+        if code:
+            return None, "http_error_{}: {}".format(code, body[:400])
         return None, "network_error: {}".format(ex)
 
     try:
@@ -521,6 +592,7 @@ def validate_exterior_envelope(cfg, ext_main_lines, snapshot=None):
         [{"lines": ext_main_lines, "color": "#111111", "width": 2.0, "label": "ext envelope"}],
         bbox,
         px,
+        snapshot=snapshot,
     )
     if not png:
         return _blank_envelope_result("no_renderer")
@@ -693,7 +765,7 @@ def _render_fragments_with_labels(all_int_lines, fragment_groups, bbox, px_long)
     groups = [{"lines": all_int_lines, "color": "#1f3b8a", "width": 2.0, "label": None}]
     for grp in fragment_groups:
         groups.append({"lines": grp.get("lines") or [], "color": "#d11a1a", "width": 4.0, "label": None})
-    png, renderer = _render_png(groups, bbox, px_long)
+    png, renderer = _render_png(groups, bbox, px_long, snapshot=None)
     return png, renderer
 
 
@@ -849,6 +921,7 @@ def sanity_check_thicknesses(cfg, ext_thick_cm, int_thick_cm, ext_lines, int_lin
         ],
         bbox,
         px,
+        snapshot=snapshot,
     )
     if not png:
         return _blank_thickness_result("no_renderer")
@@ -888,4 +961,94 @@ def sanity_check_thicknesses(cfg, ext_thick_cm, int_thick_cm, ext_lines, int_lin
         "raw": resp.get("text"),
     }
     _save_json(snapshot, "llm_qa_thickness.json", out)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Hook 4: final wall completeness check
+# ---------------------------------------------------------------------------
+
+COMPLETENESS_SYSTEM = (
+    "You are reviewing an automated CAD-to-Revit wall conversion. "
+    "The rendered image shows the final detected wall centerlines: "
+    "exterior walls in black, interior walls in blue. "
+    "Your job is to decide whether this looks like a complete, correct floor plan "
+    "or whether something is clearly wrong (missing walls, only a fragment, etc.). "
+    "Respond ONLY with a JSON object."
+)
+
+COMPLETENESS_USER = (
+    "The image shows the detected wall centerlines after processing. "
+    "Exterior walls are black, interior walls are blue.\n\n"
+    "Decide one of:\n"
+    "- complete: the walls form a recognizable, reasonably complete building floor plan\n"
+    "- incomplete: obvious problems — missing entire sides, only a small fragment "
+    "of the building was detected, or walls are clearly wrong\n"
+    "- no_opinion: you cannot tell\n\n"
+    "Respond with ONLY this JSON and nothing else:\n"
+    '{"verdict": "complete|incomplete|no_opinion", "confidence": 0.0-1.0, "reason": "<short>"}'
+)
+
+
+def validate_wall_completeness(cfg, ext_centerlines, int_centerlines, snapshot=None):
+    """Render ext + int centerlines and ask Claude if they look like a complete floor plan."""
+    if not qa_enabled(cfg):
+        return {"verdict": "no_opinion", "confidence": 0.0, "reason": "qa_disabled", "raw": None}
+
+    all_lines = list(ext_centerlines or []) + list(int_centerlines or [])
+    if not all_lines:
+        return {"verdict": "no_opinion", "confidence": 0.0, "reason": "no_lines", "raw": None}
+
+    bbox = _bbox_of_lines(all_lines)
+    if not bbox:
+        return {"verdict": "no_opinion", "confidence": 0.0, "reason": "no_bbox", "raw": None}
+
+    px = _cfg_int(cfg, "llm_qa_render_px", 1400)
+    groups = [
+        {"lines": ext_centerlines or [], "color": "#111111", "width": 2.5, "label": "exterior walls"},
+        {"lines": int_centerlines or [], "color": "#1f3b8a", "width": 1.8, "label": "interior walls"},
+    ]
+    png, renderer = _render_png(groups, bbox, px, snapshot=snapshot)
+    if not png:
+        return {"verdict": "no_opinion", "confidence": 0.0, "reason": "no_renderer", "raw": None}
+
+    _save_bytes(snapshot, "llm_qa_completeness.png", png)
+    _log(snapshot, "completeness render ok via {}, ext={} int={}".format(
+        renderer, len(ext_centerlines or []), len(int_centerlines or [])))
+
+    t0 = time.time()
+    resp, err = _call_claude(
+        _cfg_str(cfg, "llm_qa_model", "claude-opus-4-7"),
+        png,
+        COMPLETENESS_USER,
+        _cfg_int(cfg, "llm_qa_timeout_s", 15),
+        system_text=COMPLETENESS_SYSTEM,
+        max_tokens=300,
+    )
+    dt = time.time() - t0
+    _log(snapshot, "completeness api dt={:.2f}s err={}".format(dt, err))
+
+    if resp is None:
+        return {"verdict": "no_opinion", "confidence": 0.0,
+                "reason": "api_error: {}".format(err), "raw": None}
+
+    _save_text(snapshot, "llm_qa_completeness_response.txt", resp.get("text") or "")
+    parsed = _extract_json_from_text(resp.get("text") or "")
+    if not isinstance(parsed, dict):
+        return {"verdict": "no_opinion", "confidence": 0.0, "reason": "unparseable", "raw": resp.get("text")}
+
+    v = str(parsed.get("verdict") or "").strip().lower()
+    if v not in ("complete", "incomplete", "no_opinion"):
+        v = "no_opinion"
+    try:
+        conf = max(0.0, min(1.0, float(parsed.get("confidence", 0.0))))
+    except Exception:
+        conf = 0.0
+    out = {
+        "verdict": v,
+        "confidence": conf,
+        "reason": str(parsed.get("reason") or "")[:400],
+        "raw": resp.get("text"),
+    }
+    _save_json(snapshot, "llm_qa_completeness.json", out)
     return out

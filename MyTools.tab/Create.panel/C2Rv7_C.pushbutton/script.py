@@ -18,7 +18,7 @@ from Autodesk.Revit.DB import (
 )
 from Autodesk.Revit.DB.Structure import StructuralType
 from Autodesk.Revit.Exceptions import OperationCanceledException
-from Autodesk.Revit.UI import TaskDialog
+from Autodesk.Revit.UI import TaskDialog, TaskDialogCommonButtons, TaskDialogResult
 from Autodesk.Revit.UI.Selection import ISelectionFilter, ObjectType
 
 import re
@@ -26,28 +26,59 @@ import re
 from Autodesk.Revit.DB import IFailuresPreprocessor, FailureProcessingResult
 
 
+_FAILURE_LOG = []  # Accumulates failure messages for later logging to snapshot.
+
+
 class _SwallowTypeErrors(IFailuresPreprocessor):
-    """Auto-delete failing elements so 'Can't make type' dialogs don't appear."""
+    """Auto-delete failing elements so 'Can't make type' dialogs don't appear.
+    Records failure messages + deleted element IDs to _FAILURE_LOG."""
 
     def PreprocessFailures(self, failuresAccessor):
         for msg in failuresAccessor.GetFailureMessages():
             try:
                 sev = msg.GetSeverity()
+                desc = ""
+                try:
+                    desc = msg.GetDescriptionText() or ""
+                except Exception:
+                    pass
                 # Delete element on errors; dismiss warnings
                 if sev.ToString() == "Error":
                     ids = msg.GetFailingElementIds()
+                    id_list = []
                     if ids and ids.Count > 0:
+                        for eid in ids:
+                            try:
+                                id_list.append(eid.IntegerValue)
+                            except Exception:
+                                pass
                         failuresAccessor.DeleteElements(ids)
                     else:
                         failuresAccessor.DeleteWarning(msg)
+                    _FAILURE_LOG.append(("ERROR", desc, id_list))
                 else:
+                    _FAILURE_LOG.append((sev.ToString(), desc, []))
                     failuresAccessor.DeleteWarning(msg)
-            except Exception:
+            except Exception as ex:
+                _FAILURE_LOG.append(("EXC", str(ex), []))
                 try:
                     failuresAccessor.DeleteWarning(msg)
                 except Exception:
                     pass
         return FailureProcessingResult.Continue
+
+
+def _flush_failure_log(snapshot):
+    """Write accumulated Revit failure messages to the snapshot run_log."""
+    if not snapshot:
+        _FAILURE_LOG[:] = []
+        return
+    for sev, desc, ids in _FAILURE_LOG:
+        try:
+            snapshot.log("REVIT {}: {} (deleted ids={})".format(sev, desc, ids))
+        except Exception:
+            pass
+    _FAILURE_LOG[:] = []
 
 
 SCRIPT_DIR = os.path.dirname(__file__)
@@ -815,6 +846,250 @@ def _measure_local_thickness(centerline, raw_lines, max_search_cm=50.0):
     return None
 
 
+def _show_wall_preview(ext_lines, int_lines, n_ext_walls, n_int_walls):
+    """Show a WinForms dialog with the detected wall centerlines rendered as an image."""
+    try:
+        import clr
+        clr.AddReference("System.Drawing")
+        clr.AddReference("System.Windows.Forms")
+        from System.Drawing import Bitmap, Graphics, Color, Pen, Font, SolidBrush
+        from System.Drawing import Point, Size, Rectangle
+        from System.Drawing.Imaging import ImageFormat, PixelFormat
+        from System.Windows.Forms import (
+            Form, PictureBox, PictureBoxSizeMode, Button,
+            Label, DialogResult, DockStyle, AnchorStyles,
+            FormBorderStyle, FormStartPosition
+        )
+        import System.IO as SIO
+
+        # --- Compute bbox ---
+        all_lines = list(ext_lines or []) + list(int_lines or [])
+        if not all_lines:
+            return
+        xs = [float(l.get("x1",0)) for l in all_lines] + [float(l.get("x2",0)) for l in all_lines]
+        ys = [float(l.get("y1",0)) for l in all_lines] + [float(l.get("y2",0)) for l in all_lines]
+        minx, maxx = min(xs), max(xs)
+        miny, maxy = min(ys), max(ys)
+        pad = max(50.0, 0.05 * max(maxx - minx, maxy - miny))
+        minx -= pad; miny -= pad; maxx += pad; maxy += pad
+        span_x = max(1.0, maxx - minx)
+        span_y = max(1.0, maxy - miny)
+
+        # --- Render ---
+        IMG_W, IMG_H = 900, 600
+        if span_x / span_y > float(IMG_W) / IMG_H:
+            W = IMG_W
+            H = max(32, int(IMG_W * span_y / span_x))
+        else:
+            H = IMG_H
+            W = max(32, int(IMG_H * span_x / span_y))
+
+        bmp = Bitmap(W, H, PixelFormat.Format32bppArgb)
+        g = Graphics.FromImage(bmp)
+        g.Clear(Color.White)
+
+        def _px(x, y):
+            return (
+                float(x - minx) / span_x * (W - 1),
+                float(H - 1) - float(y - miny) / span_y * (H - 1)
+            )
+
+        pen_ext = Pen(Color.FromArgb(255, 20, 20, 20), 2.5)
+        pen_int = Pen(Color.FromArgb(255, 30, 80, 180), 1.8)
+        for ln in (ext_lines or []):
+            x1, y1 = _px(ln.get("x1",0), ln.get("y1",0))
+            x2, y2 = _px(ln.get("x2",0), ln.get("y2",0))
+            g.DrawLine(pen_ext, float(x1), float(y1), float(x2), float(y2))
+        for ln in (int_lines or []):
+            x1, y1 = _px(ln.get("x1",0), ln.get("y1",0))
+            x2, y2 = _px(ln.get("x2",0), ln.get("y2",0))
+            g.DrawLine(pen_int, float(x1), float(y1), float(x2), float(y2))
+        pen_ext.Dispose()
+        pen_int.Dispose()
+        g.Dispose()
+
+        # --- Save to temp file and load into PictureBox ---
+        tmp = os.path.join(os.environ.get("TEMP", "C:\\Temp"), "_c2rv7_preview.png")
+        bmp.Save(tmp, ImageFormat.Png)
+        bmp.Dispose()
+
+        from System.Drawing import Image as DImage
+        img = DImage.FromFile(tmp)
+
+        # --- Build form ---
+        form = Form()
+        form.Text = "C2Rv7 Wall Preview  —  ext: {}  int: {}".format(n_ext_walls, n_int_walls)
+        form.Width = W + 40
+        form.Height = H + 110
+        form.StartPosition = FormStartPosition.CenterScreen
+        form.FormBorderStyle = FormBorderStyle.FixedDialog
+
+        pb = PictureBox()
+        pb.Image = img
+        pb.SizeMode = PictureBoxSizeMode.Zoom
+        pb.Location = Point(10, 10)
+        pb.Size = Size(W, H)
+        form.Controls.Add(pb)
+
+        lbl = Label()
+        lbl.Text = u"Black = exterior walls    Blue = interior walls"
+        lbl.Location = Point(10, H + 15)
+        lbl.Size = Size(W, 20)
+        form.Controls.Add(lbl)
+
+        btn = Button()
+        btn.Text = "OK"
+        btn.Location = Point(W // 2 - 40, H + 40)
+        btn.Size = Size(80, 30)
+        btn.DialogResult = DialogResult.OK
+        form.Controls.Add(btn)
+        form.AcceptButton = btn
+
+        form.ShowDialog()
+        form.Dispose()
+        img.Dispose()
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+    except Exception as ex:
+        try:
+            TaskDialog.Show("C2Rv7_C", "Wall preview failed: {}".format(ex))
+        except Exception:
+            pass
+
+
+def _show_openings_preview(ext_lines, int_lines, door_markers, window_markers,
+                           n_doors, n_windows):
+    """Show walls + placed door/window markers as a WinForms image popup."""
+    try:
+        import clr
+        clr.AddReference("System.Drawing")
+        clr.AddReference("System.Windows.Forms")
+        from System.Drawing import Bitmap, Graphics, Color, Pen, SolidBrush, Point, Size
+        from System.Drawing.Imaging import ImageFormat, PixelFormat
+        from System.Windows.Forms import (
+            Form, PictureBox, PictureBoxSizeMode, Button, Label,
+            DialogResult, FormBorderStyle, FormStartPosition
+        )
+        from System.Drawing import Image as DImage
+
+        all_lines = list(ext_lines or []) + list(int_lines or [])
+        if not all_lines:
+            return
+        xs = [float(l.get("x1",0)) for l in all_lines] + [float(l.get("x2",0)) for l in all_lines]
+        ys = [float(l.get("y1",0)) for l in all_lines] + [float(l.get("y2",0)) for l in all_lines]
+        for mk in list(door_markers or []) + list(window_markers or []):
+            cx, cy = float(mk["center_cm"][0]), float(mk["center_cm"][1])
+            xs.append(cx); ys.append(cy)
+        minx, maxx = min(xs), max(xs)
+        miny, maxy = min(ys), max(ys)
+        pad = max(50.0, 0.05 * max(maxx - minx, maxy - miny))
+        minx -= pad; miny -= pad; maxx += pad; maxy += pad
+        span_x = max(1.0, maxx - minx)
+        span_y = max(1.0, maxy - miny)
+
+        IMG_W, IMG_H = 900, 600
+        if span_x / span_y > float(IMG_W) / IMG_H:
+            W = IMG_W; H = max(32, int(IMG_W * span_y / span_x))
+        else:
+            H = IMG_H; W = max(32, int(IMG_H * span_x / span_y))
+
+        bmp = Bitmap(W, H, PixelFormat.Format32bppArgb)
+        g = Graphics.FromImage(bmp)
+        g.Clear(Color.White)
+
+        def _px(x, y):
+            return (
+                float(x - minx) / span_x * (W - 1),
+                float(H - 1) - float(y - miny) / span_y * (H - 1)
+            )
+
+        def _scale(cm):
+            return max(2.0, float(cm) / span_x * (W - 1))
+
+        pen_ext = Pen(Color.FromArgb(255, 20, 20, 20), 2.5)
+        pen_int = Pen(Color.FromArgb(255, 30, 80, 180), 1.8)
+        pen_door = Pen(Color.FromArgb(255, 200, 30, 30), 2.0)
+        pen_win = Pen(Color.FromArgb(255, 30, 160, 60), 2.0)
+
+        for ln in (ext_lines or []):
+            x1, y1 = _px(ln.get("x1",0), ln.get("y1",0))
+            x2, y2 = _px(ln.get("x2",0), ln.get("y2",0))
+            g.DrawLine(pen_ext, float(x1), float(y1), float(x2), float(y2))
+        for ln in (int_lines or []):
+            x1, y1 = _px(ln.get("x1",0), ln.get("y1",0))
+            x2, y2 = _px(ln.get("x2",0), ln.get("y2",0))
+            g.DrawLine(pen_int, float(x1), float(y1), float(x2), float(y2))
+
+        # Draw door markers as red X with width bar
+        for mk in (door_markers or []):
+            cx, cy = _px(mk["center_cm"][0], mk["center_cm"][1])
+            hw = _scale(mk.get("width_cm", 90) * 0.5)
+            g.DrawLine(pen_door, float(cx - hw), float(cy), float(cx + hw), float(cy))
+            g.DrawLine(pen_door, float(cx - 4), float(cy - 4), float(cx + 4), float(cy + 4))
+            g.DrawLine(pen_door, float(cx + 4), float(cy - 4), float(cx - 4), float(cy + 4))
+
+        # Draw window markers as green rectangles
+        for mk in (window_markers or []):
+            cx, cy = _px(mk["center_cm"][0], mk["center_cm"][1])
+            hw = _scale(mk.get("width_cm", 60) * 0.5)
+            hd = max(3.0, hw * 0.15)
+            g.DrawRectangle(pen_win,
+                float(cx - hw), float(cy - hd), float(hw * 2), float(hd * 2))
+
+        pen_ext.Dispose(); pen_int.Dispose()
+        pen_door.Dispose(); pen_win.Dispose()
+        g.Dispose()
+
+        tmp = os.path.join(os.environ.get("TEMP", "C:\\Temp"), "_c2rv7_openings_preview.png")
+        bmp.Save(tmp, ImageFormat.Png)
+        bmp.Dispose()
+        img = DImage.FromFile(tmp)
+
+        form = Form()
+        form.Text = "C2Rv7 Openings Preview  —  doors: {}  windows: {}".format(
+            n_doors, n_windows)
+        form.Width = W + 40
+        form.Height = H + 110
+        form.StartPosition = FormStartPosition.CenterScreen
+        form.FormBorderStyle = FormBorderStyle.FixedDialog
+
+        pb = PictureBox()
+        pb.Image = img
+        pb.SizeMode = PictureBoxSizeMode.Zoom
+        pb.Location = Point(10, 10)
+        pb.Size = Size(W, H)
+        form.Controls.Add(pb)
+
+        lbl = Label()
+        lbl.Text = u"Black=ext walls   Blue=int walls   Red X=doors   Green rect=windows"
+        lbl.Location = Point(10, H + 15)
+        lbl.Size = Size(W, 20)
+        form.Controls.Add(lbl)
+
+        btn = Button()
+        btn.Text = "OK"
+        btn.Location = Point(W // 2 - 40, H + 40)
+        btn.Size = Size(80, 30)
+        btn.DialogResult = DialogResult.OK
+        form.Controls.Add(btn)
+        form.AcceptButton = btn
+
+        form.ShowDialog()
+        form.Dispose()
+        img.Dispose()
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+    except Exception as ex:
+        try:
+            TaskDialog.Show("C2Rv7_C", "Openings preview failed: {}".format(ex))
+        except Exception:
+            pass
+
+
 def _create_walls_from_lines(v2, lines_cm, level, wall_type, min_len_cm):
     ids = []
     if wall_type is None:
@@ -1093,7 +1368,12 @@ def _arc_bbox_cm(arc):
     cx = float(arc.get("cx", 0.0))
     cy = float(arc.get("cy", 0.0))
     r = abs(float(arc.get("r", 0.0)))
-    return (cx - r, cy - r, cx + r, cy + r)
+    # Use actual endpoints for tighter bbox (avoids merging distant doors via full-circle inflation)
+    sx = float(arc.get("sx", cx + r))
+    sy = float(arc.get("sy", cy))
+    ex = float(arc.get("ex", cx))
+    ey = float(arc.get("ey", cy + r))
+    return (min(cx, sx, ex), min(cy, sy, ey), max(cx, sx, ex), max(cy, sy, ey))
 
 
 def _pick_best_door_arc(arcs):
@@ -1112,7 +1392,7 @@ def _pick_best_door_arc(arcs):
     return best
 
 
-def _detect_opening_markers(raw_data, kind):
+def _detect_opening_markers(raw_data, kind, snapshot=None):
     """Cluster lines from A-DOORS or A-WINDOWS into opening markers.
     Returns list of {center_cm, width_cm, kind}."""
     raw_lines = []
@@ -1227,19 +1507,15 @@ def _detect_opening_markers(raw_data, kind):
 
             best_arc = _pick_best_door_arc(group_arcs)
             if is_double_door and len(valid_arcs) >= 2:
-                # Double door: total width = distance between outer jamb edges.
-                # Each leaf width = arc radius. Total = hinge distance + no overlap,
-                # but better: use jamb-to-jamb if available, else 2 * leaf radius.
+                # Double door: width = hinge-to-hinge distance (each leaf radius = half width).
+                # Use arc geometry directly — frame_xs can be corrupted if the group
+                # accidentally merged a nearby single door.
                 leaf1 = abs(float(valid_arcs[0].get("r", 0.0)))
                 leaf2 = abs(float(valid_arcs[1].get("r", 0.0)))
-                if frame_xs and frame_ys:
-                    jw = max(max(frame_xs) - min(frame_xs),
-                             max(frame_ys) - min(frame_ys))
-                    width = max(80.0, min(400.0, jw - 10.0))
-                    width_source = "double_jamb"
-                else:
-                    width = max(80.0, min(400.0, hinge_dist))
-                    width_source = "double_hinge_dist"
+                width = max(80.0, min(400.0, hinge_dist))
+                width_source = "double_hinge_dist"
+                # Center = midpoint between the two hinge positions (not frame bbox)
+                center = ((c1[0] + c2[0]) * 0.5, (c1[1] + c2[1]) * 0.5)
             elif best_arc is not None:
                 # Prefer the real DWG swing arc radius; that is the leaf width.
                 width = max(40.0, min(200.0, abs(float(best_arc.get("r", 0.0)))))
@@ -1307,6 +1583,26 @@ def _detect_opening_markers(raw_data, kind):
             "is_double": is_double_door,
         })
 
+        if snapshot and kind == "door":
+            try:
+                n_arcs = len(group_arcs)
+                n_lines = sum(1 for e in group if e["entity"] == "line")
+                arcs_str = ",".join(["r{:.0f}@({:.0f},{:.0f})".format(
+                    abs(float(a.get("r", 0.0))), float(a.get("cx", 0.0)),
+                    float(a.get("cy", 0.0))) for a in group_arcs])
+                snapshot.log("  DETECT door group: arcs={} lines={} [{}] "
+                             "center=({:.0f},{:.0f}) width={:.0f}cm src={} double={}".format(
+                    n_arcs, n_lines, arcs_str, center[0], center[1],
+                    width, width_source, is_double_door))
+                if swing_data:
+                    snapshot.log("    swing: hinge=({:.0f},{:.0f}) endpoints={} source={}".format(
+                        swing_data.get("hinge_cm", (0, 0))[0],
+                        swing_data.get("hinge_cm", (0, 0))[1],
+                        swing_data.get("arc_endpoints_cm") or swing_data.get("open_cm"),
+                        swing_data.get("source", "?")))
+            except Exception:
+                pass
+
     # Dedupe markers closer than 60cm
     out = []
     for mk in markers:
@@ -1319,7 +1615,38 @@ def _detect_opening_markers(raw_data, kind):
                 break
         if not dup:
             out.append(mk)
+
+    if snapshot and kind == "door":
+        try:
+            snapshot.log("  DETECT {} final markers: {} (after dedupe)".format(
+                kind, len(out)))
+            _dump_markers_json(out, kind, snapshot)
+        except Exception:
+            pass
     return out
+
+
+def _dump_markers_json(markers, kind, snapshot):
+    """Write detected markers to JSON for external inspection."""
+    try:
+        serializable = []
+        for mk in markers:
+            swing = mk.get("swing") or {}
+            serializable.append({
+                "kind": mk.get("kind"),
+                "center_cm": list(mk.get("center_cm", [])),
+                "width_cm": mk.get("width_cm"),
+                "width_source": mk.get("width_source"),
+                "is_double": mk.get("is_double"),
+                "swing_source": swing.get("source") if swing else None,
+                "swing_hinge_cm": list(swing.get("hinge_cm", [])) if swing.get("hinge_cm") else None,
+                "swing_endpoints_cm": [list(p) for p in (swing.get("arc_endpoints_cm") or [])],
+                "swing_open_cm": list(swing.get("open_cm", [])) if swing.get("open_cm") else None,
+                "swing_radius_cm": swing.get("radius_cm"),
+            })
+        snapshot.save_json("markers_{}.json".format(kind), serializable)
+    except Exception:
+        pass
 
 
 def _find_host_wall(v2, all_wall_ids, center_cm, level_elevation_ft):
@@ -1509,6 +1836,55 @@ def _ensure_family_type_width(v2, family_types, base_fs, target_width_cm, snapsh
         return base_fs
 
 
+def _find_or_create_opening_type(v2, base_fs, family_types, created_types, target_cm, type_name, snapshot=None):
+    """Return a family type sized to target_cm.
+
+    Search order:
+    1. Already created this run (created_types dict)
+    2. Existing loaded types by name match
+    3. Existing loaded types within 2cm of target
+    4. Duplicate base_fs and set Width parameter
+    """
+    if type_name in created_types:
+        return created_types[type_name]
+    target_ft = v2.cm_to_ft(float(target_cm))
+    # Search existing by name
+    for ft in family_types:
+        try:
+            if _family_symbol_name(ft) == type_name:
+                created_types[type_name] = ft
+                return ft
+        except Exception:
+            pass
+    # Search existing by width (within 2cm)
+    for ft in family_types:
+        try:
+            w = _family_symbol_width_ft(ft)
+            if w is not None and abs(w - target_ft) < v2.cm_to_ft(2.0):
+                created_types[type_name] = ft
+                return ft
+        except Exception:
+            pass
+    # Duplicate and resize
+    if base_fs is not None:
+        try:
+            new_fs = base_fs.Duplicate(type_name)
+            wp = new_fs.LookupParameter("Width")
+            if wp is not None and not wp.IsReadOnly:
+                wp.Set(target_ft)
+                v2.doc.Regenerate()
+            created_types[type_name] = new_fs
+            if snapshot:
+                try:
+                    snapshot.log("  created type '{}' width={}cm".format(type_name, int(target_cm)))
+                except Exception:
+                    pass
+            return new_fs
+        except Exception:
+            pass
+    return base_fs
+
+
 def _pick_family_type_by_width(v2, family_types, target_width_cm):
     """Pick the family type whose width parameter is closest to target."""
     # Exclude mamad (safe room) and curtain wall families
@@ -1601,6 +1977,27 @@ def _is_curtain_wall_family(fs):
     return False
 
 
+def _is_stale_custom_type(fs):
+    """Detect broken type names left by old runs of _ensure_family_type_width,
+    which suffix the type name with "<width>cm" (e.g. "900 x 2000mm 100cm").
+    These often have empty profile sketches and fail activation."""
+    try:
+        tname = str(fs.Name or "").strip()
+    except Exception:
+        return False
+    # Type name ends with "<digits>cm" e.g. "100cm", "90cm"
+    lower = tname.lower()
+    if not lower.endswith("cm"):
+        return False
+    # Split off the last whitespace-separated token
+    parts = tname.split()
+    if not parts:
+        return False
+    suffix = parts[-1]          # e.g. "100cm"
+    num_part = suffix[:-2]      # strip "cm"
+    return num_part.isdigit()
+
+
 def _pick_door_type_for_wall(v2, family_types, target_width_cm, is_interior, snapshot=None,
                               is_double=False):
     """Pick a door family type appropriate for interior or exterior walls."""
@@ -1611,6 +2008,16 @@ def _pick_door_type_for_wall(v2, family_types, target_width_cm, is_interior, sna
 
     # Exclude curtain wall families — they can't be hosted on basic walls.
     family_types = [fs for fs in family_types if not _is_curtain_wall_family(fs)]
+
+    # Exclude broken leftover types from prior _ensure_family_type_width runs.
+    stale = [fs for fs in family_types if _is_stale_custom_type(fs)]
+    if stale and snapshot:
+        try:
+            snapshot.log("  FILTER stale types: {}".format(
+                [_safe_str(_family_symbol_name(fs)) for fs in stale]))
+        except Exception:
+            pass
+    family_types = [fs for fs in family_types if not _is_stale_custom_type(fs)]
 
     # Filter by single vs double door
     if is_double:
@@ -1698,7 +2105,7 @@ def _pick_door_type_for_wall(v2, family_types, target_width_cm, is_interior, sna
     return best
 
 
-def _match_door_swing(v2, inst, wall, swing, center_cm, snapshot=None):
+def _match_door_swing(v2, inst, wall, swing, center_cm, snapshot=None, is_double=False):
     """Flip door hand/facing to match DWG swing arc direction.
 
     Uses world-coordinate comparison between DWG arc geometry and
@@ -1712,6 +2119,9 @@ def _match_door_swing(v2, inst, wall, swing, center_cm, snapshot=None):
     Revit orientations:
       - FacingOrientation = direction the door opens into (perpendicular to wall)
       - HandOrientation = direction from hinge toward latch (along wall)
+
+    is_double: symmetric double doors — only flip facing, skip hand (hinge is
+    at one leaf, not at door center, so hand comparison is meaningless).
     """
     hinge = swing.get("hinge_cm")
     if hinge is None:
@@ -1780,9 +2190,35 @@ def _match_door_swing(v2, inst, wall, swing, center_cm, snapshot=None):
     except Exception:
         return
 
-    # Compare facing: dot product of DWG open direction with Revit FacingOrientation.
+    init_facing = (facing_dir.X, facing_dir.Y)
+    init_hand = (hand_dir.X, hand_dir.Y)
+
+    # Geometry-based facing: which side of the wall is the open endpoint on?
+    # Compare with FacingOrientation (= pull/exterior face = OPPOSES swing direction).
+    # If open_pt and FacingOrientation are on the SAME side of the wall → flip.
     facing_dot = dwg_open_dx * facing_dir.X + dwg_open_dy * facing_dir.Y
-    need_flip_facing = (facing_dot < 0)
+    need_flip_facing = False
+    open_sign = 0.0
+    facing_sign = 0.0
+    try:
+        curve = wall.Location.Curve
+        ws = curve.GetEndPoint(0)
+        we = curve.GetEndPoint(1)
+        wdx = we.X - ws.X
+        wdy = we.Y - ws.Y
+        wall_len = math.sqrt(wdx * wdx + wdy * wdy)
+        if wall_len > 1e-9:
+            nx = -wdy / wall_len
+            ny = wdx / wall_len
+            ox = v2.cm_to_ft(float(open_pt[0]))
+            oy = v2.cm_to_ft(float(open_pt[1]))
+            open_sign = nx * (ox - ws.X) + ny * (oy - ws.Y)
+            facing_sign = nx * facing_dir.X + ny * facing_dir.Y
+            need_flip_facing = (open_sign * facing_sign < 0)
+        else:
+            need_flip_facing = (facing_dot > 0)
+    except Exception:
+        need_flip_facing = (facing_dot > 0)
 
     if need_flip_facing:
         inst.flipFacing()
@@ -1798,24 +2234,42 @@ def _match_door_swing(v2, inst, wall, swing, center_cm, snapshot=None):
         return
 
     # Compare hand: dot product of DWG hand direction with Revit HandOrientation.
+    # dwg_hand = hinge - center (points TOWARD hinge).
+    # HandOrientation points FROM hinge TOWARD latch = OPPOSITE of dwg_hand.
+    # They should always disagree (negative dot). When they AGREE (positive dot),
+    # HandOrientation is pointing the wrong way → flip.
     need_flip_hand = False
-    if has_hand:
+    hand_dot = 0.0
+    if has_hand and not is_double:
         hand_dot = dwg_hand_dx * hand_dir.X + dwg_hand_dy * hand_dir.Y
         need_flip_hand = (hand_dot < 0)
     if need_flip_hand:
         inst.flipHand()
 
+    try:
+        final_facing = inst.FacingOrientation
+        final_hand = inst.HandOrientation
+    except Exception:
+        final_facing = None
+        final_hand = None
+
     if snapshot:
         try:
-            snapshot.log("  swing({}): open=({:.0f},{:.0f}) closed={} "
-                         "facing_dot={:.2f} flip_facing={}, "
-                         "hand_dot={:.2f} flip_hand={}".format(
-                swing.get("source", "unknown"),
+            snapshot.log("  swing({},double={}): hinge=({:.0f},{:.0f}) open=({:.0f},{:.0f}) closed={} "
+                         "init_facing=({:.2f},{:.2f}) init_hand=({:.2f},{:.2f}) "
+                         "open_sign={:.3f} facing_sign={:.3f} flip_facing={} "
+                         "hand_dot={:.2f} flip_hand={} "
+                         "final_facing=({:.2f},{:.2f}) final_hand=({:.2f},{:.2f})".format(
+                swing.get("source", "unknown"), is_double,
+                float(hinge[0]), float(hinge[1]),
                 float(open_pt[0]), float(open_pt[1]),
                 "({:.0f},{:.0f})".format(float(closed_pt[0]), float(closed_pt[1])) if closed_pt else "?",
-                facing_dot, need_flip_facing,
-                (dwg_hand_dx * hand_dir.X + dwg_hand_dy * hand_dir.Y) if has_hand else 0.0,
-                need_flip_hand))
+                init_facing[0], init_facing[1],
+                init_hand[0], init_hand[1],
+                open_sign, facing_sign, need_flip_facing,
+                hand_dot, need_flip_hand,
+                final_facing.X if final_facing else 0.0, final_facing.Y if final_facing else 0.0,
+                final_hand.X if final_hand else 0.0, final_hand.Y if final_hand else 0.0))
         except Exception:
             pass
 
@@ -1987,6 +2441,7 @@ def _place_openings_in_walls(v2, level, ext_wall_ids, int_wall_ids, markers,
     max_snap_ft = v2.cm_to_ft(150.0)  # max 150cm snap distance
     ids = []
     errors = []
+    created_types = {}  # name -> FamilySymbol, persists across markers this run
 
     if snapshot:
         try:
@@ -2037,11 +2492,21 @@ def _place_openings_in_walls(v2, level, ext_wall_ids, int_wall_ids, markers,
 
         is_double = mk.get("is_double", False)
         if category == BuiltInCategory.OST_Doors:
-            fs = _pick_door_type_for_wall(v2, family_types, mk["width_cm"], is_interior, snapshot,
-                                           is_double=is_double)
-            fs = _ensure_family_type_width(v2, family_types, fs, mk["width_cm"], snapshot)
+            # Round detected width to nearest 5cm, then find/create a type at that size.
+            raw_cm = float(mk["width_cm"])
+            target_cm = round(raw_cm / 5.0) * 5.0
+            type_name = "D{}cm".format(int(target_cm))
+            base_fs = _pick_door_type_for_wall(v2, family_types, target_cm, is_interior, snapshot,
+                                               is_double=is_double)
+            fs = _find_or_create_opening_type(
+                v2, base_fs, family_types, created_types, target_cm, type_name, snapshot)
         else:
-            fs = _pick_family_type_by_width(v2, family_types, mk["width_cm"])
+            # Use exact detected width; find/create a type at that size.
+            target_cm = float(mk["width_cm"])
+            type_name = "W{}cm".format(int(target_cm))
+            base_fs = _pick_family_type_by_width(v2, family_types, target_cm)
+            fs = _find_or_create_opening_type(
+                v2, base_fs, family_types, created_types, target_cm, type_name, snapshot)
 
         if fs is None:
             errors.append("No {} family type available".format(cat_name))
@@ -2139,16 +2604,33 @@ def _place_openings_in_walls(v2, level, ext_wall_ids, int_wall_ids, markers,
             if sill_height_cm is not None and category == BuiltInCategory.OST_Windows:
                 _set_sill_height(v2, inst, sill_height_cm)
 
-            # Match door swing direction from DWG (single doors only)
-            if category == BuiltInCategory.OST_Doors and mk.get("swing") and not is_double:
+            # Disable Masonry Frame on doors — if enabled with no sketch, Revit
+            # throws "Profile sketch is empty!" and deletes the element on commit.
+            if category == BuiltInCategory.OST_Doors:
                 try:
-                    _match_door_swing(v2, inst, wall, mk["swing"], mk["center_cm"], snapshot)
-                except Exception as ex:
-                    if snapshot:
-                        try:
-                            snapshot.log("  swing match error: {}".format(ex))
-                        except Exception:
-                            pass
+                    p = inst.LookupParameter("Masonry Frame")
+                    if p is not None and not p.IsReadOnly:
+                        p.Set(0)
+                except Exception:
+                    pass
+
+            # Match door swing direction from DWG (facing always; hand only for single doors)
+            if category == BuiltInCategory.OST_Doors:
+                if mk.get("swing"):
+                    try:
+                        _match_door_swing(v2, inst, wall, mk["swing"], mk["center_cm"], snapshot,
+                                          is_double=is_double)
+                    except Exception as ex:
+                        if snapshot:
+                            try:
+                                snapshot.log("  swing match error: {}".format(ex))
+                            except Exception:
+                                pass
+                elif snapshot:
+                    try:
+                        snapshot.log("  swing SKIPPED: no swing data (double={})".format(is_double))
+                    except Exception:
+                        pass
 
             ids.append(inst.Id.IntegerValue)
             if snapshot:
@@ -2640,6 +3122,330 @@ def _chain_ext_wall_loop(curves_ft, tol_ft=0.5, snapshot=None):
     return hull
 
 
+def _detect_stair_markers(raw_data, snapshot=None):
+    """Detect stair geometry from lines on layer A-STAIRS.
+    Returns list of marker dicts with run geometry.
+    """
+    lines = raw_data.get('lines', []) if raw_data else []
+    stair_lines = [l for l in lines
+                   if str(l.get('layer', '')).strip().upper() in ('A-STAIRS', 'A-SAIRS')]
+    if not stair_lines:
+        return []
+
+    clusters = _cluster_stair_lines(stair_lines, tol_cm=50.0)
+    markers = []
+    for cluster in clusters:
+        mk = _analyze_stair_cluster(cluster)
+        if mk:
+            markers.append(mk)
+
+    if snapshot:
+        try:
+            snapshot.log("DETECT stairs: {} lines -> {} groups".format(
+                len(stair_lines), len(markers)))
+            for i, mk in enumerate(markers):
+                snapshot.log("  stair[{}] width={:.0f}cm length={:.0f}cm treads={}".format(
+                    i, mk['width_cm'], mk['length_cm'], mk['tread_count']))
+        except Exception:
+            pass
+    return markers
+
+
+def _cluster_stair_lines(lines, tol_cm=50.0):
+    """Union-find clustering of lines whose bounding boxes are within tol_cm."""
+    n = len(lines)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        parent[find(a)] = find(b)
+
+    def bbox(l):
+        return (min(l['x1'], l['x2']), min(l['y1'], l['y2']),
+                max(l['x1'], l['x2']), max(l['y1'], l['y2']))
+
+    bboxes = [bbox(l) for l in lines]
+    for i in range(n):
+        for j in range(i + 1, n):
+            bi, bj = bboxes[i], bboxes[j]
+            if (bi[0] - tol_cm <= bj[2] and bj[0] - tol_cm <= bi[2] and
+                    bi[1] - tol_cm <= bj[3] and bj[1] - tol_cm <= bi[3]):
+                union(i, j)
+
+    clusters = {}
+    for i in range(n):
+        root = find(i)
+        if root not in clusters:
+            clusters[root] = []
+        clusters[root].append(lines[i])
+    return list(clusters.values())
+
+
+def _analyze_stair_cluster(lines):
+    """Return a stair marker dict from a cluster of A-STAIRS lines."""
+    if not lines:
+        return None
+    xs = [l['x1'] for l in lines] + [l['x2'] for l in lines]
+    ys = [l['y1'] for l in lines] + [l['y2'] for l in lines]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    span_x = max_x - min_x
+    span_y = max_y - min_y
+    if span_x < 5 and span_y < 5:
+        return None
+
+    if span_x >= span_y:
+        # Horizontal run (travel direction E-W)
+        stair_width_cm = span_y
+        stair_length_cm = span_x
+        mid_y = (min_y + max_y) / 2.0
+        run_start_cm = (min_x, mid_y)
+        run_end_cm = (max_x, mid_y)
+        tread_count = sum(1 for l in lines
+                          if abs(l['y2'] - l['y1']) > abs(l['x2'] - l['x1']) * 1.5
+                          and abs(l['y2'] - l['y1']) > 5)
+    else:
+        # Vertical run (travel direction N-S)
+        stair_width_cm = span_x
+        stair_length_cm = span_y
+        mid_x = (min_x + max_x) / 2.0
+        run_start_cm = (mid_x, min_y)
+        run_end_cm = (mid_x, max_y)
+        tread_count = sum(1 for l in lines
+                          if abs(l['x2'] - l['x1']) > abs(l['y2'] - l['y1']) * 1.5
+                          and abs(l['x2'] - l['x1']) > 5)
+
+    return {
+        'run_start_cm': run_start_cm,
+        'run_end_cm': run_end_cm,
+        'width_cm': stair_width_cm,
+        'length_cm': stair_length_cm,
+        'tread_count': max(tread_count, 1),
+    }
+
+
+def _stair_input_dialog(default_height_cm=306, default_risers=18):
+    """WinForms dialog: floor-to-floor height and number of risers.
+    Returns (height_cm, num_risers) or None if cancelled.
+    """
+    try:
+        import clr
+        clr.AddReference('System.Windows.Forms')
+        clr.AddReference('System.Drawing')
+        from System.Windows.Forms import (Form, Label, TextBox, Button,
+                                           DialogResult, FormBorderStyle,
+                                           FormStartPosition)
+        from System.Drawing import Size, Point
+
+        form = Form()
+        form.Text = "Stair Parameters"
+        form.ClientSize = Size(290, 135)
+        form.FormBorderStyle = FormBorderStyle.FixedDialog
+        form.StartPosition = FormStartPosition.CenterScreen
+        form.MaximizeBox = False
+        form.MinimizeBox = False
+
+        lbl_h = Label()
+        lbl_h.Text = "Floor-to-floor height (cm):"
+        lbl_h.Location = Point(10, 15)
+        lbl_h.Size = Size(175, 20)
+        form.Controls.Add(lbl_h)
+
+        txt_h = TextBox()
+        txt_h.Text = str(default_height_cm)
+        txt_h.Location = Point(195, 12)
+        txt_h.Size = Size(75, 20)
+        form.Controls.Add(txt_h)
+
+        lbl_r = Label()
+        lbl_r.Text = "Number of risers:"
+        lbl_r.Location = Point(10, 50)
+        lbl_r.Size = Size(175, 20)
+        form.Controls.Add(lbl_r)
+
+        txt_r = TextBox()
+        txt_r.Text = str(default_risers)
+        txt_r.Location = Point(195, 47)
+        txt_r.Size = Size(75, 20)
+        form.Controls.Add(txt_r)
+
+        btn_ok = Button()
+        btn_ok.Text = "OK"
+        btn_ok.Location = Point(75, 95)
+        btn_ok.Size = Size(65, 26)
+        btn_ok.DialogResult = DialogResult.OK
+        form.AcceptButton = btn_ok
+        form.Controls.Add(btn_ok)
+
+        btn_cancel = Button()
+        btn_cancel.Text = "Cancel"
+        btn_cancel.Location = Point(155, 95)
+        btn_cancel.Size = Size(65, 26)
+        btn_cancel.DialogResult = DialogResult.Cancel
+        form.CancelButton = btn_cancel
+        form.Controls.Add(btn_cancel)
+
+        if form.ShowDialog() == DialogResult.OK:
+            try:
+                h = float(txt_h.Text.strip().replace(',', '.'))
+                r = int(float(txt_r.Text.strip()))
+                return h, r
+            except Exception:
+                return float(default_height_cm), int(default_risers)
+        return None
+    except Exception:
+        return float(default_height_cm), int(default_risers)
+
+
+def _find_or_create_top_level(v2, base_level, floor_height_ft, snapshot=None):
+    """Find a level at base_level.Elevation + floor_height_ft, or create one."""
+    from Autodesk.Revit.DB import Level, FilteredElementCollector, Transaction
+
+    target_elev = base_level.Elevation + floor_height_ft
+    tol = 0.033  # ~1cm
+
+    for lvl in FilteredElementCollector(v2.doc).OfClass(Level).ToElements():
+        if abs(lvl.Elevation - target_elev) < tol:
+            return lvl
+
+    t = Transaction(v2.doc, "C2Rv7 Create Top Level for Stairs")
+    t.Start()
+    try:
+        new_lvl = Level.Create(v2.doc, target_elev)
+        t.Commit()
+        if snapshot:
+            try:
+                snapshot.log("Created top level at {:.2f}ft ({:.0f}cm above base)".format(
+                    target_elev, v2.ft_to_cm(floor_height_ft)))
+            except Exception:
+                pass
+        return new_lvl
+    except Exception as ex:
+        try:
+            t.RollBack()
+        except Exception:
+            pass
+        if snapshot:
+            try:
+                snapshot.log("Failed to create top level: {}".format(ex))
+            except Exception:
+                pass
+        return None
+
+
+def _create_stairs_from_markers(v2, level, markers, num_risers, floor_height_cm, snapshot=None):
+    """Create Revit stair elements from detected stair markers."""
+    from Autodesk.Revit.DB import Line, XYZ, BuiltInParameter
+
+    # Use getattr on the module — IronPython's 'from ... import' can silently
+    # Use getattr on the module — IronPython's 'from ... import' silently fails
+    # for some CLR types. StairsEditScope was removed in Revit 2025.
+    StairsEditScope = None
+    StairsRun = None
+    StairsRunJustification = None
+    try:
+        import Autodesk.Revit.DB.Architecture as _arch
+        StairsEditScope = getattr(_arch, 'StairsEditScope', None)
+        StairsRun = getattr(_arch, 'StairsRun', None)
+        StairsRunJustification = getattr(_arch, 'StairsRunJustification', None)
+    except Exception:
+        pass
+
+    if StairsEditScope is None:
+        # Confirmed absent in Revit 2025: StairsEditScope was removed and no public
+        # factory replacement exists. Stairs creation is not supported on this Revit version.
+        if snapshot:
+            try:
+                snapshot.log("Stairs creation skipped: StairsEditScope not available (Revit 2025+)")
+            except Exception:
+                pass
+        return []
+
+    if StairsRun is None:
+        if snapshot:
+            try:
+                snapshot.log("Stairs creation skipped: StairsRun not available")
+            except Exception:
+                pass
+        return []
+
+    stair_ids = []
+    floor_height_ft = v2.cm_to_ft(float(floor_height_cm))
+
+    top_level = _find_or_create_top_level(v2, level, floor_height_ft, snapshot)
+    if top_level is None:
+        return stair_ids
+
+    from Autodesk.Revit.DB import Transaction
+    jus = StairsRunJustification.Center
+
+    for i, mk in enumerate(markers):
+        scope = None
+        committed = False
+        try:
+            s = mk['run_start_cm']
+            e = mk['run_end_cm']
+            start_pt = XYZ(v2.cm_to_ft(s[0]), v2.cm_to_ft(s[1]), 0.0)
+            end_pt = XYZ(v2.cm_to_ft(e[0]), v2.cm_to_ft(e[1]), 0.0)
+            if start_pt.DistanceTo(end_pt) < 0.1:
+                continue
+
+            run_line = Line.CreateBound(start_pt, end_pt)
+            width_ft = v2.cm_to_ft(float(mk['width_cm']))
+
+            scope = StairsEditScope(v2.doc, "C2Rv7 Create Stairs")
+            stairsId = scope.Start(level.Id, top_level.Id)
+            stairs_elem = v2.doc.GetElement(stairsId)
+            if stairs_elem is not None:
+                try:
+                    p = stairs_elem.get_Parameter(
+                        BuiltInParameter.STAIRS_DESIRED_NUMBER_OF_RISERS)
+                    if p is not None and not p.IsReadOnly:
+                        p.Set(num_risers)
+                except Exception:
+                    pass
+            run = StairsRun.CreateStraightRun(v2.doc, stairsId, run_line, jus)
+            if run is not None:
+                try:
+                    run.ActualRunWidth = width_ft
+                except Exception:
+                    pass
+            scope.Commit(None)
+            committed = True
+            stair_ids.append(stairsId.IntegerValue)
+
+            if snapshot:
+                try:
+                    snapshot.log("Stair[{}] created: width={:.0f}cm length={:.0f}cm risers={}".format(
+                        i, mk['width_cm'], mk['length_cm'], num_risers))
+                except Exception:
+                    pass
+        except Exception as ex:
+            if snapshot:
+                try:
+                    snapshot.log("Stair[{}] creation error: {}".format(i, ex))
+                except Exception:
+                    pass
+        finally:
+            if scope is not None and not committed:
+                try:
+                    scope.Discard()
+                except Exception:
+                    pass
+            if scope is not None:
+                try:
+                    scope.Dispose()
+                except Exception:
+                    pass
+
+    return stair_ids
+
+
 def _create_rooms_and_tags(v2, level, snapshot=None):
     """Place a Room and RoomTag in every enclosed space on the given level.
 
@@ -3061,15 +3867,42 @@ def _create_exterior_dimensions(v2, level, wall_ids, door_ids, window_ids,
                     for pw in cardinal_groups.get(pk, []):
                         # Must share an endpoint with a parallel wall
                         at_corner = False
+                        matched_wep = None
                         for pep in par_ep_list:
                             for wep in [pw["p0"], pw["p1"]]:
                                 if (abs(pep[0] - wep[0]) < ep_tol and
                                         abs(pep[1] - wep[1]) < ep_tol):
                                     at_corner = True
+                                    matched_wep = wep
                                     break
                             if at_corner:
                                 break
                         if not at_corner:
+                            continue
+                        # Skip recess side-walls: if the perp wall's free end
+                        # (the endpoint NOT touching the parallel wall) connects
+                        # to another parallel-group wall, this is the side of an
+                        # interior recess, not an outer perimeter corner.
+                        free_ep = (
+                            pw["p1"] if (
+                                matched_wep is not None and
+                                abs(matched_wep[0] - pw["p0"][0]) < ep_tol and
+                                abs(matched_wep[1] - pw["p0"][1]) < ep_tol)
+                            else pw["p0"])
+                        connects_to_group = False
+                        for gw in group_walls:
+                            for wep2 in [gw["p0"], gw["p1"]]:
+                                if (abs(wep2[0] - free_ep[0]) < ep_tol and
+                                        abs(wep2[1] - free_ep[1]) < ep_tol):
+                                    connects_to_group = True
+                                    break
+                            if connects_to_group:
+                                break
+                        if connects_to_group:
+                            if snapshot:
+                                snapshot.log(
+                                    "DIM[%s]  corner SKIP(recess) perp=%s free=(%.2f,%.2f)" % (
+                                        card_key, pk, free_ep[0], free_ep[1]))
                             continue
                         side_refs = _wall_faces_by_normal(pw["wall"], sdir)
                         if not side_refs:
@@ -3082,8 +3915,33 @@ def _create_exterior_dimensions(v2, level, wall_ids, door_ids, window_ids,
                             ext_ref = side_refs[-1]  # rightmost face
                         corner_refs.append(ext_ref)
                         corner_positions.append(ext_ref[0])
+                        if snapshot:
+                            snapshot.log(
+                                "DIM[%s]  corner from perp=%s p0=(%.2f,%.2f) p1=(%.2f,%.2f) len=%.2fft pos=%.3f" % (
+                                    card_key, pk,
+                                    pw["p0"][0], pw["p0"][1],
+                                    pw["p1"][0], pw["p1"][1],
+                                    pw["length"], ext_ref[0]))
 
                 # Step 2: Parallel wall end face refs (skip those near corners)
+                # Pre-compute perp wall endpoint positions along sdir so we can
+                # distinguish real jogs (match a perp wall endpoint) from interior
+                # T-junction splits (Revit splits the wall but there's no perp ext wall).
+                perp_ep_sdir = []
+                for pk in perp_keys:
+                    for pw in cardinal_groups.get(pk, []):
+                        perp_ep_sdir.append(sdir[0] * pw["p0"][0] + sdir[1] * pw["p0"][1])
+                        perp_ep_sdir.append(sdir[0] * pw["p1"][0] + sdir[1] * pw["p1"][1])
+
+                if snapshot:
+                    snapshot.log("DIM[%s] perp_ep_sdir(%s) ft=[%s]" % (
+                        card_key,
+                        "+".join(perp_keys),
+                        ", ".join("%.3f" % v for v in sorted(set(perp_ep_sdir)))))
+                    snapshot.log("DIM[%s] corner_positions ft=[%s]" % (
+                        card_key,
+                        ", ".join("%.3f" % v for v in sorted(corner_positions))))
+
                 par_refs = []
                 for w in group_walls:
                     w_refs = _wall_faces_by_normal(w["wall"], sdir)
@@ -3108,7 +3966,20 @@ def _create_exterior_dimensions(v2, level, wall_ids, door_ids, window_ids,
                             if abs(candidate[0] - cp) < ep_tol:
                                 near_corner = True
                                 break
-                        if not near_corner:
+                        if near_corner:
+                            if snapshot:
+                                snapshot.log("DIM[%s]  par cand=%.3f SKIP(corner)" % (
+                                    card_key, candidate[0]))
+                            continue
+                        # Skip interior T-junction splits: only include if position
+                        # coincides with a real perpendicular exterior wall endpoint
+                        near_perp = any(
+                            abs(candidate[0] - pep) < ep_tol
+                            for pep in perp_ep_sdir)
+                        if snapshot:
+                            snapshot.log("DIM[%s]  par cand=%.3f near_perp=%s" % (
+                                card_key, candidate[0], near_perp))
+                        if near_perp:
                             par_refs.append(candidate)
 
                 # Combine and sort
@@ -3186,7 +4057,12 @@ def _create_exterior_dimensions(v2, level, wall_ids, door_ids, window_ids,
                     _place_dim(overall, cur_offset)
 
                 sides_created += 1
-            except Exception:
+            except Exception as _dim_ex:
+                if snapshot:
+                    try:
+                        snapshot.log("DIM[%s] EXCEPTION: %s" % (card_key, _dim_ex))
+                    except Exception:
+                        pass
                 continue
 
         t.Commit()
@@ -3408,7 +4284,7 @@ def _apply_layer_first_wall_mode(v2, selected_import):
 
     def _load_layer_map_strict(path):
         lm = dict(orig_load_layer_map(path) or {})
-        lm["walls"] = [r"^A-WALL-EXT$", r"^A-WALL-INT$"]
+        lm["walls"] = [r"^A-WALL-EXT$", r"^A-WALL-INT$", r"^A-WALL-CORE$"]
         lm["doors"] = []
         lm["windows"] = []
         return lm
@@ -3424,7 +4300,7 @@ def _apply_layer_first_wall_mode(v2, selected_import):
         strict = []
         for ln in wl:
             layer = str(ln.get("layer", "")).strip().upper()
-            if layer in ("A-WALL-EXT", "A-WALL-INT"):
+            if layer in ("A-WALL-EXT", "A-WALL-INT", "A-WALL-CORE"):
                 strict.append(ln)
         out["wall_lines"] = strict
         out["door_lines"] = []
@@ -3455,10 +4331,21 @@ def _apply_layer_first_wall_mode(v2, selected_import):
         cfg = dict(cfg or {})
         classified = dict(classified or {})
 
-        # Prompt user for floor type selection early (before any transactions)
-        floor_choice = _pick_floor_types(v2)
-        concrete_type = floor_choice[0] if floor_choice else None
-        tile_type = floor_choice[1] if floor_choice else None
+        # Load API key from api_key.txt in the pushbutton folder if not already in env.
+        import os as _os
+        if not _os.environ.get("ANTHROPIC_API_KEY"):
+            _key_path = _os.path.join(SCRIPT_DIR, "api_key.txt")
+            try:
+                with open(_key_path, "r") as _kf:
+                    _key = _kf.read().strip()
+                if _key:
+                    _os.environ["ANTHROPIC_API_KEY"] = _key
+            except Exception:
+                pass
+
+        # Auto-enable QA when the API key is available.
+        if _os.environ.get("ANTHROPIC_API_KEY"):
+            cfg["llm_qa_enabled"] = True
 
         llm_qa = _load_llm_qa()
         qa_report = {
@@ -3466,6 +4353,7 @@ def _apply_layer_first_wall_mode(v2, selected_import):
             "envelope": None,
             "fragments": None,
             "thickness": None,
+            "completeness": None,
             "restored_fragment_lines": 0,
         }
         if snapshot is not None:
@@ -3476,7 +4364,7 @@ def _apply_layer_first_wall_mode(v2, selected_import):
 
         min_len_cm = float(cfg.get("model_wall_min_length_cm", 20.0))
         raw_min_len_cm = float(cfg.get("raw_dedup_min_len_cm", 5.0))
-        close_gap_ext_cm = float(cfg.get("continuous_gap_close_cm_ext", 180.0))
+        close_gap_ext_cm = float(cfg.get("continuous_gap_close_cm_ext", 250.0))
         close_gap_int_cm = float(cfg.get("continuous_gap_close_cm_int", 140.0))
         cleanup_tol_cm = float(cfg.get("continuous_cleanup_snap_cm", 6.0))
         raw_dup_tol_cm = float(cfg.get("continuous_raw_duplicate_tol_cm", 1.5))
@@ -3505,21 +4393,27 @@ def _apply_layer_first_wall_mode(v2, selected_import):
             except Exception:
                 qa_report["envelope"] = {"verdict": "no_opinion", "error": "exception"}
 
-        ext_bbox = _bbox_of_lines(ext_main)
+        # Use bbox of ALL ext lines (not just the largest connected component) so that
+        # a drawing change that breaks ext connectivity doesn't clip out the changed area.
+        ext_bbox = _bbox_of_lines(ext_all)
         if ext_bbox:
             wall_lines = _keep_lines_in_bbox(wall_lines, ext_bbox, margin_cm=180.0)
 
         ext_raw = [ln for ln in wall_lines if str(ln.get("layer", "")).strip().upper() == "A-WALL-EXT"]
         int_raw = [ln for ln in wall_lines if str(ln.get("layer", "")).strip().upper() == "A-WALL-INT"]
+        core_raw = [ln for ln in wall_lines if str(ln.get("layer", "")).strip().upper() == "A-WALL-CORE"]
 
         ext_raw = _dedupe_lines(ext_raw, raw_min_len_cm)
         int_raw = _dedupe_lines(int_raw, raw_min_len_cm)
+        core_raw = _dedupe_lines(core_raw, raw_min_len_cm)
 
         # Bridge wall-face gaps before pairing so openings do not break the wall run.
         ext_raw = _suppress_parallel_duplicates(ext_raw, raw_dup_tol_cm, 0.92)
         int_raw = _suppress_parallel_duplicates(int_raw, raw_dup_tol_cm, 0.92)
+        core_raw = _suppress_parallel_duplicates(core_raw, raw_dup_tol_cm, 0.92)
         ext_raw = _bridge_raw_wall_faces(rec, ext_raw, close_gap_ext_cm, max(6.0, raw_dup_tol_cm * 2.0))
         int_raw = _bridge_raw_wall_faces(rec, int_raw, close_gap_int_cm, max(6.0, raw_dup_tol_cm * 2.0))
+        core_raw = _bridge_raw_wall_faces(rec, core_raw, close_gap_ext_cm, max(6.0, raw_dup_tol_cm * 2.0))
 
         ext_center, ext_dbg = _collapse_paired_centerlines_only(
             rec,
@@ -3533,10 +4427,17 @@ def _apply_layer_first_wall_mode(v2, selected_import):
             cfg,
             float(cfg.get("default_internal_wall_thickness_cm", 15.0)),
         )
+        core_center, core_dbg = _collapse_paired_centerlines_only(
+            rec,
+            core_raw,
+            cfg,
+            float(cfg.get("default_wall_thickness_cm", 20.0)),
+        )
 
         ext_thick_cm = _estimate_thickness_cm(ext_dbg, float(cfg.get("default_wall_thickness_cm", 20.0)))
         int_fallback_cm = float(cfg.get("default_internal_wall_thickness_cm", min(15.0, max(10.0, ext_thick_cm * 0.7))))
         int_thick_cm = _estimate_thickness_cm(int_dbg, int_fallback_cm)
+        core_thick_cm = _estimate_thickness_cm(core_dbg, ext_thick_cm)
 
         # Hook 3: thickness sanity check (informational only, never changes numbers).
         if qa_report["enabled"]:
@@ -3571,7 +4472,8 @@ def _apply_layer_first_wall_mode(v2, selected_import):
         # Interior traces still need pruning for door-swing/jamb leftovers.
         int_center = _prune_short_leaf_lines(int_center, cleanup_tol_cm, max(70.0, int_thick_cm * 2.0))
         _dump_lines("02_int_after_prune_leaf", int_center)
-        ext_center = _largest_component_lines(ext_center, cleanup_tol_cm)
+        # Do NOT drop disconnected ext components — a large door opening can break
+        # connectivity between wall segments. Keep all paired centerlines.
         int_before_removal = list(int_center)
         int_center = _remove_small_components(int_center, cleanup_tol_cm, max(220.0, int_thick_cm * 6.0), max(110.0, int_thick_cm * 2.5))
         _dump_lines("03_int_after_remove_small", int_center)
@@ -3656,29 +4558,38 @@ def _apply_layer_first_wall_mode(v2, selected_import):
         )
         _dump_lines("09_int_final", int_center)
 
+        _dump_lines("core_00_after_pair", core_center)
+        core_center = rec._merge_collinear_overlapping(core_center, perp_tol=6.0, gap_tol=4.0)
+        _dump_lines("core_01_after_merge", core_center)
+        core_center = rec._extend_to_intersections(core_center, ext_tol=max(30.0, core_thick_cm * 2.0))
+        _dump_lines("core_02_after_extend", core_center)
+        core_center = _suppress_parallel_duplicates(core_center, max(8.0, core_thick_cm * 0.35), 0.75)
+        _dump_lines("core_03_after_dedup", core_center)
+
         ext_center = _dedupe_lines(ext_center, min_len_cm)
         int_center = _dedupe_lines(int_center, min_len_cm)
+        core_center = _dedupe_lines(core_center, min_len_cm)
 
-        # --- Detect doors BEFORE creating walls ---
-        # If a door sits in a gap between two collinear wall segments,
-        # bridge the gap so the wall is continuous and can host the door.
+        # Detect door/window markers before walls so gaps can be bridged.
         raw_data = _RAW_CAD_CACHE.get("data")
         door_markers = []
         window_markers = []
         if raw_data is not None:
-            door_markers = _detect_opening_markers(raw_data, "door")
-            window_markers = _detect_opening_markers(raw_data, "window")
-
-            # Bridge centerline gaps at door locations
+            door_markers = _detect_opening_markers(raw_data, "door", snapshot)
+            window_markers = _detect_opening_markers(raw_data, "window", snapshot)
             ext_center = _bridge_gaps_at_doors(ext_center, door_markers, snapshot)
             int_center = _bridge_gaps_at_doors(int_center, door_markers, snapshot)
 
         ext_type = _pick_wall_type(v2, ext_thick_cm, ["EXTERIOR", "EXT"])
         if ext_type is None:
             raise Exception("No Basic wall type found for exterior walls.")
+        core_type = _pick_wall_type(v2, core_thick_cm, ["CORE", "EXTERIOR", "EXT"])
+        if core_type is None:
+            core_type = ext_type
 
         wall_ids = []
         internal_wall_ids = []
+        core_wall_ids = []
         t = v2.Transaction(v2.doc, "Create Model From CAD V2 (C2Rv7_C Layer-First Walls)")
         t.Start()
         try:
@@ -3687,6 +4598,8 @@ def _apply_layer_first_wall_mode(v2, selected_import):
             internal_wall_ids = _create_walls_per_thickness(
                 v2, int_center, int_raw, level, int_thick_cm,
                 ["INTERIOR", "INT", "PARTITION"], min_len_cm, snapshot)
+            # Core walls: same collapse pipeline as exterior, own wall type
+            core_wall_ids = _create_walls_from_lines(v2, core_center, level, core_type, min_len_cm)
             t.Commit()
         except Exception:
             try:
@@ -3695,34 +4608,52 @@ def _apply_layer_first_wall_mode(v2, selected_import):
                 pass
             raise
 
-        # --- Opening placement (markers already detected above) ---
+        # --- Dev preview: show rendered wall centerlines in a popup image ---
+        _show_wall_preview(ext_center, int_center + core_center, len(wall_ids), len(internal_wall_ids) + len(core_wall_ids))
+
+        # --- Visual QA: ask Claude if the wall set looks complete ---
+        if qa_report["enabled"] and llm_qa is not None:
+            try:
+                qa_result = llm_qa.validate_wall_completeness(
+                    cfg, ext_center, int_center + core_center, snapshot=snapshot)
+                qa_report["completeness"] = qa_result
+                verdict = qa_result.get("verdict", "no_opinion")
+                reason = qa_result.get("reason", "")
+                if verdict == "incomplete":
+                    msg = (
+                        "Wall QA Warning\n\n"
+                        "Claude reviewed the detected walls and flagged a possible problem:\n\n"
+                        "{}\n\n"
+                        "Check the model before continuing."
+                    ).format(reason)
+                    TaskDialog.Show("C2Rv7_C QA", msg)
+                elif verdict == "complete":
+                    TaskDialog.Show(
+                        "C2Rv7_C QA",
+                        "Wall QA passed.\n\n{}\n\nExt: {} walls  Int: {} walls".format(
+                            reason, len(wall_ids), len(internal_wall_ids)))
+            except Exception as _qa_ex:
+                if snapshot:
+                    try:
+                        snapshot.log("Wall QA error: {}".format(_qa_ex))
+                    except Exception:
+                        pass
+
+        # =======================================================================
+        # STEP 2 — DOORS / WINDOWS
+        # =======================================================================
         door_ids = []
         window_ids = []
         opening_errors = []
-        if raw_data is not None:
-
-            if snapshot:
-                try:
-                    snapshot.log("Opening markers detected: {} doors, {} windows ({} raw lines, {} raw arcs)".format(
-                        len(door_markers), len(window_markers),
-                        len(raw_data.get("lines") or []), len(raw_data.get("arcs") or [])))
-                    for i, mk in enumerate(door_markers):
-                        sw = mk.get("swing") or {}
-                        snapshot.log("  door[{}] center=({:.0f},{:.0f}) width={:.0f}cm({}) {} swing={} hinge={} open={}".format(
-                            i, mk["center_cm"][0], mk["center_cm"][1], mk["width_cm"],
-                            mk.get("width_source", "?"),
-                            "DOUBLE" if mk.get("is_double") else "single",
-                            sw.get("source", "?"),
-                            sw.get("hinge_cm", "?"), sw.get("open_cm", "?")))
-                    for i, mk in enumerate(window_markers):
-                        snapshot.log("  win[{}] center=({:.0f},{:.0f}) width={:.0f}cm({})".format(
-                            i, mk["center_cm"][0], mk["center_cm"][1], mk["width_cm"], mk.get("width_source", "?")))
-                except Exception:
-                    pass
-
-            if door_markers or window_markers:
+        if door_markers or window_markers:
+            td = TaskDialog("C2Rv7_C")
+            td.MainInstruction = "Place doors and windows?"
+            td.MainContent = "Detected: {} doors,  {} windows".format(
+                len(door_markers), len(window_markers))
+            td.CommonButtons = TaskDialogCommonButtons.Yes | TaskDialogCommonButtons.No
+            td.DefaultButton = TaskDialogResult.Yes
+            if td.Show() == TaskDialogResult.Yes:
                 t2 = v2.Transaction(v2.doc, "C2Rv7_C Place Openings")
-                # Suppress "Can't make type" dialogs — auto-delete failing elements
                 fho = t2.GetFailureHandlingOptions()
                 fho.SetFailuresPreprocessor(_SwallowTypeErrors())
                 t2.SetFailureHandlingOptions(fho)
@@ -3730,16 +4661,14 @@ def _apply_layer_first_wall_mode(v2, selected_import):
                 try:
                     if door_markers:
                         door_ids = _place_openings_in_walls(
-                            v2, level, wall_ids, internal_wall_ids,
-                            door_markers,
-                            BuiltInCategory.OST_Doors, snapshot,
-                            sill_height_cm=0.0)
+                            v2, level, wall_ids, internal_wall_ids + core_wall_ids,
+                            door_markers, BuiltInCategory.OST_Doors,
+                            snapshot, sill_height_cm=0.0)
                     if window_markers:
                         window_ids = _place_openings_in_walls(
-                            v2, level, wall_ids, internal_wall_ids,
-                            window_markers,
-                            BuiltInCategory.OST_Windows, snapshot,
-                            sill_height_cm=105.0)
+                            v2, level, wall_ids, internal_wall_ids + core_wall_ids,
+                            window_markers, BuiltInCategory.OST_Windows,
+                            snapshot, sill_height_cm=105.0)
                     t2.Commit()
                 except Exception as ex:
                     opening_errors.append(str(ex))
@@ -3747,70 +4676,93 @@ def _apply_layer_first_wall_mode(v2, selected_import):
                         t2.RollBack()
                     except Exception:
                         pass
+                # Log any Revit failure messages captured by _SwallowTypeErrors
+                _flush_failure_log(snapshot)
 
-        # --- Extract inner face lines from ext wall pairs for floor ---
-        ext_inner_lines_cm = _extract_inner_face_lines(rec, ext_raw, cfg, snapshot)
-
-        # --- Floor creation ---
-        concrete_floor_ids = []
-        tile_floor_ids = []
-        if concrete_type is not None or tile_type is not None:
-            try:
-                concrete_floor_ids, tile_floor_ids = _create_floors(
-                    v2, level, ext_inner_lines_cm,
-                    concrete_type, tile_type,
-                    snapshot=snapshot)
-            except Exception as ex:
+                # Verify which placed doors/windows still exist (the preprocessor
+                # may have deleted some during commit).
                 if snapshot:
                     try:
-                        import traceback
-                        snapshot.log("Floor creation error: {}\n{}".format(ex, traceback.format_exc()))
+                        for _id in list(door_ids) + list(window_ids):
+                            el = v2.doc.GetElement(ElementId(_id))
+                            if el is None:
+                                snapshot.log("POST-COMMIT MISSING id={} (deleted by Revit)".format(_id))
                     except Exception:
-                        snapshot.log("Floor creation error: {}".format(ex))
+                        pass
 
-        # --- Room + Room Tag creation ---
+                # Dev preview: show walls + opening markers
+                _show_openings_preview(
+                    ext_center, int_center,
+                    door_markers, window_markers,
+                    len(door_ids), len(window_ids))
+
+        # =======================================================================
+        # STEP 2.6 — STAIRS
+        # =======================================================================
+        stair_ids = []
+        stair_markers = _detect_stair_markers(raw_data, snapshot)
+        if stair_markers:
+            stair_params = _stair_input_dialog(306, 18)
+            if stair_params is not None:
+                floor_h_cm, n_risers = stair_params
+                stair_ids = _create_stairs_from_markers(
+                    v2, level, stair_markers, n_risers, floor_h_cm, snapshot)
+
+        # =======================================================================
+        # STEP 3 — FLOORS
+        # =======================================================================
+        floor_ids = []
+        tile_floor_ids = []
+        td_fl = TaskDialog("C2Rv7_C")
+        td_fl.MainInstruction = "Create floors?"
+        td_fl.CommonButtons = TaskDialogCommonButtons.Yes | TaskDialogCommonButtons.No
+        td_fl.DefaultButton = TaskDialogResult.Yes
+        if td_fl.Show() == TaskDialogResult.Yes:
+            floor_type_pair = _pick_floor_types(v2)
+            if floor_type_pair is not None:
+                concrete_type, tile_type = floor_type_pair
+                ext_inner_lines_cm = _extract_inner_face_lines(rec, ext_raw, cfg, snapshot)
+                floor_ids, tile_floor_ids = _create_floors(
+                    v2, level, ext_inner_lines_cm, concrete_type, tile_type, snapshot)
+
+        # =======================================================================
+        # STEP 3.5 — ROOMS
+        # =======================================================================
         room_ids = []
-        tag_ids = []
-        try:
-            room_ids, tag_ids = _create_rooms_and_tags(v2, level, snapshot)
-        except Exception as ex:
-            if snapshot:
-                try:
-                    snapshot.log("Room creation error: {}".format(ex))
-                except Exception:
-                    pass
+        room_tag_ids = []
+        td_room = TaskDialog("C2Rv7_C")
+        td_room.MainInstruction = "Create rooms and area tags?"
+        td_room.CommonButtons = TaskDialogCommonButtons.Yes | TaskDialogCommonButtons.No
+        td_room.DefaultButton = TaskDialogResult.Yes
+        if td_room.Show() == TaskDialogResult.Yes:
+            room_ids, room_tag_ids = _create_rooms_and_tags(v2, level, snapshot)
 
-        # --- Exterior dimensions ---
-        ext_dim_ids = []
-        try:
-            ext_dim_ids = _create_exterior_dimensions(
+        # =======================================================================
+        # STEP 4 — DIMENSIONS
+        # =======================================================================
+        dim_ids = []
+        td_dim = TaskDialog("C2Rv7_C")
+        td_dim.MainInstruction = "Create exterior dimensions?"
+        td_dim.CommonButtons = TaskDialogCommonButtons.Yes | TaskDialogCommonButtons.No
+        td_dim.DefaultButton = TaskDialogResult.Yes
+        if td_dim.Show() == TaskDialogResult.Yes:
+            dim_ids = _create_exterior_dimensions(
                 v2, level, wall_ids, door_ids, window_ids,
                 ext_thick_cm, snapshot)
-        except Exception as ex:
-            if snapshot:
-                try:
-                    snapshot.log("Dimension creation error: {}".format(ex))
-                except Exception:
-                    pass
 
         if snapshot is not None:
             try:
-                snapshot.log("Layer-first walls created: ext={} int={}, doors={} windows={}, "
-                             "concrete_floors={} tile_floors={}, rooms={} tags={}, dims={}".format(
-                    len(wall_ids), len(internal_wall_ids), len(door_ids), len(window_ids),
-                    len(concrete_floor_ids), len(tile_floor_ids),
-                    len(room_ids), len(tag_ids), len(ext_dim_ids)))
+                snapshot.log("Layer-first walls created: ext={} core={} int={}, doors={} windows={}, stairs={}, floors={} tile={}, rooms={} tags={}, dims={}".format(
+                    len(wall_ids), len(core_wall_ids), len(internal_wall_ids), len(door_ids), len(window_ids),
+                    len(stair_ids), len(floor_ids), len(tile_floor_ids), len(room_ids), len(room_tag_ids), len(dim_ids)))
                 snapshot.save_json("08_geometry_summary.json", {
                     "geometry": {
                         "wall_ids": wall_ids,
                         "internal_wall_ids": internal_wall_ids,
                         "door_ids": door_ids,
                         "window_ids": window_ids,
-                        "concrete_floor_ids": concrete_floor_ids,
+                        "floor_ids": floor_ids,
                         "tile_floor_ids": tile_floor_ids,
-                        "room_ids": room_ids,
-                        "tag_ids": tag_ids,
-                        "ext_dim_ids": ext_dim_ids,
                         "opening_errors": opening_errors,
                         "perimeter_wall_thickness_cm": float(ext_thick_cm),
                         "internal_wall_thickness_cm": float(int_thick_cm),
@@ -3826,11 +4778,6 @@ def _apply_layer_first_wall_mode(v2, selected_import):
                 "internal_wall_ids": internal_wall_ids,
                 "door_ids": door_ids,
                 "window_ids": window_ids,
-                "concrete_floor_ids": concrete_floor_ids,
-                "tile_floor_ids": tile_floor_ids,
-                "room_ids": room_ids,
-                "tag_ids": tag_ids,
-                "ext_dim_ids": ext_dim_ids,
                 "opening_errors": opening_errors,
                 "perimeter_wall_thickness_cm": float(ext_thick_cm),
                 "internal_wall_thickness_cm": float(int_thick_cm),
