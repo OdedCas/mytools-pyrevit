@@ -143,12 +143,20 @@ def get_area_views(sheets):
     return list(views.values())
 
 
+_area_view_names = {}  # area element id -> view name (for building detection)
+
 def collect_areas(views):
+    global _area_view_names
+    _area_view_names = {}
     found = {}
     for view in views:
+        vname = to_text(view.Name).strip()
         for el in FilteredElementCollector(doc, view.Id).OfClass(SpatialElement).ToElements():
             if isinstance(el, Area) and el.Area > 0:
-                found[el.Id.IntegerValue] = el
+                eid = el.Id.IntegerValue
+                if eid not in found:
+                    found[eid] = el
+                    _area_view_names[eid] = vname
     return list(found.values())
 
 
@@ -158,9 +166,9 @@ def get_level_name(area):
 
 
 def get_building(area):
-    area_name = get_area_name(area).strip()
-    if area_name and area_name[0].upper() in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-        return area_name[0].upper()
+    view_name = _area_view_names.get(area.Id.IntegerValue, "").strip()
+    if view_name and view_name[0].upper() in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        return view_name[0].upper()
     level_name = get_level_name(area).strip()
     return level_name[0].upper() if level_name else u"?"
 
