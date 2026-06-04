@@ -68,6 +68,13 @@ class _SwallowTypeErrors(IFailuresPreprocessor):
         return FailureProcessingResult.Continue
 
 
+class _ContinueFailuresPreprocessor(IFailuresPreprocessor):
+    """No-op failures preprocessor for APIs that require a non-null instance."""
+
+    def PreprocessFailures(self, failuresAccessor):
+        return FailureProcessingResult.Continue
+
+
 def _flush_failure_log(snapshot):
     """Write accumulated Revit failure messages to the snapshot run_log."""
     if not snapshot:
@@ -564,34 +571,54 @@ def _biconnected_edge_blocks(lines, tol_cm):
     edge_stack = []
     blocks = []
 
-    def _dfs(u):
+    # Iterative Tarjan biconnected-components — avoids stack overflow on large graphs.
+    # call_stack entries: (node, neighbour_iterator, pending_child, pending_edge_id)
+    for root in nodes:
+        if root in disc:
+            continue
+        call_stack = [(root, iter(adj.get(root, [])), None, None)]
         time_ref[0] += 1
-        disc[u] = time_ref[0]
-        low[u] = time_ref[0]
+        disc[root] = time_ref[0]
+        low[root] = time_ref[0]
 
-        for v, edge_id in adj.get(u, []):
-            if v not in disc:
-                parent[v] = u
-                edge_stack.append(edge_id)
-                _dfs(v)
-                low[u] = min(low[u], low[v])
-                if low[v] >= disc[u]:
+        while call_stack:
+            u, nbr_iter, child, child_edge = call_stack[-1]
+
+            # Return from child: propagate low, maybe emit block.
+            if child is not None:
+                low[u] = min(low[u], low[child])
+                if low[child] >= disc[u]:
                     block = set()
                     while edge_stack:
                         last = edge_stack.pop()
                         block.add(last)
-                        if last == edge_id:
+                        if last == child_edge:
                             break
                     if block:
                         blocks.append(block)
-            elif parent.get(u) != v and disc[v] < disc[u]:
-                edge_stack.append(edge_id)
-                low[u] = min(low[u], disc[v])
+                call_stack[-1] = (u, nbr_iter, None, None)
 
-    for node in nodes:
-        if node in disc:
-            continue
-        _dfs(node)
+            # Advance to next neighbour.
+            advanced = False
+            for v, edge_id in nbr_iter:
+                if v not in disc:
+                    parent[v] = u
+                    edge_stack.append(edge_id)
+                    time_ref[0] += 1
+                    disc[v] = time_ref[0]
+                    low[v] = time_ref[0]
+                    # Record that u is waiting for child v with edge_id.
+                    call_stack[-1] = (u, nbr_iter, v, edge_id)
+                    call_stack.append((v, iter(adj.get(v, [])), None, None))
+                    advanced = True
+                    break
+                elif parent.get(u) != v and disc[v] < disc[u]:
+                    edge_stack.append(edge_id)
+                    low[u] = min(low[u], disc[v])
+
+            if not advanced:
+                call_stack.pop()
+
         if edge_stack:
             blocks.append(set(edge_stack))
             edge_stack[:] = []
@@ -3135,17 +3162,73 @@ def _detect_stair_markers(raw_data, snapshot=None):
     clusters = _cluster_stair_lines(stair_lines, tol_cm=50.0)
     markers = []
     for cluster in clusters:
-        mk = _analyze_stair_cluster(cluster)
+        mk, reason = _analyze_u_stair_cluster(cluster, raw_data=raw_data)
         if mk:
             markers.append(mk)
+        else:
+            markers.append({
+                "kind": "unsupported_stair",
+                "skip_stairs": True,
+                "reason": reason or "U-stair parser could not classify this stair geometry",
+                "width_cm": 0.0,
+                "length_cm": 0.0,
+                "tread_count": 0,
+            })
 
     if snapshot:
         try:
+            debug_lines = []
             snapshot.log("DETECT stairs: {} lines -> {} groups".format(
                 len(stair_lines), len(markers)))
             for i, mk in enumerate(markers):
-                snapshot.log("  stair[{}] width={:.0f}cm length={:.0f}cm treads={}".format(
-                    i, mk['width_cm'], mk['length_cm'], mk['tread_count']))
+                if mk.get("kind") == "u_two_run_auto_landing":
+                    line1 = "stair[{}] U-run width={:.0f}cm runs={} landing_side={} treads={}".format(
+                        i, mk['width_cm'], len(mk.get("runs") or []),
+                        mk.get("landing_side", "?"), mk['tread_count'])
+                    line2 = "arrow_tip={} climb_end_band={} order_mode={}".format(
+                        mk.get("arrow_tip_cm"), mk.get("climb_end_band", "?"),
+                        mk.get("run_order_mode", "?"))
+                    line3 = "opening_mode={} opening_y=[{},{}] centers_y=[{:.0f},{:.0f}]".format(
+                        mk.get("opening_mode", False),
+                        "?" if mk.get("opening_y_min") is None else int(round(float(mk.get("opening_y_min")))),
+                        "?" if mk.get("opening_y_max") is None else int(round(float(mk.get("opening_y_max")))),
+                        float(mk.get("lower_center_y", 0.0)),
+                        float(mk.get("upper_center_y", 0.0)))
+                    snapshot.log("  " + line1)
+                    snapshot.log("    " + line2)
+                    snapshot.log("    " + line3)
+                    debug_lines.append(line1)
+                    debug_lines.append(line2)
+                    debug_lines.append(line3)
+                    arrow_count_line = "arrow_lines={}".format(mk.get("arrow_line_count", 0))
+                    snapshot.log("    " + arrow_count_line)
+                    debug_lines.append(arrow_count_line)
+                    for cand in list(mk.get("arrow_line_debug") or [])[:4]:
+                        snapshot.log("    " + cand)
+                        debug_lines.append(cand)
+                    for ridx, run in enumerate(mk.get("runs") or []):
+                        run_line = "run[{}] {} start=({:.0f},{:.0f}) end=({:.0f},{:.0f}) width={:.0f}".format(
+                            ridx, run.get("band_name", "?"),
+                            run["run_start_cm"][0], run["run_start_cm"][1],
+                            run["run_end_cm"][0], run["run_end_cm"][1],
+                            run.get("width_cm", 0.0))
+                        snapshot.log("    " + run_line)
+                        debug_lines.append(run_line)
+                elif mk.get("kind") == "unsupported_stair":
+                    line = "stair[{}] unsupported: {}".format(
+                        i, mk.get("reason", "unknown reason"))
+                    snapshot.log("  " + line)
+                    debug_lines.append(line)
+                else:
+                    line = "stair[{}] width={:.0f}cm length={:.0f}cm treads={}".format(
+                        i, mk['width_cm'], mk['length_cm'], mk['tread_count'])
+                    snapshot.log("  " + line)
+                    debug_lines.append(line)
+            if debug_lines:
+                try:
+                    TaskDialog.Show("C2Rv7_C Stairs Debug", "\n".join(debug_lines[:8]))
+                except Exception:
+                    pass
         except Exception:
             pass
     return markers
@@ -3221,6 +3304,7 @@ def _analyze_stair_cluster(lines):
                           and abs(l['x2'] - l['x1']) > 5)
 
     return {
+        'kind': 'single_run',
         'run_start_cm': run_start_cm,
         'run_end_cm': run_end_cm,
         'width_cm': stair_width_cm,
@@ -3229,9 +3313,480 @@ def _analyze_stair_cluster(lines):
     }
 
 
-def _stair_input_dialog(default_height_cm=306, default_risers=18):
-    """WinForms dialog: floor-to-floor height and number of risers.
-    Returns (height_cm, num_risers) or None if cancelled.
+def _stair_line_len_cm(ln):
+    dx = float(ln.get('x2', 0.0)) - float(ln.get('x1', 0.0))
+    dy = float(ln.get('y2', 0.0)) - float(ln.get('y1', 0.0))
+    return math.sqrt((dx * dx) + (dy * dy))
+
+
+def _is_vertical_riser_candidate(ln):
+    dx = abs(float(ln.get('x2', 0.0)) - float(ln.get('x1', 0.0)))
+    dy = abs(float(ln.get('y2', 0.0)) - float(ln.get('y1', 0.0)))
+    length = _stair_line_len_cm(ln)
+    if length < 20.0 or length > 300.0:
+        return False
+    if dy < 10.0:
+        return False
+    return dx <= max(2.0, dy * 0.12)
+
+
+def _cluster_riser_bands(risers):
+    if not risers:
+        return []
+
+    items = []
+    for ln in risers:
+        y1 = float(ln.get('y1', 0.0))
+        y2 = float(ln.get('y2', 0.0))
+        x1 = float(ln.get('x1', 0.0))
+        x2 = float(ln.get('x2', 0.0))
+        items.append({
+            "line": ln,
+            "x": (x1 + x2) * 0.5,
+            "y": (y1 + y2) * 0.5,
+            "ymin": min(y1, y2),
+            "ymax": max(y1, y2),
+            "len": abs(y2 - y1),
+        })
+
+    items.sort(key=lambda it: it["y"])
+    lengths = sorted([it["len"] for it in items])
+    median_len = lengths[len(lengths) // 2]
+    join_tol = max(20.0, median_len * 0.75)
+
+    bands = []
+    for it in items:
+        placed = False
+        for band in bands:
+            if abs(it["y"] - band["ymean"]) <= join_tol:
+                band["items"].append(it)
+                n = float(len(band["items"]))
+                band["ymean"] = ((band["ymean"] * (n - 1.0)) + it["y"]) / n
+                placed = True
+                break
+        if not placed:
+            bands.append({"items": [it], "ymean": it["y"]})
+
+    out = []
+    for band in bands:
+        bitems = band["items"]
+        if len(bitems) < 4:
+            continue
+        xs = sorted([it["x"] for it in bitems])
+        if len(xs) >= 3:
+            diffs = [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]
+            pos_diffs = [d for d in diffs if d > 2.0]
+            if pos_diffs:
+                avg = sum(pos_diffs) / float(len(pos_diffs))
+                if avg <= 0.0:
+                    continue
+                regular = [d for d in pos_diffs if abs(d - avg) <= max(6.0, avg * 0.45)]
+                if len(regular) < max(3, int(len(pos_diffs) * 0.5)):
+                    continue
+        out.append({
+            "lines": [it["line"] for it in bitems],
+            "x_min": min(xs),
+            "x_max": max(xs),
+            "y_mid": sum([it["y"] for it in bitems]) / float(len(bitems)),
+            "y_min": min([it["ymin"] for it in bitems]),
+            "y_max": max([it["ymax"] for it in bitems]),
+            "width_cm": sum([it["len"] for it in bitems]) / float(len(bitems)),
+            "count": len(bitems),
+        })
+
+    out.sort(key=lambda b: b["y_mid"])
+    return out
+
+
+def _find_stair_arrow_tip(lines):
+    """Find a likely stair arrow tip from two short diagonal lines sharing a point."""
+    diags = []
+    for ln in (lines or []):
+        x1 = float(ln.get('x1', 0.0))
+        y1 = float(ln.get('y1', 0.0))
+        x2 = float(ln.get('x2', 0.0))
+        y2 = float(ln.get('y2', 0.0))
+        dx = x2 - x1
+        dy = y2 - y1
+        length = math.sqrt((dx * dx) + (dy * dy))
+        # Imported CAD arrows are often larger than the earlier threshold.
+        if length < 8.0 or length > 220.0:
+            continue
+        if abs(dx) < 4.0 or abs(dy) < 4.0:
+            continue
+        diags.append((x1, y1, x2, y2))
+
+    def _near(p, q, tol=20.0):
+        return math.sqrt(((p[0] - q[0]) ** 2) + ((p[1] - q[1]) ** 2)) <= tol
+
+    # Fast path: first pair of diagonals that share exactly one endpoint is the
+    # arrow head. This matches the cleaned CAD arrow you showed.
+    for i in range(len(diags)):
+        a = diags[i]
+        a_pts = [(a[0], a[1]), (a[2], a[3])]
+        for j in range(i + 1, len(diags)):
+            b = diags[j]
+            b_pts = [(b[0], b[1]), (b[2], b[3])]
+            shared_pts = []
+            for ap in a_pts:
+                for bp in b_pts:
+                    if _near(ap, bp):
+                        shared_pts.append(((ap[0] + bp[0]) * 0.5, (ap[1] + bp[1]) * 0.5))
+            if len(shared_pts) == 1:
+                return shared_pts[0]
+
+    best = None
+    best_score = -1.0
+    for i in range(len(diags)):
+        a = diags[i]
+        a_pts = [(a[0], a[1]), (a[2], a[3])]
+        for j in range(i + 1, len(diags)):
+            b = diags[j]
+            b_pts = [(b[0], b[1]), (b[2], b[3])]
+            shared = None
+            outer = []
+            for ap in a_pts:
+                for bp in b_pts:
+                    if _near(ap, bp):
+                        shared = ((ap[0] + bp[0]) * 0.5, (ap[1] + bp[1]) * 0.5)
+                        outer = [pt for pt in a_pts if not _near(pt, ap)] + [pt for pt in b_pts if not _near(pt, bp)]
+                        break
+                if shared is not None:
+                    break
+            if shared is None or len(outer) != 2:
+                continue
+            span = math.sqrt(((outer[0][0] - outer[1][0]) ** 2) + ((outer[0][1] - outer[1][1]) ** 2))
+            if span < 6.0 or span > 180.0:
+                continue
+            score = 100.0 - span
+            if score > best_score:
+                best = shared
+                best_score = score
+    return best
+
+
+def _gather_stair_arrow_lines(raw_data, cluster_lines):
+    """Prefer arrow geometry from layer 0 near the stair cluster; fall back to cluster lines."""
+    cluster_lines = list(cluster_lines or [])
+    raw_lines = list((raw_data or {}).get("lines") or [])
+    if not cluster_lines:
+        return raw_lines
+
+    xs = [float(ln.get('x1', 0.0)) for ln in cluster_lines] + [float(ln.get('x2', 0.0)) for ln in cluster_lines]
+    ys = [float(ln.get('y1', 0.0)) for ln in cluster_lines] + [float(ln.get('y2', 0.0)) for ln in cluster_lines]
+    min_x = min(xs) - 120.0
+    max_x = max(xs) + 120.0
+    min_y = min(ys) - 120.0
+    max_y = max(ys) + 120.0
+
+    layer0_diags = []
+    other_candidates = []
+    for ln in raw_lines:
+        layer = str(ln.get('layer', '')).strip().upper()
+        if layer not in ('0', 'A-STAIRS', 'A-SAIRS'):
+            continue
+        x1 = float(ln.get('x1', 0.0))
+        y1 = float(ln.get('y1', 0.0))
+        x2 = float(ln.get('x2', 0.0))
+        y2 = float(ln.get('y2', 0.0))
+        if (min(x1, x2) > max_x or max(x1, x2) < min_x or
+                min(y1, y2) > max_y or max(y1, y2) < min_y):
+            continue
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        if layer == '0' and dx > 4.0 and dy > 4.0:
+            layer0_diags.append(ln)
+        else:
+            other_candidates.append(ln)
+    # If there are diagonal lines on layer 0 near the stair, treat them as the
+    # primary arrow candidates. Otherwise fall back to the broader pool.
+    if layer0_diags:
+        return layer0_diags + other_candidates + cluster_lines
+    return other_candidates + cluster_lines
+    return out
+
+
+def _format_arrow_line_candidates(lines, limit=8):
+    out = []
+    for i, ln in enumerate(list(lines or [])[:limit]):
+        try:
+            x1 = float(ln.get('x1', 0.0))
+            y1 = float(ln.get('y1', 0.0))
+            x2 = float(ln.get('x2', 0.0))
+            y2 = float(ln.get('y2', 0.0))
+            layer = str(ln.get('layer', '')).strip()
+            length = math.sqrt(((x2 - x1) ** 2) + ((y2 - y1) ** 2))
+            out.append("arrow_ln[{}] L={} ({:.0f},{:.0f})->({:.0f},{:.0f}) len={:.0f}".format(
+                i, layer, x1, y1, x2, y2, length))
+        except Exception:
+            pass
+    return out
+
+
+def _find_horizontal_opening_band(lines):
+    """Find a long horizontal opening/void band that splits the two runs."""
+    cands = []
+    for ln in (lines or []):
+        x1 = float(ln.get('x1', 0.0))
+        y1 = float(ln.get('y1', 0.0))
+        x2 = float(ln.get('x2', 0.0))
+        y2 = float(ln.get('y2', 0.0))
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        if dx < 60.0:
+            continue
+        if dy > max(3.0, dx * 0.08):
+            continue
+        cands.append({
+            "x_min": min(x1, x2),
+            "x_max": max(x1, x2),
+            "y": (y1 + y2) * 0.5,
+            "len": dx,
+        })
+    if len(cands) < 2:
+        return None
+
+    cands.sort(key=lambda it: it["y"])
+    best = None
+    for i in range(len(cands)):
+        a = cands[i]
+        for j in range(i + 1, len(cands)):
+            b = cands[j]
+            y_gap = abs(b["y"] - a["y"])
+            if y_gap < 12.0 or y_gap > 220.0:
+                continue
+            overlap_x = min(a["x_max"], b["x_max"]) - max(a["x_min"], b["x_min"])
+            min_len = min(a["len"], b["len"])
+            if overlap_x < max(40.0, min_len * 0.55):
+                continue
+            score = overlap_x - y_gap
+            if best is None or score > best["score"]:
+                best = {
+                    "x_min": max(a["x_min"], b["x_min"]),
+                    "x_max": min(a["x_max"], b["x_max"]),
+                    "y_min": min(a["y"], b["y"]),
+                    "y_max": max(a["y"], b["y"]),
+                    "score": score,
+                }
+    return best
+
+
+def _build_riser_band_from_lines(risers):
+    if not risers:
+        return None
+    xs = []
+    ys_mid = []
+    y_mins = []
+    y_maxs = []
+    lens = []
+    for ln in risers:
+        x1 = float(ln.get('x1', 0.0))
+        x2 = float(ln.get('x2', 0.0))
+        y1 = float(ln.get('y1', 0.0))
+        y2 = float(ln.get('y2', 0.0))
+        xs.append((x1 + x2) * 0.5)
+        ys_mid.append((y1 + y2) * 0.5)
+        y_mins.append(min(y1, y2))
+        y_maxs.append(max(y1, y2))
+        lens.append(abs(y2 - y1))
+    xs.sort()
+    return {
+        "lines": list(risers),
+        "x_min": min(xs),
+        "x_max": max(xs),
+        "y_mid": sum(ys_mid) / float(len(ys_mid)),
+        "y_min": min(y_mins),
+        "y_max": max(y_maxs),
+        "width_cm": sum(lens) / float(len(lens)),
+        "count": len(risers),
+    }
+
+
+def _analyze_u_stair_cluster(lines, raw_data=None):
+    """Detect a narrow office-standard U stair:
+    two horizontal run bands with repeated vertical risers, connected by an auto landing.
+    """
+    if not lines:
+        return None, "No stair lines in cluster"
+
+    risers = [ln for ln in lines if _is_vertical_riser_candidate(ln)]
+    bands = _cluster_riser_bands(risers)
+    if len(bands) != 2:
+        return None, "Expected 2 riser bands, found {}".format(len(bands))
+
+    lower = bands[0]
+    upper = bands[1]
+    if lower["count"] < 4 or upper["count"] < 4:
+        return None, "Not enough repeated risers in both runs"
+
+    overlap_x = min(lower["x_max"], upper["x_max"]) - max(lower["x_min"], upper["x_min"])
+    min_span = min(lower["x_max"] - lower["x_min"], upper["x_max"] - upper["x_min"])
+    if overlap_x < max(40.0, min_span * 0.55):
+        return None, (
+            "Two riser bands do not overlap enough in X to form a U stair "
+            "(lower_x=[{:.0f},{:.0f}] upper_x=[{:.0f},{:.0f}] overlap_x={:.0f} min_span={:.0f})"
+        ).format(
+            lower["x_min"], lower["x_max"],
+            upper["x_min"], upper["x_max"],
+            overlap_x, min_span,
+        )
+
+    gap_y = upper["y_min"] - lower["y_max"]
+    avg_width = (lower["width_cm"] + upper["width_cm"]) * 0.5
+    if gap_y <= 5.0:
+        opening = _find_horizontal_opening_band(lines)
+        if opening is None:
+            return None, (
+                "Gap between riser bands is not consistent with this U-stair pattern "
+                "(lower_y=[{:.0f},{:.0f}] upper_y=[{:.0f},{:.0f}] gap_y={:.0f} avg_width={:.0f}; no middle opening band found)"
+            ).format(
+                lower["y_min"], lower["y_max"],
+                upper["y_min"], upper["y_max"],
+                gap_y, avg_width,
+            )
+        top_risers = []
+        bot_risers = []
+        y_split = (opening["y_min"] + opening["y_max"]) * 0.5
+        for ln in risers:
+            y1 = float(ln.get('y1', 0.0))
+            y2 = float(ln.get('y2', 0.0))
+            y_mid = (y1 + y2) * 0.5
+            if y_mid >= y_split:
+                top_risers.append(ln)
+            else:
+                bot_risers.append(ln)
+        lower = _build_riser_band_from_lines(bot_risers)
+        upper = _build_riser_band_from_lines(top_risers)
+        if lower is None or upper is None or lower["count"] < 3 or upper["count"] < 3:
+            return None, (
+                "Found middle opening band but could not split risers into two runs "
+                "(opening_y=[{:.0f},{:.0f}] bottom_count={} top_count={})"
+            ).format(
+                opening["y_min"], opening["y_max"],
+                0 if lower is None else lower["count"],
+                0 if upper is None else upper["count"],
+            )
+        # For this stair type, the opening defines the actual separation between
+        # the two runs better than the riser-band midpoints do.
+        lower["y_mid"] = float(opening["y_min"]) - (float(lower["width_cm"]) * 0.5)
+        upper["y_mid"] = float(opening["y_max"]) + (float(upper["width_cm"]) * 0.5)
+        gap_y = upper["y_min"] - lower["y_max"]
+        avg_width = (lower["width_cm"] + upper["width_cm"]) * 0.5
+        opening_mode = True
+    else:
+        opening = None
+        opening_mode = False
+    if gap_y > max(220.0, avg_width * 2.2):
+        return None, (
+            "Gap between riser bands is not consistent with this U-stair pattern "
+            "(lower_y=[{:.0f},{:.0f}] upper_y=[{:.0f},{:.0f}] gap_y={:.0f} avg_width={:.0f} max_gap={:.0f})"
+        ).format(
+            lower["y_min"], lower["y_max"],
+            upper["y_min"], upper["y_max"],
+            gap_y, avg_width, max(220.0, avg_width * 2.2),
+        )
+
+    all_x = [float(ln.get('x1', 0.0)) for ln in lines] + [float(ln.get('x2', 0.0)) for ln in lines]
+    cluster_x_min = min(all_x)
+    cluster_x_max = max(all_x)
+    band_x_min = min(lower["x_min"], upper["x_min"])
+    band_x_max = max(lower["x_max"], upper["x_max"])
+    x_mid = (band_x_min + band_x_max) * 0.5
+    left_margin = band_x_min - cluster_x_min
+    right_margin = cluster_x_max - band_x_max
+
+    arrow_lines = _gather_stair_arrow_lines(raw_data, lines)
+    arrow_tip = _find_stair_arrow_tip(arrow_lines)
+    if arrow_tip is not None:
+        landing_side = "left" if arrow_tip[0] >= x_mid else "right"
+    else:
+        # If no arrow is found, prefer the side with the larger riser-free connector.
+        landing_side = "left"
+        if right_margin > (left_margin + 10.0):
+            landing_side = "right"
+
+    landing_x = (lower["x_min"] + upper["x_min"]) * 0.5 if landing_side == "left" else (lower["x_max"] + upper["x_max"]) * 0.5
+    far_x = (lower["x_max"] + upper["x_max"]) * 0.5 if landing_side == "left" else (lower["x_min"] + upper["x_min"]) * 0.5
+
+    lower_run_to_landing = {
+        "run_start_cm": (far_x, lower["y_mid"]),
+        "run_end_cm": (landing_x, lower["y_mid"]),
+        "width_cm": lower["width_cm"],
+        "length_cm": abs(far_x - landing_x),
+        "band_name": "lower",
+    }
+    lower_run_from_landing = {
+        "run_start_cm": (landing_x, lower["y_mid"]),
+        "run_end_cm": (far_x, lower["y_mid"]),
+        "width_cm": lower["width_cm"],
+        "length_cm": abs(far_x - landing_x),
+        "band_name": "lower",
+    }
+    upper_run_to_landing = {
+        "run_start_cm": (far_x, upper["y_mid"]),
+        "run_end_cm": (landing_x, upper["y_mid"]),
+        "width_cm": upper["width_cm"],
+        "length_cm": abs(far_x - landing_x),
+        "band_name": "upper",
+    }
+    upper_run_from_landing = {
+        "run_start_cm": (landing_x, upper["y_mid"]),
+        "run_end_cm": (far_x, upper["y_mid"]),
+        "width_cm": upper["width_cm"],
+        "length_cm": abs(far_x - landing_x),
+        "band_name": "upper",
+    }
+
+    # Use the arrow head as the end of climb. The band nearest the arrow tip is
+    # treated as the second run; the other band becomes the first run.
+    if arrow_tip is not None:
+        lower_dy = abs(arrow_tip[1] - lower["y_mid"])
+        upper_dy = abs(arrow_tip[1] - upper["y_mid"])
+        second_is_upper = upper_dy <= lower_dy
+    else:
+        second_is_upper = True
+
+    if second_is_upper:
+        # Upper band is the top of the climb — first run on lower band, second on upper.
+        run1 = lower_run_to_landing
+        run2 = upper_run_from_landing
+        climb_end_band = "upper"
+        run_order_mode = "lower_first"
+    else:
+        # Lower band is the top of the climb — first run on upper band, second on lower.
+        run1 = upper_run_to_landing
+        run2 = lower_run_from_landing
+        climb_end_band = "lower"
+        run_order_mode = "upper_first"
+
+    tread_count = max(2, lower["count"] + upper["count"])
+    return {
+        "kind": "u_two_run_auto_landing",
+        "width_cm": avg_width,
+        "length_cm": abs(far_x - landing_x),
+        "tread_count": tread_count,
+        "landing_side": landing_side,
+        "arrow_tip_cm": arrow_tip,
+        "arrow_line_count": len(arrow_lines or []),
+        "arrow_line_debug": _format_arrow_line_candidates(arrow_lines, limit=10),
+        "climb_end_band": climb_end_band,
+        "run_order_mode": run_order_mode,
+        "opening_mode": opening_mode,
+        "opening_y_min": None if opening is None else float(opening["y_min"]),
+        "opening_y_max": None if opening is None else float(opening["y_max"]),
+        "lower_center_y": float(lower["y_mid"]),
+        "upper_center_y": float(upper["y_mid"]),
+        "landing_x_cm": float(landing_x),
+        "far_x_cm": float(far_x),
+        "cluster_x_min_cm": float(cluster_x_min),
+        "cluster_x_max_cm": float(cluster_x_max),
+        "runs": [run1, run2],
+    }, None
+
+
+def _stair_input_dialog(default_height_cm=306, default_risers=18, default_width_cm=120):
+    """WinForms dialog: floor-to-floor height, number of risers, and run width.
+    Returns (height_cm, num_risers, width_cm) or None if cancelled.
     """
     try:
         import clr
@@ -3244,7 +3799,7 @@ def _stair_input_dialog(default_height_cm=306, default_risers=18):
 
         form = Form()
         form.Text = "Stair Parameters"
-        form.ClientSize = Size(290, 135)
+        form.ClientSize = Size(290, 170)
         form.FormBorderStyle = FormBorderStyle.FixedDialog
         form.StartPosition = FormStartPosition.CenterScreen
         form.MaximizeBox = False
@@ -3274,9 +3829,21 @@ def _stair_input_dialog(default_height_cm=306, default_risers=18):
         txt_r.Size = Size(75, 20)
         form.Controls.Add(txt_r)
 
+        lbl_w = Label()
+        lbl_w.Text = "Run width (cm):"
+        lbl_w.Location = Point(10, 85)
+        lbl_w.Size = Size(175, 20)
+        form.Controls.Add(lbl_w)
+
+        txt_w = TextBox()
+        txt_w.Text = str(int(round(float(default_width_cm or 120))))
+        txt_w.Location = Point(195, 82)
+        txt_w.Size = Size(75, 20)
+        form.Controls.Add(txt_w)
+
         btn_ok = Button()
         btn_ok.Text = "OK"
-        btn_ok.Location = Point(75, 95)
+        btn_ok.Location = Point(75, 125)
         btn_ok.Size = Size(65, 26)
         btn_ok.DialogResult = DialogResult.OK
         form.AcceptButton = btn_ok
@@ -3284,7 +3851,7 @@ def _stair_input_dialog(default_height_cm=306, default_risers=18):
 
         btn_cancel = Button()
         btn_cancel.Text = "Cancel"
-        btn_cancel.Location = Point(155, 95)
+        btn_cancel.Location = Point(155, 125)
         btn_cancel.Size = Size(65, 26)
         btn_cancel.DialogResult = DialogResult.Cancel
         form.CancelButton = btn_cancel
@@ -3294,12 +3861,13 @@ def _stair_input_dialog(default_height_cm=306, default_risers=18):
             try:
                 h = float(txt_h.Text.strip().replace(',', '.'))
                 r = int(float(txt_r.Text.strip()))
-                return h, r
+                w = float(txt_w.Text.strip().replace(',', '.'))
+                return h, r, w
             except Exception:
-                return float(default_height_cm), int(default_risers)
+                return float(default_height_cm), int(default_risers), float(default_width_cm)
         return None
     except Exception:
-        return float(default_height_cm), int(default_risers)
+        return float(default_height_cm), int(default_risers), float(default_width_cm)
 
 
 def _find_or_create_top_level(v2, base_level, floor_height_ft, snapshot=None):
@@ -3338,43 +3906,255 @@ def _find_or_create_top_level(v2, base_level, floor_height_ft, snapshot=None):
         return None
 
 
-def _create_stairs_from_markers(v2, level, markers, num_risers, floor_height_cm, snapshot=None):
-    """Create Revit stair elements from detected stair markers."""
-    from Autodesk.Revit.DB import Line, XYZ, BuiltInParameter
+def _set_param_by_bip_names(elem, bip_names, value, snapshot=None, label=None):
+    try:
+        from Autodesk.Revit.DB import BuiltInParameter
+        for bip_name in bip_names:
+            try:
+                bip = getattr(BuiltInParameter, bip_name)
+            except Exception:
+                continue
+            try:
+                p = elem.get_Parameter(bip)
+            except Exception:
+                p = None
+            if p is not None and not p.IsReadOnly:
+                p.Set(value)
+                if snapshot:
+                    try:
+                        snapshot.log("{} set {}={:.3f}ft".format(label or "param", bip_name, value))
+                    except Exception:
+                        pass
+                return True
+    except Exception:
+        pass
+    return False
 
-    # Use getattr on the module — IronPython's 'from ... import' can silently
-    # Use getattr on the module — IronPython's 'from ... import' silently fails
-    # for some CLR types. StairsEditScope was removed in Revit 2025.
+
+def _set_param_by_definition_names(elem, definition_names, value, snapshot=None, label=None):
+    wanted = {}
+    for name in definition_names:
+        wanted[str(name).strip().lower()] = name
+    try:
+        for p in elem.Parameters:
+            try:
+                p_name = str(p.Definition.Name).strip().lower()
+            except Exception:
+                continue
+            if p_name in wanted and not p.IsReadOnly:
+                p.Set(value)
+                if snapshot:
+                    try:
+                        snapshot.log("{} set '{}'={:.3f}ft".format(label or "param", wanted[p_name], value))
+                    except Exception:
+                        pass
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _set_stair_run_relative_heights(run, base_z_ft, top_z_ft, snapshot=None, stair_index=0, run_index=0):
+    label = "Stair[{}] run[{}]".format(stair_index, run_index)
+    base_ok = _set_param_by_bip_names(
+        run,
+        [
+            "STAIRS_RUN_RELATIVE_BASE_HEIGHT",
+            "STAIRS_RUN_BASE_HEIGHT",
+            "STAIRS_RUN_BASE_ELEVATION",
+        ],
+        base_z_ft,
+        snapshot,
+        label + " base",
+    )
+    top_ok = _set_param_by_bip_names(
+        run,
+        [
+            "STAIRS_RUN_RELATIVE_TOP_HEIGHT",
+            "STAIRS_RUN_TOP_HEIGHT",
+            "STAIRS_RUN_TOP_ELEVATION",
+        ],
+        top_z_ft,
+        snapshot,
+        label + " top",
+    )
+
+    if not base_ok:
+        base_ok = _set_param_by_definition_names(
+            run,
+            ["Relative Base Height", "Base Height", "Base Elevation"],
+            base_z_ft,
+            snapshot,
+            label + " base",
+        )
+    if not top_ok:
+        top_ok = _set_param_by_definition_names(
+            run,
+            ["Relative Top Height", "Top Height", "Top Elevation"],
+            top_z_ft,
+            snapshot,
+            label + " top",
+        )
+
+    if snapshot and (not base_ok or not top_ok):
+        try:
+            snapshot.log("{} relative height set incomplete: base_ok={} top_ok={}".format(
+                label, base_ok, top_ok))
+        except Exception:
+            pass
+    return base_ok and top_ok
+
+
+def _unit_xy(dx, dy):
+    length = math.sqrt((dx * dx) + (dy * dy))
+    if length <= 0.0001:
+        return None
+    return (dx / length, dy / length)
+
+
+def _create_connector_sketch_landing(v2, StairsLanding, stairsId, run_defs, run_width_cm,
+                                     landing_z_ft, snapshot=None, stair_index=0):
+    """Fallback sketched landing built from the two run connection endpoints."""
+    if len(run_defs) < 2:
+        raise Exception("Need two run definitions for connector landing")
+
+    first = run_defs[0]
+    second = run_defs[1]
+    s0 = first['run_start_cm']
+    e0 = first['run_end_cm']
+    s1 = second['run_start_cm']
+    e1 = second['run_end_cm']
+
+    conn_dx = float(s1[0]) - float(e0[0])
+    conn_dy = float(s1[1]) - float(e0[1])
+    conn = _unit_xy(conn_dx, conn_dy)
+    if conn is None:
+        raise Exception("Connector landing endpoints are coincident")
+    conn_len_cm = math.sqrt((conn_dx * conn_dx) + (conn_dy * conn_dy))
+
+    # The landing depth points into the turn: toward the first run endpoint and
+    # opposite the second run direction. This handles both horizontal and
+    # vertical U-stairs without hard-coded axes.
+    d0 = _unit_xy(float(e0[0]) - float(s0[0]), float(e0[1]) - float(s0[1]))
+    d1 = _unit_xy(float(e1[0]) - float(s1[0]), float(e1[1]) - float(s1[1]))
+    if d0 is None or d1 is None:
+        raise Exception("Cannot resolve run directions for connector landing")
+    depth = _unit_xy(d0[0] - d1[0], d0[1] - d1[1])
+    if depth is None:
+        depth = (-conn[1], conn[0])
+
+    # Guard against a footprint that is clearly not a stair landing.
+    rw_cm = float(run_width_cm)
+    if rw_cm < 40.0:
+        rw_cm = 40.0
+    if rw_cm > 240.0:
+        rw_cm = 240.0
+    if conn_len_cm < 20.0 or conn_len_cm > max(600.0, rw_cm * 5.0):
+        raise Exception("Connector landing span is implausible: {:.1f}cm".format(conn_len_cm))
+
+    half_span_extra_cm = (rw_cm * 0.5) + 2.0
+    depth_cm = rw_cm
+    p0 = (
+        float(e0[0]) - (conn[0] * half_span_extra_cm),
+        float(e0[1]) - (conn[1] * half_span_extra_cm),
+    )
+    p1 = (
+        float(s1[0]) + (conn[0] * half_span_extra_cm),
+        float(s1[1]) + (conn[1] * half_span_extra_cm),
+    )
+    p2 = (
+        p1[0] + (depth[0] * depth_cm),
+        p1[1] + (depth[1] * depth_cm),
+    )
+    p3 = (
+        p0[0] + (depth[0] * depth_cm),
+        p0[1] + (depth[1] * depth_cm),
+    )
+
+    if snapshot:
+        try:
+            snapshot.log(
+                "Stair[{}] sketched connector landing cm p0=({:.1f},{:.1f}) p1=({:.1f},{:.1f}) p2=({:.1f},{:.1f}) p3=({:.1f},{:.1f}) z={:.3f}ft".format(
+                    stair_index,
+                    p0[0], p0[1], p1[0], p1[1], p2[0], p2[1], p3[0], p3[1],
+                    landing_z_ft))
+        except Exception:
+            pass
+
+    from Autodesk.Revit.DB import Line, XYZ
+    from System.Collections.Generic import List as _NetList
+    from Autodesk.Revit.DB import Curve as _Curve
+    from Autodesk.Revit.DB import CurveLoop as _CurveLoop
+
+    pts = [
+        XYZ(v2.cm_to_ft(p0[0]), v2.cm_to_ft(p0[1]), landing_z_ft),
+        XYZ(v2.cm_to_ft(p1[0]), v2.cm_to_ft(p1[1]), landing_z_ft),
+        XYZ(v2.cm_to_ft(p2[0]), v2.cm_to_ft(p2[1]), landing_z_ft),
+        XYZ(v2.cm_to_ft(p3[0]), v2.cm_to_ft(p3[1]), landing_z_ft),
+    ]
+    segs = [
+        Line.CreateBound(pts[0], pts[1]),
+        Line.CreateBound(pts[1], pts[2]),
+        Line.CreateBound(pts[2], pts[3]),
+        Line.CreateBound(pts[3], pts[0]),
+    ]
+    net_segs = _NetList[_Curve]()
+    for seg in segs:
+        net_segs.Add(seg)
+    cl = _CurveLoop.Create(net_segs)
+    return StairsLanding.CreateSketchedLanding(v2.doc, stairsId, cl, landing_z_ft)
+
+
+def _create_stairs_from_markers(v2, level, markers, num_risers, floor_height_cm, run_width_cm=None, snapshot=None):
+    """Create Revit stair elements from detected stair markers."""
+    from Autodesk.Revit.DB import Line, XYZ, BuiltInParameter, Transaction
+
+    # Resolve stair API types from the loaded Revit assemblies instead of relying
+    # on a single namespace import. Revit 2025 still exposes StairsEditScope,
+    # but it is documented under Autodesk.Revit.DB rather than Architecture.
     StairsEditScope = None
     StairsRun = None
     StairsRunJustification = None
     try:
+        import Autodesk.Revit.DB as _db
+        StairsEditScope = getattr(_db, 'StairsEditScope', None)
+    except Exception:
+        pass
+    try:
         import Autodesk.Revit.DB.Architecture as _arch
-        StairsEditScope = getattr(_arch, 'StairsEditScope', None)
         StairsRun = getattr(_arch, 'StairsRun', None)
         StairsRunJustification = getattr(_arch, 'StairsRunJustification', None)
+        if StairsEditScope is None:
+            StairsEditScope = getattr(_arch, 'StairsEditScope', None)
+    except Exception:
+        pass
+    try:
+        import Autodesk.Revit.DB as _db
+        if StairsRun is None:
+            StairsRun = getattr(_db, 'StairsRun', None)
+        if StairsRunJustification is None:
+            StairsRunJustification = getattr(_db, 'StairsRunJustification', None)
     except Exception:
         pass
 
     if StairsEditScope is None:
-        # Confirmed absent in Revit 2025: StairsEditScope was removed and no public
-        # factory replacement exists. Stairs creation is not supported on this Revit version.
         if snapshot:
             try:
-                snapshot.log("Stairs creation skipped: StairsEditScope not available (Revit 2025+)")
+                snapshot.log("Stairs creation skipped: StairsEditScope not available")
             except Exception:
                 pass
         return []
 
-    if StairsRun is None:
+    if StairsRun is None or StairsRunJustification is None:
         if snapshot:
             try:
-                snapshot.log("Stairs creation skipped: StairsRun not available")
+                snapshot.log("Stairs creation skipped: stair run API types not available")
             except Exception:
                 pass
         return []
 
     stair_ids = []
+    stair_errors = []
     floor_height_ft = v2.cm_to_ft(float(floor_height_cm))
 
     top_level = _find_or_create_top_level(v2, level, floor_height_ft, snapshot)
@@ -3386,20 +4166,30 @@ def _create_stairs_from_markers(v2, level, markers, num_risers, floor_height_cm,
 
     for i, mk in enumerate(markers):
         scope = None
+        tx = None
         committed = False
         try:
-            s = mk['run_start_cm']
-            e = mk['run_end_cm']
-            start_pt = XYZ(v2.cm_to_ft(s[0]), v2.cm_to_ft(s[1]), 0.0)
-            end_pt = XYZ(v2.cm_to_ft(e[0]), v2.cm_to_ft(e[1]), 0.0)
-            if start_pt.DistanceTo(end_pt) < 0.1:
+            if mk.get("skip_stairs"):
+                stair_errors.append("Stair[{}]: {}".format(i, mk.get("reason", "Unsupported stair geometry")))
+                if snapshot:
+                    try:
+                        snapshot.log("Stair[{}] skipped: {}".format(i, mk.get("reason", "Unsupported stair geometry")))
+                    except Exception:
+                        pass
                 continue
 
-            run_line = Line.CreateBound(start_pt, end_pt)
-            width_ft = v2.cm_to_ft(float(mk['width_cm']))
+            run_defs = list(mk.get('runs') or [])
+            if not run_defs:
+                run_defs = [{
+                    "run_start_cm": mk['run_start_cm'],
+                    "run_end_cm": mk['run_end_cm'],
+                    "width_cm": mk['width_cm'],
+                }]
 
             scope = StairsEditScope(v2.doc, "C2Rv7 Create Stairs")
             stairsId = scope.Start(level.Id, top_level.Id)
+            tx = Transaction(v2.doc, "C2Rv7 Create Stair Run")
+            tx.Start()
             stairs_elem = v2.doc.GetElement(stairsId)
             if stairs_elem is not None:
                 try:
@@ -3409,26 +4199,148 @@ def _create_stairs_from_markers(v2, level, markers, num_risers, floor_height_cm,
                         p.Set(num_risers)
                 except Exception:
                     pass
-            run = StairsRun.CreateStraightRun(v2.doc, stairsId, run_line, jus)
-            if run is not None:
+            created_run_count = 0
+            created_run_ids = []
+            risers_run1 = num_risers // 2
+            landing_z_ft = floor_height_ft * risers_run1 / float(num_risers)
+            for run_idx, run_def in enumerate(run_defs):
+                base_z_ft = 0.0 if run_idx == 0 else landing_z_ft
+                top_z_ft = landing_z_ft if run_idx == 0 else floor_height_ft
+                s = run_def['run_start_cm']
+                e = run_def['run_end_cm']
+                start_pt = XYZ(v2.cm_to_ft(s[0]), v2.cm_to_ft(s[1]), base_z_ft)
+                end_pt = XYZ(v2.cm_to_ft(e[0]), v2.cm_to_ft(e[1]), base_z_ft)
+                if start_pt.DistanceTo(end_pt) < 0.1:
+                    continue
+                run_line = Line.CreateBound(start_pt, end_pt)
+                width_cm = float(run_width_cm if run_width_cm is not None else run_def.get('width_cm', mk['width_cm']))
+                width_ft = v2.cm_to_ft(width_cm)
+                if snapshot:
+                    try:
+                        snapshot.log(
+                            "Stair[{}] create run[{}] base_z={:.3f}ft top_z={:.3f}ft start=({:.1f},{:.1f})cm end=({:.1f},{:.1f})cm width={:.1f}cm".format(
+                                i, run_idx, base_z_ft, top_z_ft,
+                                float(s[0]), float(s[1]), float(e[0]), float(e[1]), width_cm))
+                    except Exception:
+                        pass
+                run = StairsRun.CreateStraightRun(v2.doc, stairsId, run_line, jus)
+                if run is not None:
+                    created_run_count += 1
+                    try:
+                        created_run_ids.append(run.Id)
+                    except Exception:
+                        pass
+                    try:
+                        run.ActualRunWidth = width_ft
+                    except Exception:
+                        pass
+                    try:
+                        _set_stair_run_relative_heights(run, base_z_ft, top_z_ft, snapshot, i, run_idx)
+                    except Exception as rh_ex:
+                        if snapshot:
+                            try:
+                                snapshot.log("Stair[{}] run[{}] relative height error: {}".format(
+                                    i, run_idx, rh_ex))
+                            except Exception:
+                                pass
+            if created_run_count <= 0:
+                raise Exception("No stair runs were created from the detected marker")
+            if created_run_count >= 2 and len(created_run_ids) >= 2 and mk.get('kind') == 'u_two_run_auto_landing':
+                StairsLanding = None
                 try:
-                    run.ActualRunWidth = width_ft
+                    import Autodesk.Revit.DB.Architecture as _arch2
+                    StairsLanding = getattr(_arch2, 'StairsLanding', None)
                 except Exception:
                     pass
-            scope.Commit(None)
+                if StairsLanding is None:
+                    try:
+                        import Autodesk.Revit.DB as _db2
+                        StairsLanding = getattr(_db2, 'StairsLanding', None)
+                    except Exception:
+                        pass
+                if StairsLanding is not None:
+                    auto_ok = False
+                    auto_error = None
+                    try:
+                        can_auto = True
+                        try:
+                            can_auto = StairsLanding.CanCreateAutomaticLanding(
+                                v2.doc, created_run_ids[0], created_run_ids[1])
+                        except Exception as can_ex:
+                            if snapshot:
+                                try:
+                                    snapshot.log("Stair[{}] automatic landing precheck unavailable: {}".format(
+                                        i, can_ex))
+                                except Exception:
+                                    pass
+                        if can_auto:
+                            landing_ids = StairsLanding.CreateAutomaticLanding(
+                                v2.doc, created_run_ids[0], created_run_ids[1])
+                            landing_count = 0
+                            try:
+                                landing_count = landing_ids.Count
+                            except Exception:
+                                try:
+                                    landing_count = len(landing_ids)
+                                except Exception:
+                                    landing_count = 1 if landing_ids is not None else 0
+                            auto_ok = landing_count > 0
+                            if snapshot:
+                                try:
+                                    snapshot.log("Stair[{}] automatic landing created {} component(s)".format(
+                                        i, landing_count))
+                                except Exception:
+                                    pass
+                        else:
+                            auto_error = "CanCreateAutomaticLanding returned False"
+                    except Exception as auto_ex:
+                        auto_error = str(auto_ex)
+                    if not auto_ok:
+                        if snapshot:
+                            try:
+                                snapshot.log("Stair[{}] automatic landing failed: {}".format(
+                                    i, auto_error or "unknown error"))
+                            except Exception:
+                                pass
+                        try:
+                            rw_cm = float(run_width_cm if run_width_cm is not None else mk['width_cm'])
+                            _create_connector_sketch_landing(
+                                v2, StairsLanding, stairsId, run_defs, rw_cm,
+                                landing_z_ft, snapshot, i)
+                        except Exception as sk_ex:
+                            if snapshot:
+                                try:
+                                    snapshot.log("Connector sketched landing failed: {}".format(sk_ex))
+                                except Exception:
+                                    pass
+                            try:
+                                TaskDialog.Show("C2Rv7_C Landing", "Connector landing error: {}".format(sk_ex))
+                            except Exception:
+                                pass
+            tx.Commit()
+            tx = None
+            scope.Commit(_ContinueFailuresPreprocessor())
             committed = True
             stair_ids.append(stairsId.IntegerValue)
 
             if snapshot:
                 try:
-                    snapshot.log("Stair[{}] created: width={:.0f}cm length={:.0f}cm risers={}".format(
-                        i, mk['width_cm'], mk['length_cm'], num_risers))
+                    snapshot.log("Stair[{}] created: kind={} runs={} width={:.0f}cm length={:.0f}cm risers={}".format(
+                        i, mk.get("kind", "single_run"), len(run_defs),
+                        float(run_width_cm if run_width_cm is not None else mk['width_cm']),
+                        mk['length_cm'], num_risers))
                 except Exception:
                     pass
         except Exception as ex:
+            if tx is not None:
+                try:
+                    tx.RollBack()
+                except Exception:
+                    pass
+            stair_errors.append("Stair[{}]: {}: {}".format(i, type(ex).__name__, ex))
             if snapshot:
                 try:
-                    snapshot.log("Stair[{}] creation error: {}".format(i, ex))
+                    snapshot.log("Stair[{}] creation error: {}: {}".format(i, type(ex).__name__, ex))
                 except Exception:
                     pass
         finally:
@@ -3442,6 +4354,17 @@ def _create_stairs_from_markers(v2, level, markers, num_risers, floor_height_cm,
                     scope.Dispose()
                 except Exception:
                     pass
+
+    if stair_errors:
+        try:
+            TaskDialog.Show(
+                "C2Rv7_C Stairs",
+                "Detected {} stair marker(s).\n\n{}".format(
+                    len(markers), "\n".join(stair_errors[:4])
+                ),
+            )
+        except Exception:
+            pass
 
     return stair_ids
 
@@ -3607,16 +4530,17 @@ def _create_rooms_and_tags(v2, level, snapshot=None):
 
 
 def _create_exterior_dimensions(v2, level, wall_ids, door_ids, window_ids,
-                                ext_thick_cm, snapshot=None):
-    """Create 3 rows of dimension chains parallel to each exterior wall side.
+                                ext_thick_cm, snapshot=None,
+                                cfg=None, llm_qa=None, int_wall_ids=None):
+    """Create dimension chains parallel to each exterior wall side, plus interior wall lengths.
+
+    Without LLM decisions (default): 3 rows per side — openings, segments, overall.
+    With LLM decisions (cfg+llm_qa provided and enabled): Claude decides per side which rows
+    to create, filters short segments, and selects which interior walls to dimension.
 
     Row 1 (closest):  Opening dimensions — measures each door/window.
-                       Only created if the side has openings.
-                       Chain runs from side start to side end.
-    Row 2:            Segment dimensions — measures each wall segment.
+    Row 2:            Segment dimensions — measures each wall segment break.
     Row 3 (farthest): Overall dimension of the entire side.
-
-    Rows are spaced at equal intervals outward from the exterior face.
     """
     from Autodesk.Revit.DB import (
         Options, XYZ, Line, ReferenceArray, ViewPlan, Transaction,
@@ -3797,6 +4721,53 @@ def _create_exterior_dimensions(v2, level, wall_ids, door_ids, window_ids,
             })
         except Exception:
             continue
+
+    # --- Collect interior wall geometry for LLM and for interior dim creation ---
+    int_walls_data = []
+    for iwid in (int_wall_ids or []):
+        try:
+            iwall = v2.doc.GetElement(ElementId(iwid))
+            if iwall is None:
+                continue
+            curve = iwall.Location.Curve
+            p0 = curve.GetEndPoint(0)
+            p1 = curve.GetEndPoint(1)
+            dx = p1.X - p0.X
+            dy = p1.Y - p0.Y
+            length = (dx * dx + dy * dy) ** 0.5
+            if length < 0.01:
+                continue
+            dir_x = dx / length
+            dir_y = dy / length
+            int_walls_data.append({
+                "id": iwid, "wall": iwall,
+                "p0": (p0.X, p0.Y), "p1": (p1.X, p1.Y),
+                "mid": ((p0.X + p1.X) / 2.0, (p0.Y + p1.Y) / 2.0),
+                "dir": (dir_x, dir_y),
+                "length": length,
+            })
+        except Exception:
+            continue
+
+    # --- Ask Claude which sides/rows/walls to dimension (optional, requires API key) ---
+    decisions = None
+    if llm_qa is not None and cfg is not None:
+        try:
+            decisions = llm_qa.plan_dimension_decisions(
+                cfg, cardinal_groups, int_walls_data, opening_by_wall, snapshot=snapshot)
+        except Exception as _dec_ex:
+            if snapshot:
+                try:
+                    snapshot.log("DIM decisions error: {}".format(_dec_ex))
+                except Exception:
+                    pass
+
+    min_segment_ft = 0.0
+    if decisions:
+        try:
+            min_segment_ft = v2.cm_to_ft(float(decisions.get("min_segment_cm") or 0.0))
+        except Exception:
+            min_segment_ft = 0.0
 
     # --- Dimension spacing ---
     row_spacing_ft = v2.cm_to_ft(90.0)   # 90cm from outer wall and between detail rows
@@ -4039,20 +5010,49 @@ def _create_exterior_dimensions(v2, level, wall_ids, door_ids, window_ids,
                     except Exception:
                         pass
 
+                # --- Apply LLM row decisions and min-segment filter ---
+                side_rows = None
+                if decisions:
+                    side_dec = (decisions.get("exterior") or {}).get(card_key)
+                    if isinstance(side_dec, dict):
+                        side_rows = set(side_dec.get("rows") or [])
+                        if snapshot:
+                            try:
+                                snapshot.log("DIM[%s] LLM rows=%s reason=%s" % (
+                                    card_key,
+                                    list(side_rows),
+                                    side_dec.get("reason", ""),
+                                ))
+                            except Exception:
+                                pass
+
+                if side_rows is None:
+                    # No LLM opinion — use default all-rows behavior
+                    side_rows = {"openings", "segments", "overall"}
+
+                # Prune intermediate seg_refs that create segments shorter than min_segment_ft
+                if min_segment_ft > 0.0 and len(seg_refs) > 2:
+                    pruned = [seg_refs[0]]
+                    for _k in range(1, len(seg_refs) - 1):
+                        if seg_refs[_k][0] - pruned[-1][0] >= min_segment_ft:
+                            pruned.append(seg_refs[_k])
+                    pruned.append(seg_refs[-1])
+                    seg_refs = pruned
+
                 cur_offset = row_spacing_ft  # first row 90cm from outer wall
 
-                # Row 1: Opening dimensions (only if openings exist on this side)
-                if has_openings and len(side_opening_refs) >= 2:
+                # Row 1: Opening dimensions (only if openings exist and LLM agrees)
+                if "openings" in side_rows and has_openings and len(side_opening_refs) >= 2:
                     _place_dim(side_opening_refs, cur_offset)
                     cur_offset += row_spacing_ft
 
-                # Row 2: Segment dimensions (only if more than one segment)
-                if len(seg_refs) >= 3:
+                # Row 2: Segment dimensions (only if more than one segment and LLM agrees)
+                if "segments" in side_rows and len(seg_refs) >= 3:
                     _place_dim(seg_refs, cur_offset)
                     cur_offset += overall_gap_ft  # 50cm gap to overall
 
-                # Row 3: Overall dimension (always — start to end)
-                if len(seg_refs) >= 2:
+                # Row 3: Overall dimension (if LLM agrees)
+                if "overall" in side_rows and len(seg_refs) >= 2:
                     overall = [seg_refs[0], seg_refs[-1]]
                     _place_dim(overall, cur_offset)
 
@@ -4064,6 +5064,64 @@ def _create_exterior_dimensions(v2, level, wall_ids, door_ids, window_ids,
                     except Exception:
                         pass
                 continue
+
+        # --- Interior wall dimensions (LLM-guided) ---
+        # For each interior wall Claude approved, create a chain along the wall's length,
+        # offset perpendicular to the wall on the side facing away from the building centroid.
+        int_offset_ft = v2.cm_to_ft(60.0)
+        int_dims_created = 0
+        int_decisions = (decisions or {}).get("interior") or {}
+        for _i, _iw in enumerate(int_walls_data):
+            _label = "I{}".format(_i)
+            _dec = int_decisions.get(_label)
+            # Require explicit LLM approval; skip if no decisions or not approved
+            if not isinstance(_dec, dict) or not _dec.get("dimension"):
+                continue
+            try:
+                _dir = _iw["dir"]
+                _end_refs = _wall_faces_by_normal(_iw["wall"], _dir)
+                if len(_end_refs) < 2:
+                    continue
+                _ra = ReferenceArray()
+                _ra.Append(_end_refs[0][1])
+                _ra.Append(_end_refs[-1][1])
+                if _ra.Size < 2:
+                    continue
+                # Perpendicular outward from centroid
+                _mid = _iw["mid"]
+                _perp = (-_dir[1], _dir[0])
+                _to_c = (centroid[0] - _mid[0], centroid[1] - _mid[1])
+                if _perp[0] * _to_c[0] + _perp[1] * _to_c[1] > 0:
+                    _perp = (_dir[1], -_dir[0])
+                _base = _perp[0] * _mid[0] + _perp[1] * _mid[1]
+                _off = _base + int_offset_ft
+                _dim_line = Line.CreateBound(
+                    XYZ(_perp[0] * _off + _dir[0] * (-500.0),
+                        _perp[1] * _off + _dir[1] * (-500.0), 0.0),
+                    XYZ(_perp[0] * _off + _dir[0] * 500.0,
+                        _perp[1] * _off + _dir[1] * 500.0, 0.0),
+                )
+                _dim = v2.doc.Create.NewDimension(plan_view, _dim_line, _ra)
+                if _dim is not None:
+                    dim_ids.append(_dim.Id.IntegerValue)
+                    int_dims_created += 1
+                    if snapshot:
+                        try:
+                            snapshot.log("INT DIM %s ok: %s" % (_label, _dec.get("reason", "")))
+                        except Exception:
+                            pass
+            except Exception as _int_ex:
+                if snapshot:
+                    try:
+                        snapshot.log("INT DIM %s EXCEPTION: %s" % (_label, _int_ex))
+                    except Exception:
+                        pass
+
+        if snapshot and int_dims_created:
+            try:
+                snapshot.log("Interior dims created: {}".format(int_dims_created))
+            except Exception:
+                pass
 
         t.Commit()
     except Exception as ex:
@@ -4343,9 +5401,8 @@ def _apply_layer_first_wall_mode(v2, selected_import):
             except Exception:
                 pass
 
-        # Auto-enable QA when the API key is available.
-        if _os.environ.get("ANTHROPIC_API_KEY"):
-            cfg["llm_qa_enabled"] = True
+        # LLM QA disabled — set to True to re-enable (incurs Anthropic API charges).
+        cfg["llm_qa_enabled"] = True
 
         llm_qa = _load_llm_qa()
         qa_report = {
@@ -4702,11 +5759,18 @@ def _apply_layer_first_wall_mode(v2, selected_import):
         stair_ids = []
         stair_markers = _detect_stair_markers(raw_data, snapshot)
         if stair_markers:
-            stair_params = _stair_input_dialog(306, 18)
+            default_stair_width_cm = 120.0
+            try:
+                valid_widths = [float(mk.get("width_cm", 0.0)) for mk in stair_markers if float(mk.get("width_cm", 0.0)) > 1.0]
+                if valid_widths:
+                    default_stair_width_cm = sum(valid_widths) / float(len(valid_widths))
+            except Exception:
+                pass
+            stair_params = _stair_input_dialog(306, 18, default_stair_width_cm)
             if stair_params is not None:
-                floor_h_cm, n_risers = stair_params
+                floor_h_cm, n_risers, run_width_cm = stair_params
                 stair_ids = _create_stairs_from_markers(
-                    v2, level, stair_markers, n_risers, floor_h_cm, snapshot)
+                    v2, level, stair_markers, n_risers, floor_h_cm, run_width_cm, snapshot)
 
         # =======================================================================
         # STEP 3 — FLOORS
@@ -4748,7 +5812,8 @@ def _apply_layer_first_wall_mode(v2, selected_import):
         if td_dim.Show() == TaskDialogResult.Yes:
             dim_ids = _create_exterior_dimensions(
                 v2, level, wall_ids, door_ids, window_ids,
-                ext_thick_cm, snapshot)
+                ext_thick_cm, snapshot,
+                cfg=cfg, llm_qa=llm_qa, int_wall_ids=internal_wall_ids)
 
         if snapshot is not None:
             try:

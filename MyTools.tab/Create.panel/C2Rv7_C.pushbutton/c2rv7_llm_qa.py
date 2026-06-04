@@ -1052,3 +1052,291 @@ def validate_wall_completeness(cfg, ext_centerlines, int_centerlines, snapshot=N
     }
     _save_json(snapshot, "llm_qa_completeness.json", out)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Hook 5: dimension plan decisions
+# ---------------------------------------------------------------------------
+
+_SIDE_COLORS = {
+    "N": "#C040C0",
+    "S": "#E06020",
+    "E": "#207820",
+    "W": "#20A0C0",
+}
+
+DIMENSION_SYSTEM = (
+    "You are an experienced Israeli architect and senior drafter reviewing a floor plan "
+    "that is about to receive automatic Revit annotations. Decide what needs to be "
+    "dimensioned — like a real drafter preparing permit drawings, not a machine that "
+    "blindly dimensions everything. Think about what a contractor needs to build from "
+    "and what Israeli permit authorities need to verify."
+)
+
+
+def _dim_decisions_user_text(n_int_walls):
+    int_desc = ""
+    if n_int_walls > 0:
+        labels = ", ".join("I{}".format(i) for i in range(min(n_int_walls, 20)))
+        if n_int_walls > 20:
+            labels += ", ..."
+        int_desc = (
+            "\nInterior walls are labeled in blue: {}.\n"
+            "For each, decide if it needs a dimension showing its length.\n"
+            "Keep walls that define room/corridor widths or structural offsets. "
+            "Skip trivially short stubs.\n"
+        ).format(labels)
+
+    return (
+        "The rendered floor plan shows:\n"
+        "- Exterior walls by side: North (magenta), South (orange), East (green), West (cyan)\n"
+        "- Door/window positions: red crosses\n"
+        + int_desc
+        + "\nFor each exterior side, choose which dimension rows to include:\n"
+        "  'openings' - individual door/window widths (only if openings exist on this side)\n"
+        "  'segments' - wall-break dimensions along the facade\n"
+        "  'overall'  - total building length on this side\n"
+        "\nAlso pick min_segment_cm: shortest facade break worth dimensioning (typical 20-40).\n\n"
+        "Respond with ONLY this JSON (include all 4 cardinal keys even if a side has no walls):\n"
+        "{\n"
+        "  \"exterior\": {\n"
+        "    \"N\": {\"rows\": [\"openings\", \"segments\", \"overall\"], \"reason\": \"<short>\"},\n"
+        "    \"S\": {\"rows\": [\"overall\"], \"reason\": \"<short>\"},\n"
+        "    \"E\": {\"rows\": [...], \"reason\": \"<short>\"},\n"
+        "    \"W\": {\"rows\": [...], \"reason\": \"<short>\"}\n"
+        "  },\n"
+        "  \"interior\": [\n"
+        "    {\"label\": \"I0\", \"dimension\": true, \"reason\": \"<short>\"},\n"
+        "    {\"label\": \"I1\", \"dimension\": false, \"reason\": \"<short>\"}\n"
+        "  ],\n"
+        "  \"min_segment_cm\": 25\n"
+        "}"
+    )
+
+
+def _render_dim_plan_mpl(cardinal_lines, int_lines, opening_pts, bbox, px_long):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.lines as mlines
+
+        minx, miny, maxx, maxy = bbox
+        pad = max(50.0, 0.05 * max(maxx - minx, maxy - miny))
+        minx -= pad
+        miny -= pad
+        maxx += pad
+        maxy += pad
+        span_x = max(1.0, maxx - minx)
+        span_y = max(1.0, maxy - miny)
+        aspect = span_x / span_y
+        if aspect >= 1.0:
+            w_in = max(5.0, float(px_long) / 150.0)
+            h_in = w_in / aspect
+        else:
+            h_in = max(5.0, float(px_long) / 150.0)
+            w_in = h_in * aspect
+
+        fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=150)
+        ax.set_facecolor("white")
+
+        for key, lines in cardinal_lines.items():
+            color = _SIDE_COLORS.get(key, "#111111")
+            for ln in lines:
+                ax.plot(
+                    [float(ln["x1"]), float(ln["x2"])],
+                    [float(ln["y1"]), float(ln["y2"])],
+                    color=color, linewidth=2.5, solid_capstyle="round",
+                )
+
+        for ln in int_lines:
+            ax.plot(
+                [float(ln["x1"]), float(ln["x2"])],
+                [float(ln["y1"]), float(ln["y2"])],
+                color="#1f3b8a", linewidth=1.5, solid_capstyle="round",
+            )
+            label = ln.get("label", "")
+            if label:
+                mx = (float(ln["x1"]) + float(ln["x2"])) / 2.0
+                my = (float(ln["y1"]) + float(ln["y2"])) / 2.0
+                ax.annotate(
+                    label, xy=(mx, my), xytext=(5, 5),
+                    textcoords="offset points", fontsize=9,
+                    color="#1f3b8a", fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="#f0f4ff", ec="#1f3b8a", lw=0.7),
+                )
+
+        if opening_pts:
+            sz = max(20.0, (maxx - minx + maxy - miny) * 0.005)
+            for pt in opening_pts:
+                ax.plot([pt[0] - sz, pt[0] + sz], [pt[1], pt[1]], color="#CC2020", linewidth=1.5)
+                ax.plot([pt[0], pt[0]], [pt[1] - sz, pt[1] + sz], color="#CC2020", linewidth=1.5)
+
+        handles = [
+            mlines.Line2D([], [], color=_SIDE_COLORS["N"], linewidth=2.0, label="North"),
+            mlines.Line2D([], [], color=_SIDE_COLORS["S"], linewidth=2.0, label="South"),
+            mlines.Line2D([], [], color=_SIDE_COLORS["E"], linewidth=2.0, label="East"),
+            mlines.Line2D([], [], color=_SIDE_COLORS["W"], linewidth=2.0, label="West"),
+            mlines.Line2D([], [], color="#1f3b8a", linewidth=1.5, label="Interior"),
+        ]
+        if opening_pts:
+            handles.append(mlines.Line2D([], [], color="#CC2020", linewidth=1.5, label="Openings"))
+        ax.legend(handles=handles, loc="upper right", fontsize=7, framealpha=0.9)
+        ax.set_xlim(minx, maxx)
+        ax.set_ylim(miny, maxy)
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0.1)
+        plt.close(fig)
+        return buf.getvalue()
+    except Exception:
+        try:
+            import matplotlib.pyplot as _plt
+            _plt.close("all")
+        except Exception:
+            pass
+        return None
+
+
+def _render_dim_plan(cardinal_lines, int_lines, opening_pts, px_long, snapshot=None):
+    all_lines = []
+    for lines in cardinal_lines.values():
+        all_lines.extend(lines)
+    all_lines.extend(int_lines)
+    for pt in opening_pts:
+        all_lines.append({"x1": pt[0] - 0.01, "y1": pt[1], "x2": pt[0] + 0.01, "y2": pt[1]})
+    bbox = _bbox_of_lines(all_lines)
+    if not bbox:
+        return None, None
+
+    if _have_matplotlib():
+        png = _render_dim_plan_mpl(cardinal_lines, int_lines, opening_pts, bbox, px_long)
+        if png:
+            return png, "matplotlib"
+
+    groups = []
+    for key, lines in cardinal_lines.items():
+        if lines:
+            groups.append({"lines": lines, "color": _SIDE_COLORS.get(key, "#111111"),
+                           "width": 2.5, "label": key})
+    if int_lines:
+        groups.append({"lines": int_lines, "color": "#1f3b8a", "width": 1.5, "label": "interior"})
+    if opening_pts:
+        sz = max(0.1, (bbox[2] - bbox[0] + bbox[3] - bbox[1]) * 0.005)
+        crosses = []
+        for pt in opening_pts:
+            crosses.append({"x1": pt[0] - sz, "y1": pt[1], "x2": pt[0] + sz, "y2": pt[1]})
+            crosses.append({"x1": pt[0], "y1": pt[1] - sz, "x2": pt[0], "y2": pt[1] + sz})
+        groups.append({"lines": crosses, "color": "#CC2020", "width": 2.0, "label": "openings"})
+    png, renderer = _render_png(groups, bbox, px_long, snapshot=snapshot)
+    return png, renderer
+
+
+def plan_dimension_decisions(cfg, cardinal_groups, int_walls, opening_by_wall, snapshot=None):
+    """Render ext+int walls and ask Claude which need dimensions and what rows.
+
+    cardinal_groups: {"N": [wall_dict...], ...}  each wall_dict has p0=(x,y), p1=(x,y) in feet
+    int_walls: [wall_dict, ...]
+    opening_by_wall: {wall_id: [{"pos": (x,y)}, ...]}
+
+    Returns decisions dict, or None if disabled/failed (caller uses default all-rows behavior).
+    """
+    if not qa_enabled(cfg):
+        return None
+
+    def _to_line(w):
+        p0, p1 = w["p0"], w["p1"]
+        return {"x1": p0[0], "y1": p0[1], "x2": p1[0], "y2": p1[1]}
+
+    cardinal_lines = {}
+    for key, wlist in (cardinal_groups or {}).items():
+        cardinal_lines[key] = [_to_line(w) for w in (wlist or [])]
+
+    int_lines = []
+    for i, w in enumerate(int_walls or []):
+        d = _to_line(w)
+        d["label"] = "I{}".format(i)
+        int_lines.append(d)
+
+    opening_pts = []
+    for ops in (opening_by_wall or {}).values():
+        for op in ops:
+            pos = op.get("pos")
+            if pos:
+                opening_pts.append((float(pos[0]), float(pos[1])))
+
+    px = _cfg_int(cfg, "llm_qa_render_px", 1400)
+    png, renderer = _render_dim_plan(cardinal_lines, int_lines, opening_pts, px, snapshot=snapshot)
+    if not png:
+        _log(snapshot, "dim_decisions: no renderer available")
+        return None
+
+    _save_bytes(snapshot, "llm_qa_dim_decisions.png", png)
+    _log(snapshot, "dim_decisions render ok via {}, int_walls={}".format(renderer, len(int_lines)))
+
+    user_text = _dim_decisions_user_text(len(int_lines))
+    t0 = time.time()
+    resp, err = _call_claude(
+        _cfg_str(cfg, "llm_qa_model", "claude-opus-4-7"),
+        png,
+        user_text,
+        _cfg_int(cfg, "llm_qa_timeout_s", 15),
+        system_text=DIMENSION_SYSTEM,
+        max_tokens=1200,
+    )
+    dt = time.time() - t0
+    _log(snapshot, "dim_decisions api dt={:.2f}s err={}".format(dt, err))
+
+    if resp is None:
+        _log(snapshot, "dim_decisions: api error: {}".format(err))
+        return None
+
+    _save_text(snapshot, "llm_qa_dim_decisions_response.txt", resp.get("text") or "")
+    parsed = _extract_json_from_text(resp.get("text") or "")
+    if not isinstance(parsed, dict):
+        _log(snapshot, "dim_decisions: unparseable response")
+        return None
+
+    valid_rows = {"openings", "segments", "overall"}
+    exterior = {}
+    raw_ext = parsed.get("exterior") or {}
+    for key in ("N", "S", "E", "W"):
+        entry = raw_ext.get(key) or {}
+        rows = [r for r in [str(x).strip().lower() for x in (entry.get("rows") or [])]
+                if r in valid_rows]
+        if not rows:
+            rows = ["overall"]
+        exterior[key] = {"rows": rows, "reason": str(entry.get("reason") or "")[:300]}
+
+    interior = {}
+    for item in (parsed.get("interior") or []):
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()
+        if not label:
+            continue
+        interior[label] = {
+            "dimension": bool(item.get("dimension", False)),
+            "reason": str(item.get("reason") or "")[:200],
+        }
+
+    try:
+        min_seg = max(0.0, float(parsed.get("min_segment_cm") or 25.0))
+    except Exception:
+        min_seg = 25.0
+
+    out = {
+        "exterior": exterior,
+        "interior": interior,
+        "min_segment_cm": min_seg,
+    }
+    _save_json(snapshot, "llm_qa_dim_decisions.json", out)
+    _log(snapshot, "dim_decisions ok: min_seg_cm={} int_dims={}".format(
+        min_seg,
+        sum(1 for v in interior.values() if v.get("dimension")),
+    ))
+    return out
