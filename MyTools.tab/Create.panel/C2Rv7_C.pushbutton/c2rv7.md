@@ -4,12 +4,14 @@ This file records the current `C2Rv7` state for the layer-first wall workflow.
 
 ## Scope
 
-`C2Rv7` is limited to wall creation.
+`C2Rv7` is focused on layer-first wall creation, with optional apartment-area
+creation after the walls are generated.
 
 - input: one selected DWG import in the active floor plan
-- wall source layers: `A-WALL-EXT`, `A-WALL-INT`
+- wall source layers: `A-WALL-EXT`, `A-WALL-INT`, `A-WALL-CORE`
 - openings: ignored for wall cutting
-- output: native Revit walls only
+- output: native Revit walls, optional doors/windows/floors/stairs/dimensions,
+  and optional apartment `Area` objects
 
 ## Current rules
 
@@ -20,6 +22,13 @@ This file records the current `C2Rv7` state for the layer-first wall workflow.
 5. Raw wall-face gaps are bridged before wall-face pairing.
 6. Centerlines are generated from paired faces only.
 7. Interior cleanup removes tiny fragments and collapses small attached loop patterns.
+8. Apartment areas are created from large enclosed cells after wall detection:
+   - exterior wall is counted fully inside the apartment area by using the
+     exterior wall outer face
+   - apartment/apartment walls are counted to the wall centerline
+   - core walls are counted to the wall centerline
+   - apartment-separating walls must measure at least 20 cm
+   - minimum apartment area is 35 sqm
 
 ## Why this version exists
 
@@ -36,6 +45,10 @@ The current version narrows the logic to the office CAD standard instead of tryi
 ## Current limitation
 
 If a DWG contains a complex interior pocket that is drawn as a valid wall loop and is larger than the cleanup thresholds, it may still survive.
+
+Apartment-area detection assumes that apartment boundaries are already drawn as
+wall boundaries. It does not create internal rooms inside an apartment; it
+creates one area per apartment-sized enclosed space.
 
 The next debugging step, if needed, should be:
 

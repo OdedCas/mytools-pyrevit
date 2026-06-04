@@ -4529,6 +4529,631 @@ def _create_rooms_and_tags(v2, level, snapshot=None):
     return room_ids, tag_ids
 
 
+def _polygon_area_cm2(poly):
+    if not poly or len(poly) < 3:
+        return 0.0
+    s = 0.0
+    for i in range(len(poly)):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % len(poly)]
+        s += (float(x1) * float(y2)) - (float(x2) * float(y1))
+    return 0.5 * s
+
+
+def _polygon_centroid_cm(poly):
+    if not poly:
+        return None
+    a = _polygon_area_cm2(poly)
+    if abs(a) <= 1.0e-9:
+        sx = sum(float(p[0]) for p in poly)
+        sy = sum(float(p[1]) for p in poly)
+        return (sx / len(poly), sy / len(poly))
+    cx = 0.0
+    cy = 0.0
+    for i in range(len(poly)):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % len(poly)]
+        cross = (float(x1) * float(y2)) - (float(x2) * float(y1))
+        cx += (float(x1) + float(x2)) * cross
+        cy += (float(y1) + float(y2)) * cross
+    return (cx / (6.0 * a), cy / (6.0 * a))
+
+
+def _point_in_polygon_cm(pt, poly):
+    if pt is None or not poly or len(poly) < 3:
+        return False
+    x, y = float(pt[0]), float(pt[1])
+    inside = False
+    j = len(poly) - 1
+    for i in range(len(poly)):
+        xi, yi = float(poly[i][0]), float(poly[i][1])
+        xj, yj = float(poly[j][0]), float(poly[j][1])
+        if ((yi > y) != (yj > y)):
+            x_at_y = (xj - xi) * (y - yi) / ((yj - yi) or 1.0e-9) + xi
+            if x < x_at_y:
+                inside = not inside
+        j = i
+    return inside
+
+
+def _point_segment_distance_cm(pt, a, b):
+    px, py = float(pt[0]), float(pt[1])
+    ax, ay = float(a[0]), float(a[1])
+    bx, by = float(b[0]), float(b[1])
+    vx, vy = bx - ax, by - ay
+    den = (vx * vx) + (vy * vy)
+    if den <= 1.0e-9:
+        return math.sqrt(((px - ax) ** 2) + ((py - ay) ** 2))
+    t = ((px - ax) * vx + (py - ay) * vy) / den
+    t = max(0.0, min(1.0, t))
+    qx, qy = ax + t * vx, ay + t * vy
+    return math.sqrt(((px - qx) ** 2) + ((py - qy) ** 2))
+
+
+def _point_polyline_distance_cm(pt, poly):
+    if not poly or len(poly) < 2:
+        return 1.0e9
+    best = 1.0e9
+    for i in range(len(poly)):
+        d = _point_segment_distance_cm(pt, poly[i], poly[(i + 1) % len(poly)])
+        if d < best:
+            best = d
+    return best
+
+
+def _line_intersection_unbounded_cm(a1, a2, b1, b2):
+    ax, ay = float(a1[0]), float(a1[1])
+    bx, by = float(a2[0]), float(a2[1])
+    cx, cy = float(b1[0]), float(b1[1])
+    dx, dy = float(b2[0]), float(b2[1])
+    rx, ry = bx - ax, by - ay
+    sx, sy = dx - cx, dy - cy
+    den = (rx * sy) - (ry * sx)
+    if abs(den) <= 1.0e-9:
+        return None
+    qpx, qpy = cx - ax, cy - ay
+    t = (qpx * sy - qpy * sx) / den
+    return (ax + t * rx, ay + t * ry)
+
+
+def _offset_polygon_cm(poly, offset_cm):
+    if not poly or len(poly) < 3 or abs(float(offset_cm)) <= 1.0e-9:
+        return list(poly or [])
+    area = _polygon_area_cm2(poly)
+    outward_for_ccw = area > 0.0
+    offset_edges = []
+    n = len(poly)
+    for i in range(n):
+        x1, y1 = float(poly[i][0]), float(poly[i][1])
+        x2, y2 = float(poly[(i + 1) % n][0]), float(poly[(i + 1) % n][1])
+        dx, dy = x2 - x1, y2 - y1
+        ln = math.sqrt(dx * dx + dy * dy)
+        if ln <= 1.0e-9:
+            continue
+        ux, uy = dx / ln, dy / ln
+        if outward_for_ccw:
+            nx, ny = uy, -ux
+        else:
+            nx, ny = -uy, ux
+        ox = nx * float(offset_cm)
+        oy = ny * float(offset_cm)
+        offset_edges.append(((x1 + ox, y1 + oy), (x2 + ox, y2 + oy)))
+    if len(offset_edges) < 3:
+        return list(poly or [])
+
+    out = []
+    for i in range(len(offset_edges)):
+        prev_edge = offset_edges[i - 1]
+        cur_edge = offset_edges[i]
+        p = _line_intersection_unbounded_cm(prev_edge[0], prev_edge[1], cur_edge[0], cur_edge[1])
+        if p is None:
+            p = ((prev_edge[1][0] + cur_edge[0][0]) * 0.5,
+                 (prev_edge[1][1] + cur_edge[0][1]) * 0.5)
+        out.append(p)
+    return out
+
+
+def _chain_center_loop_cm(lines_cm, tol_cm, snapshot=None):
+    curves_ft = []
+    for ln in (lines_cm or []):
+        curves_ft.append((
+            (float(ln.get("x1", 0.0)) / 30.48, float(ln.get("y1", 0.0)) / 30.48),
+            (float(ln.get("x2", 0.0)) / 30.48, float(ln.get("y2", 0.0)) / 30.48),
+        ))
+    poly_ft = _chain_ext_wall_loop(curves_ft, tol_ft=float(tol_cm) / 30.48, snapshot=snapshot)
+    return [(float(x) * 30.48, float(y) * 30.48) for x, y in (poly_ft or [])]
+
+
+def _polygon_to_lines_cm(poly, layer):
+    out = []
+    if not poly or len(poly) < 2:
+        return out
+    for i in range(len(poly)):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % len(poly)]
+        out.append({
+            "type": "line",
+            "x1": float(x1),
+            "y1": float(y1),
+            "x2": float(x2),
+            "y2": float(y2),
+            "layer": layer,
+        })
+    return out
+
+
+def _ray_segment_intersection_cm(p, d, a, b):
+    px, py = float(p[0]), float(p[1])
+    dx, dy = float(d[0]), float(d[1])
+    ax, ay = float(a[0]), float(a[1])
+    bx, by = float(b[0]), float(b[1])
+    sx, sy = bx - ax, by - ay
+    den = (dx * sy) - (dy * sx)
+    if abs(den) <= 1.0e-9:
+        return None
+    qx, qy = ax - px, ay - py
+    t = (qx * sy - qy * sx) / den
+    u = (qx * dy - qy * dx) / den
+    if t < -1.0e-6 or u < -1.0e-6 or u > 1.0 + 1.0e-6:
+        return None
+    return (t, (px + t * dx, py + t * dy))
+
+
+def _extend_endpoint_to_polygon(pt, other, polygon, near_cm, max_extend_cm):
+    if _point_polyline_distance_cm(pt, polygon) > float(near_cm):
+        return pt
+    dx = float(pt[0]) - float(other[0])
+    dy = float(pt[1]) - float(other[1])
+    ln = math.sqrt(dx * dx + dy * dy)
+    if ln <= 1.0e-9:
+        return pt
+    d = (dx / ln, dy / ln)
+    best = None
+    for i in range(len(polygon)):
+        hit = _ray_segment_intersection_cm(pt, d, polygon[i], polygon[(i + 1) % len(polygon)])
+        if hit is None:
+            continue
+        t, hp = hit
+        if t > float(max_extend_cm):
+            continue
+        if best is None or t < best[0]:
+            best = (t, hp)
+    if best is None:
+        return pt
+    return best[1]
+
+
+def _extend_line_to_outer_polygon_cm(ln, outer_polygon, near_cm, max_extend_cm):
+    p1 = (float(ln.get("x1", 0.0)), float(ln.get("y1", 0.0)))
+    p2 = (float(ln.get("x2", 0.0)), float(ln.get("y2", 0.0)))
+    n1 = _extend_endpoint_to_polygon(p1, p2, outer_polygon, near_cm, max_extend_cm)
+    n2 = _extend_endpoint_to_polygon(p2, p1, outer_polygon, near_cm, max_extend_cm)
+    out = dict(ln)
+    out["x1"], out["y1"] = n1
+    out["x2"], out["y2"] = n2
+    return out
+
+
+def _segment_intersection_params_cm(a, b):
+    ax, ay = float(a["x1"]), float(a["y1"])
+    bx, by = float(a["x2"]), float(a["y2"])
+    cx, cy = float(b["x1"]), float(b["y1"])
+    dx, dy = float(b["x2"]), float(b["y2"])
+    rx, ry = bx - ax, by - ay
+    sx, sy = dx - cx, dy - cy
+    den = (rx * sy) - (ry * sx)
+    if abs(den) <= 1.0e-9:
+        return None
+    qx, qy = cx - ax, cy - ay
+    ta = (qx * sy - qy * sx) / den
+    tb = (qx * ry - qy * rx) / den
+    if ta < -1.0e-7 or ta > 1.0 + 1.0e-7:
+        return None
+    if tb < -1.0e-7 or tb > 1.0 + 1.0e-7:
+        return None
+    ta = max(0.0, min(1.0, ta))
+    tb = max(0.0, min(1.0, tb))
+    return (ta, tb, (ax + ta * rx, ay + ta * ry))
+
+
+def _build_area_graph_cm(segments, tol_cm, min_seg_cm):
+    segments = [s for s in (segments or []) if _line_len_cm(s) >= float(min_seg_cm)]
+    split_params = []
+    for _s in segments:
+        split_params.append([0.0, 1.0])
+
+    for i in range(len(segments)):
+        for j in range(i + 1, len(segments)):
+            hit = _segment_intersection_params_cm(segments[i], segments[j])
+            if hit is None:
+                continue
+            ti, tj, _pt = hit
+            split_params[i].append(ti)
+            split_params[j].append(tj)
+
+    node_sum = {}
+    node_cnt = {}
+    edges = set()
+
+    def _node_key(pt):
+        return _pt_key_cm(pt[0], pt[1], tol_cm)
+
+    def _add_node(pt):
+        key = _node_key(pt)
+        if key in node_sum:
+            node_sum[key] = (node_sum[key][0] + float(pt[0]), node_sum[key][1] + float(pt[1]))
+            node_cnt[key] += 1
+        else:
+            node_sum[key] = (float(pt[0]), float(pt[1]))
+            node_cnt[key] = 1
+        return key
+
+    for i, seg in enumerate(segments):
+        x1, y1 = float(seg["x1"]), float(seg["y1"])
+        x2, y2 = float(seg["x2"]), float(seg["y2"])
+        vals = sorted(set([round(max(0.0, min(1.0, t)), 9) for t in split_params[i]]))
+        pts = []
+        for t in vals:
+            pts.append((x1 + (x2 - x1) * t, y1 + (y2 - y1) * t))
+        for j in range(len(pts) - 1):
+            a, b = pts[j], pts[j + 1]
+            if math.sqrt(((a[0] - b[0]) ** 2) + ((a[1] - b[1]) ** 2)) < float(min_seg_cm):
+                continue
+            ka = _add_node(a)
+            kb = _add_node(b)
+            if ka == kb:
+                continue
+            edge = (ka, kb) if ka <= kb else (kb, ka)
+            edges.add(edge)
+
+    node_xy = {}
+    for key in node_sum:
+        c = float(node_cnt[key])
+        node_xy[key] = (node_sum[key][0] / c, node_sum[key][1] / c)
+
+    adj = {}
+    for a, b in edges:
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, []).append(a)
+    for k in adj:
+        x0, y0 = node_xy[k]
+        adj[k].sort(key=lambda n: math.atan2(node_xy[n][1] - y0, node_xy[n][0] - x0))
+
+    visited = set()
+    faces = []
+    directed = []
+    for a, b in edges:
+        directed.append((a, b))
+        directed.append((b, a))
+
+    for start in directed:
+        if start in visited:
+            continue
+        cur = start
+        face_nodes = []
+        for _step in range(max(20, len(directed) * 3)):
+            if cur in visited:
+                break
+            visited.add(cur)
+            u, v = cur
+            face_nodes.append(u)
+            nbrs = adj.get(v, [])
+            if not nbrs or u not in nbrs:
+                break
+            idx = nbrs.index(u)
+            nxt = nbrs[(idx - 1) % len(nbrs)]
+            cur = (v, nxt)
+            if cur == start:
+                break
+        if len(face_nodes) < 3:
+            continue
+        poly = [node_xy[n] for n in face_nodes]
+        area = _polygon_area_cm2(poly)
+        if area <= 1.0:
+            continue
+        faces.append(poly)
+
+    edge_lines = []
+    for a, b in edges:
+        pa = node_xy[a]
+        pb = node_xy[b]
+        edge_lines.append({
+            "type": "line",
+            "x1": pa[0],
+            "y1": pa[1],
+            "x2": pb[0],
+            "y2": pb[1],
+            "layer": "C2RV7-APT-AREA",
+        })
+    return {"edges": edge_lines, "faces": faces}
+
+
+def _seed_point_in_polygon_cm(poly):
+    c = _polygon_centroid_cm(poly)
+    if c is not None and _point_in_polygon_cm(c, poly):
+        return c
+    if not poly:
+        return None
+    xs = [float(p[0]) for p in poly]
+    ys = [float(p[1]) for p in poly]
+    minx, maxx = min(xs), max(xs)
+    miny, maxy = min(ys), max(ys)
+    for div in (2, 3, 4, 5, 7):
+        for ix in range(1, div):
+            for iy in range(1, div):
+                p = (minx + (maxx - minx) * ix / float(div),
+                     miny + (maxy - miny) * iy / float(div))
+                if _point_in_polygon_cm(p, poly):
+                    return p
+    return c
+
+
+def _find_or_create_area_plan(v2, level, snapshot=None):
+    from Autodesk.Revit.DB import AreaScheme, ViewPlan
+    scheme = None
+    try:
+        schemes = list(FilteredElementCollector(v2.doc).OfClass(AreaScheme).ToElements())
+        for s in schemes:
+            name = ""
+            try:
+                name = s.Name or ""
+            except Exception:
+                pass
+            if "gross" in name.lower():
+                scheme = s
+                break
+        if scheme is None and schemes:
+            scheme = schemes[0]
+    except Exception:
+        scheme = None
+    if scheme is None:
+        if snapshot:
+            try:
+                snapshot.log("Apartment areas: no AreaScheme found")
+            except Exception:
+                pass
+        return None
+
+    try:
+        for vp in FilteredElementCollector(v2.doc).OfClass(ViewPlan).ToElements():
+            try:
+                if vp.IsTemplate:
+                    continue
+                if vp.GenLevel is not None and vp.GenLevel.Id == level.Id:
+                    if str(vp.ViewType) == "AreaPlan":
+                        return vp
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    t = None
+    try:
+        t = v2.Transaction(v2.doc, "C2Rv7_C Create Apartment Area Plan")
+        t.Start()
+        view = ViewPlan.CreateAreaPlan(v2.doc, scheme.Id, level.Id)
+        try:
+            view.Name = "C2Rv7 Apartment Areas - {}".format(level.Name)
+        except Exception:
+            pass
+        t.Commit()
+        return view
+    except Exception as ex:
+        if t is not None:
+            try:
+                t.RollBack()
+            except Exception:
+                pass
+        if snapshot:
+            try:
+                snapshot.log("Apartment area plan create failed: {}".format(ex))
+            except Exception:
+                pass
+        return None
+
+
+def _create_apartment_areas(v2, level, cfg, ext_center, int_center, core_center,
+                            int_raw, ext_thick_cm, int_thick_cm, core_thick_cm,
+                            snapshot=None):
+    """Create Revit Areas for apartment-sized enclosed cells.
+
+    Rules:
+    - exterior wall counts fully inside the apartment area: use exterior outer face
+    - apartment/apartment wall counts to wall centerline and must be >= 20 cm
+    - core wall counts to wall centerline
+    - minimum apartment area is 35 sqm
+    """
+    from Autodesk.Revit.DB import BuiltInParameter, Plane, SketchPlane, UV, XYZ
+
+    area_ids = []
+    tag_ids = []
+    min_sqm = float((cfg or {}).get("apartment_area_min_sqm", 35.0))
+    sep_min_cm = float((cfg or {}).get("apartment_wall_min_thickness_cm", 20.0))
+    snap_tol_cm = float((cfg or {}).get("apartment_area_snap_tol_cm", 4.0))
+    min_boundary_cm = float((cfg or {}).get("apartment_area_min_boundary_segment_cm", 5.0))
+
+    ext_loop = _chain_center_loop_cm(ext_center, max(6.0, snap_tol_cm * 2.0), snapshot=snapshot)
+    if len(ext_loop) < 3:
+        if snapshot:
+            try:
+                snapshot.log("Apartment areas: no exterior loop")
+            except Exception:
+                pass
+        return area_ids, tag_ids
+
+    outer_polygon = _offset_polygon_cm(ext_loop, float(ext_thick_cm) * 0.5)
+    outer_segments = _polygon_to_lines_cm(outer_polygon, "C2RV7-APT-OUTER")
+
+    sep_lines = []
+    thicknesses = []
+    for ln in (int_center or []):
+        t_cm = _measure_local_thickness(ln, int_raw) or float(int_thick_cm)
+        thicknesses.append(float(t_cm))
+        if float(t_cm) + 1.0e-6 >= sep_min_cm:
+            sep_lines.append(ln)
+
+    near_cm = max(80.0, float(ext_thick_cm) * 3.0)
+    max_extend_cm = max(160.0, float(ext_thick_cm) * 6.0)
+    sep_lines = [_extend_line_to_outer_polygon_cm(ln, outer_polygon, near_cm, max_extend_cm)
+                 for ln in sep_lines]
+    core_lines = [_extend_line_to_outer_polygon_cm(ln, outer_polygon, near_cm, max_extend_cm)
+                  for ln in (core_center or [])]
+
+    boundary_segments = outer_segments + sep_lines + core_lines
+    graph = _build_area_graph_cm(boundary_segments, snap_tol_cm, min_boundary_cm)
+
+    core_graph = _build_area_graph_cm(core_lines, snap_tol_cm, min_boundary_cm)
+    core_polys = [p for p in core_graph.get("faces", []) if abs(_polygon_area_cm2(p)) >= 10000.0]
+
+    cells = []
+    seen = set()
+    for poly in graph.get("faces", []):
+        area_cm2 = abs(_polygon_area_cm2(poly))
+        area_sqm = area_cm2 / 10000.0
+        if area_sqm + 1.0e-6 < min_sqm:
+            continue
+        seed = _seed_point_in_polygon_cm(poly)
+        if seed is None or not _point_in_polygon_cm(seed, outer_polygon):
+            continue
+        in_core = False
+        for cp in core_polys:
+            if _point_in_polygon_cm(seed, cp):
+                in_core = True
+                break
+        if in_core:
+            continue
+        sig = tuple(sorted((round(float(x), 1), round(float(y), 1)) for x, y in poly))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        cells.append({"polygon": poly, "seed": seed, "area_sqm": area_sqm})
+
+    cells.sort(key=lambda c: (-c["area_sqm"], c["seed"][0], c["seed"][1]))
+
+    if snapshot:
+        try:
+            snapshot.log("Apartment areas: ext_loop={} sep_lines={} core_lines={} cells>={}sqm={}".format(
+                len(ext_loop), len(sep_lines), len(core_lines), min_sqm, len(cells)))
+            snapshot.save_json("apartment_area_cells.json", {
+                "min_sqm": min_sqm,
+                "apartment_wall_min_thickness_cm": sep_min_cm,
+                "internal_wall_thicknesses_cm": thicknesses,
+                "cell_count": len(cells),
+                "cells": [
+                    {
+                        "area_sqm": round(c["area_sqm"], 2),
+                        "seed_cm": [round(c["seed"][0], 2), round(c["seed"][1], 2)],
+                        "polygon_cm": [[round(x, 2), round(y, 2)] for x, y in c["polygon"]],
+                    }
+                    for c in cells
+                ],
+            })
+        except Exception:
+            pass
+
+    if not cells:
+        return area_ids, tag_ids
+
+    area_view = _find_or_create_area_plan(v2, level, snapshot=snapshot)
+    if area_view is None:
+        return area_ids, tag_ids
+
+    sketch_plane = None
+    t = v2.Transaction(v2.doc, "C2Rv7_C Create Apartment Area Boundaries")
+    t.Start()
+    try:
+        plane = Plane.CreateByNormalAndOrigin(XYZ.BasisZ, XYZ(0.0, 0.0, level.Elevation))
+        sketch_plane = SketchPlane.Create(v2.doc, plane)
+        for ln in graph.get("edges", []):
+            if _line_len_cm(ln) < min_boundary_cm:
+                continue
+            p0 = XYZ(v2.cm_to_ft(float(ln["x1"])), v2.cm_to_ft(float(ln["y1"])), level.Elevation)
+            p1 = XYZ(v2.cm_to_ft(float(ln["x2"])), v2.cm_to_ft(float(ln["y2"])), level.Elevation)
+            try:
+                curve = v2.Line.CreateBound(p0, p1)
+                v2.doc.Create.NewAreaBoundaryLine(sketch_plane, curve, area_view)
+            except Exception:
+                continue
+        t.Commit()
+    except Exception as ex:
+        try:
+            t.RollBack()
+        except Exception:
+            pass
+        if snapshot:
+            try:
+                snapshot.log("Apartment area boundaries failed: {}".format(ex))
+            except Exception:
+                pass
+        return area_ids, tag_ids
+
+    try:
+        v2.doc.Regenerate()
+    except Exception:
+        pass
+
+    t2 = v2.Transaction(v2.doc, "C2Rv7_C Create Apartment Areas")
+    t2.Start()
+    try:
+        for idx, cell in enumerate(cells):
+            sx, sy = cell["seed"]
+            try:
+                area = v2.doc.Create.NewArea(
+                    area_view,
+                    UV(v2.cm_to_ft(float(sx)), v2.cm_to_ft(float(sy))),
+                )
+                if area is None:
+                    continue
+                area_ids.append(area.Id.IntegerValue)
+                try:
+                    p_name = area.get_Parameter(BuiltInParameter.ROOM_NAME)
+                    if p_name and not p_name.IsReadOnly:
+                        p_name.Set("Apartment")
+                    p_num = area.get_Parameter(BuiltInParameter.ROOM_NUMBER)
+                    if p_num and not p_num.IsReadOnly:
+                        p_num.Set("A-{:02d}".format(idx + 1))
+                    p_comments = area.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+                    if p_comments and not p_comments.IsReadOnly:
+                        p_comments.Set("C2Rv7 apartment area; detected {:.1f} sqm".format(cell["area_sqm"]))
+                except Exception:
+                    pass
+                try:
+                    tag_pt = UV(v2.cm_to_ft(float(sx)), v2.cm_to_ft(float(sy)))
+                    try:
+                        tag = v2.doc.Create.NewAreaTag(area, tag_pt, area_view)
+                    except Exception:
+                        tag = v2.doc.Create.NewAreaTag(area_view, area, tag_pt)
+                    if tag is not None:
+                        tag_ids.append(tag.Id.IntegerValue)
+                except Exception:
+                    pass
+            except Exception as ex:
+                if snapshot:
+                    try:
+                        snapshot.log("Apartment area create failed at {}: {}".format(idx + 1, ex))
+                    except Exception:
+                        pass
+        t2.Commit()
+    except Exception as ex:
+        try:
+            t2.RollBack()
+        except Exception:
+            pass
+        if snapshot:
+            try:
+                snapshot.log("Apartment area transaction failed: {}".format(ex))
+            except Exception:
+                pass
+        return area_ids, tag_ids
+
+    if snapshot:
+        try:
+            snapshot.log("Apartment areas created: {} areas, {} tags".format(len(area_ids), len(tag_ids)))
+        except Exception:
+            pass
+    return area_ids, tag_ids
+
+
 def _create_exterior_dimensions(v2, level, wall_ids, door_ids, window_ids,
                                 ext_thick_cm, snapshot=None,
                                 cfg=None, llm_qa=None, int_wall_ids=None):
@@ -5790,16 +6415,25 @@ def _apply_layer_first_wall_mode(v2, selected_import):
                     v2, level, ext_inner_lines_cm, concrete_type, tile_type, snapshot)
 
         # =======================================================================
-        # STEP 3.5 — ROOMS
+        # STEP 3.5 — APARTMENT AREAS
         # =======================================================================
-        room_ids = []
-        room_tag_ids = []
-        td_room = TaskDialog("C2Rv7_C")
-        td_room.MainInstruction = "Create rooms and area tags?"
-        td_room.CommonButtons = TaskDialogCommonButtons.Yes | TaskDialogCommonButtons.No
-        td_room.DefaultButton = TaskDialogResult.Yes
-        if td_room.Show() == TaskDialogResult.Yes:
-            room_ids, room_tag_ids = _create_rooms_and_tags(v2, level, snapshot)
+        apartment_area_ids = []
+        apartment_area_tag_ids = []
+        td_area = TaskDialog("C2Rv7_C")
+        td_area.MainInstruction = "Create apartment areas?"
+        td_area.MainContent = (
+            "Rules:\n"
+            "- exterior wall counted fully inside apartment area\n"
+            "- apartment/core walls counted to wall centerline\n"
+            "- apartment separating wall must be at least 20 cm\n"
+            "- minimum apartment area: 35 sqm"
+        )
+        td_area.CommonButtons = TaskDialogCommonButtons.Yes | TaskDialogCommonButtons.No
+        td_area.DefaultButton = TaskDialogResult.Yes
+        if td_area.Show() == TaskDialogResult.Yes:
+            apartment_area_ids, apartment_area_tag_ids = _create_apartment_areas(
+                v2, level, cfg, ext_center, int_center, core_center,
+                int_raw, ext_thick_cm, int_thick_cm, core_thick_cm, snapshot)
 
         # =======================================================================
         # STEP 4 — DIMENSIONS
@@ -5817,15 +6451,18 @@ def _apply_layer_first_wall_mode(v2, selected_import):
 
         if snapshot is not None:
             try:
-                snapshot.log("Layer-first walls created: ext={} core={} int={}, doors={} windows={}, stairs={}, floors={} tile={}, rooms={} tags={}, dims={}".format(
+                snapshot.log("Layer-first walls created: ext={} core={} int={}, doors={} windows={}, stairs={}, floors={} tile={}, apartment_areas={} area_tags={}, dims={}".format(
                     len(wall_ids), len(core_wall_ids), len(internal_wall_ids), len(door_ids), len(window_ids),
-                    len(stair_ids), len(floor_ids), len(tile_floor_ids), len(room_ids), len(room_tag_ids), len(dim_ids)))
+                    len(stair_ids), len(floor_ids), len(tile_floor_ids),
+                    len(apartment_area_ids), len(apartment_area_tag_ids), len(dim_ids)))
                 snapshot.save_json("08_geometry_summary.json", {
                     "geometry": {
                         "wall_ids": wall_ids,
                         "internal_wall_ids": internal_wall_ids,
                         "door_ids": door_ids,
                         "window_ids": window_ids,
+                        "apartment_area_ids": apartment_area_ids,
+                        "apartment_area_tag_ids": apartment_area_tag_ids,
                         "floor_ids": floor_ids,
                         "tile_floor_ids": tile_floor_ids,
                         "opening_errors": opening_errors,
@@ -5843,6 +6480,8 @@ def _apply_layer_first_wall_mode(v2, selected_import):
                 "internal_wall_ids": internal_wall_ids,
                 "door_ids": door_ids,
                 "window_ids": window_ids,
+                "apartment_area_ids": apartment_area_ids,
+                "apartment_area_tag_ids": apartment_area_tag_ids,
                 "opening_errors": opening_errors,
                 "perimeter_wall_thickness_cm": float(ext_thick_cm),
                 "internal_wall_thickness_cm": float(int_thick_cm),
