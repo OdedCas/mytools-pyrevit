@@ -5219,24 +5219,38 @@ def _create_apartment_areas(v2, level, cfg, ext_center, int_center, core_center,
     else:
         _diag = 500.0
 
-    # Core lines: extend with small tolerance to close the staircase polygon.
+    # Step 1 — Core lines: close the staircase polygon with small tolerance.
     core_near_cm = max(80.0, float(ext_thick_cm) * 3.0)
     core_max_cm  = max(160.0, float(ext_thick_cm) * 6.0)
     core_lines = [_extend_line_to_outer_polygon_cm(ln, outer_polygon, core_near_cm, core_max_cm)
                   for ln in (core_center or [])]
 
-    # Sep lines — two-step approach, fully geometry-driven:
-    # Step 1: extend every endpoint to the outer boundary (building-diagonal scale).
-    # Step 2: trim each extended line at its intersections with other sep-lines,
-    #   keeping only the portion that contains the ORIGINAL wall midpoint.
-    #   This ensures a vertical divider that was only in the upper half doesn't
-    #   bleed into the lower half after extension.  Works for any building shape.
-    sep_lines_orig = list(sep_lines)
-    sep_lines = [_extend_line_to_segments(ln, outer_segments, _diag)
-                 for ln in sep_lines]
-    sep_lines = _trim_sep_lines_at_mutual_intersections(sep_lines_orig, sep_lines)
+    # Step 2 — Build closed staircase polygon from core_lines.
+    # This polygon is the inner boundary that sep-lines connect to.
+    _core_graph_tmp = _build_area_graph_cm(core_lines, snap_tol_cm, min_boundary_cm)
+    _core_polys_tmp = [p for p in _core_graph_tmp.get("faces", [])
+                       if abs(_polygon_area_cm2(p)) >= 100.0]
+    core_boundary_segs = []
+    for _cp in _core_polys_tmp:
+        for _ci in range(len(_cp)):
+            _a, _b = _cp[_ci], _cp[(_ci + 1) % len(_cp)]
+            core_boundary_segs.append({"x1": _a[0], "y1": _a[1],
+                                        "x2": _b[0], "y2": _b[1],
+                                        "layer": "C2RV7-CORE-POLY"})
 
-    boundary_segments = outer_segments + sep_lines + core_lines
+    # Step 3 — Sep lines: extend each endpoint only toward the nearest boundary —
+    # outer polygon OR staircase polygon.  Use a small threshold so endpoints
+    # already far from both boundaries are NOT forced across the building.
+    # The staircase polygon provides the inner stop so sep-lines connect
+    # staircase→outer-wall correctly without crossing into the wrong zone.
+    all_stop_segs = outer_segments + (core_boundary_segs or core_lines)
+    sep_near_cm = max(80.0, float(ext_thick_cm) * 3.0)
+    sep_max_cm  = max(_diag, 160.0)
+    sep_lines = [_extend_line_to_segments(ln, all_stop_segs, sep_max_cm)
+                 for ln in sep_lines]
+
+    # Step 4 — boundary graph: outer polygon + sep-lines + staircase polygon.
+    boundary_segments = outer_segments + sep_lines + (core_boundary_segs or core_lines)
     graph = _build_area_graph_cm(boundary_segments, snap_tol_cm, min_boundary_cm)
 
     if snapshot:
