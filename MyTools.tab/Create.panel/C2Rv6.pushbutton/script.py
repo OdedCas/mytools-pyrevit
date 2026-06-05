@@ -422,6 +422,130 @@ def _remove_tiny_through_segments(lines, tol_cm, max_len_cm):
     return out
 
 
+def _build_node_edge_graph(lines, tol_cm):
+    nodes = {}
+    edge_nodes = []
+    for i, ln in enumerate(lines or []):
+        k1 = _pt_key_cm(ln.get("x1", 0.0), ln.get("y1", 0.0), tol_cm)
+        k2 = _pt_key_cm(ln.get("x2", 0.0), ln.get("y2", 0.0), tol_cm)
+        edge_nodes.append((k1, k2))
+        nodes.setdefault(k1, set()).add(i)
+        nodes.setdefault(k2, set()).add(i)
+    return nodes, edge_nodes
+
+
+def _biconnected_edge_blocks(lines, tol_cm):
+    lines = list(lines or [])
+    if not lines:
+        return []
+
+    nodes, edge_nodes = _build_node_edge_graph(lines, tol_cm)
+    adj = {}
+    for node, edge_ids in nodes.items():
+        nbrs = []
+        for edge_id in edge_ids:
+            a, b = edge_nodes[edge_id]
+            other = b if node == a else a
+            nbrs.append((other, edge_id))
+        adj[node] = nbrs
+
+    disc = {}
+    low = {}
+    parent = {}
+    time_ref = [0]
+    edge_stack = []
+    blocks = []
+
+    def _dfs(u):
+        time_ref[0] += 1
+        disc[u] = time_ref[0]
+        low[u] = time_ref[0]
+
+        for v, edge_id in adj.get(u, []):
+            if v not in disc:
+                parent[v] = u
+                edge_stack.append(edge_id)
+                _dfs(v)
+                low[u] = min(low[u], low[v])
+                if low[v] >= disc[u]:
+                    block = set()
+                    while edge_stack:
+                        last = edge_stack.pop()
+                        block.add(last)
+                        if last == edge_id:
+                            break
+                    if block:
+                        blocks.append(block)
+            elif parent.get(u) != v and disc[v] < disc[u]:
+                edge_stack.append(edge_id)
+                low[u] = min(low[u], disc[v])
+
+    for node in nodes:
+        if node in disc:
+            continue
+        _dfs(node)
+        if edge_stack:
+            blocks.append(set(edge_stack))
+            edge_stack[:] = []
+
+    return blocks
+
+
+def _collapse_small_attached_cycles(lines, tol_cm, max_edges, max_total_len_cm, max_dim_cm):
+    lines = list(lines or [])
+    if len(lines) < 4:
+        return lines
+
+    nodes, edge_nodes = _build_node_edge_graph(lines, tol_cm)
+    remove_ids = set()
+
+    for block in _biconnected_edge_blocks(lines, tol_cm):
+        edge_ids = sorted(list(block))
+        if len(edge_ids) < 3 or len(edge_ids) > int(max_edges):
+            continue
+
+        block_lines = [lines[i] for i in edge_ids]
+        bbox = _bbox_of_lines(block_lines)
+        if not bbox:
+            continue
+        total_len = sum([_line_len_cm(ln) for ln in block_lines])
+        dim_x = bbox[2] - bbox[0]
+        dim_y = bbox[3] - bbox[1]
+        max_dim = max(dim_x, dim_y)
+        if total_len > float(max_total_len_cm) or max_dim > float(max_dim_cm):
+            continue
+
+        block_edge_set = set(edge_ids)
+        external_nodes = set()
+        for edge_id in edge_ids:
+            for node in edge_nodes[edge_id]:
+                incident = nodes.get(node, set())
+                if any([(other_id not in block_edge_set) for other_id in incident]):
+                    external_nodes.add(node)
+
+        if not external_nodes:
+            continue
+
+        kept = []
+        removable = []
+        for edge_id in edge_ids:
+            n1, n2 = edge_nodes[edge_id]
+            ext1 = n1 in external_nodes
+            ext2 = n2 in external_nodes
+            if ext1 and ext2:
+                kept.append(edge_id)
+            else:
+                removable.append(edge_id)
+
+        if not kept or not removable:
+            continue
+
+        for edge_id in removable:
+            remove_ids.add(edge_id)
+
+    return [lines[i] for i in range(len(lines)) if i not in remove_ids]
+
+
 def _keep_lines_in_bbox(lines, bbox, margin_cm):
     if not bbox:
         return list(lines or [])
@@ -807,6 +931,13 @@ def _apply_layer_first_wall_mode(v2, selected_import):
             int_center,
             cleanup_tol_cm,
             max(45.0, int_thick_cm * 1.25),
+        )
+        int_center = _collapse_small_attached_cycles(
+            int_center,
+            cleanup_tol_cm,
+            6,
+            max(220.0, int_thick_cm * 8.0),
+            max(90.0, int_thick_cm * 3.0),
         )
 
         ext_center = _dedupe_lines(ext_center, min_len_cm)

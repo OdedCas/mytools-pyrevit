@@ -17,17 +17,17 @@ Current pipeline:
 3. Filter lines by `A-WALL-EXT` and `A-WALL-INT`.
 4. Bridge wall-face gaps before pairing.
 5. Collapse paired wall faces into centerlines only.
-6. Run focused cleanup on duplicate and tiny false fragments.
+6. Run focused cleanup on duplicate lines, tiny false fragments, and small attached interior loops.
 7. Create Revit walls from the resulting centerlines.
 
 Known status:
 
 - main perimeter and most walls are now much closer to the DWG
-- the remaining issue is a small false interior fragment in the right-side room for the current test file
+- current tuning specifically targets the false small box/pocket pattern that can appear on interior walls
 - the center thick wall block is intentional and should remain
 
 Important files:
 
 - `script.py`: current `C2Rv6` implementation
 - `bundle.yaml`: pyRevit button metadata
-- `r2cv6.md`: current implementation notes and remaining work
+- `c2rv6.md`: current implementation notes and remaining work

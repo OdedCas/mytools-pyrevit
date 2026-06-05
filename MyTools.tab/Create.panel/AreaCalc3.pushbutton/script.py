@@ -396,13 +396,43 @@ def get_usage_code(area):
     return None
 
 
+_USAGE_TYPE_NAME_PARAMS = [
+    "Usage Type Name", "UsageTypeName", "usage_type_name",
+    u"שם שימוש", u"שם_שימוש",
+]
+
+
+def get_usage_type_name(area):
+    for param_name in _USAGE_TYPE_NAME_PARAMS:
+        try:
+            p = area.LookupParameter(param_name)
+        except Exception:
+            p = None
+        if p is None or not p.HasValue:
+            continue
+        val = get_param_text(p)
+        if val:
+            return val
+    return ""
+
+
 def classify_by_code(code):
+    if code == 255:
+        return u"מצללה"
+    if code == 252:
+        return u"שטח מרוצף"
     if code == 300:
-        return u"הורדה"
+        return u"הורדות"
     if 250 <= code <= 302:
         return u"אחר"
     if 101 <= code <= 130:
         return u"שירות"
+    if code == 1:
+        return u"מגורים"
+    if code == 2:
+        return u"מסחר"
+    if code in (4, 7, 8, 9):
+        return u"תעסוקה"
     if 1 <= code <= 33:
         return u"עיקרי"
     return u"אחר"
@@ -410,8 +440,12 @@ def classify_by_code(code):
 
 def classify_by_name(area_name):
     source = normalize_text(area_name)
+    if u"מצלל" in source:
+        return u"מצללה"
+    if u"מרוצף" in source:
+        return u"שטח מרוצף"
     if u"הורד" in source:
-        return u"הורדה"
+        return u"הורדות"
     service_keywords = [
         u"ממ\"ד", u"ממד", u"מרחב מוגן", u"מקלט",
         u"מעלית", u"מדרגות", u"מבואה",
@@ -440,11 +474,45 @@ def classify_by_name(area_name):
     return u"אחר"
 
 
+def classify_service_subcat(source):
+    if u"חניה" in source or u"חנייה" in source or u"חניון" in source:
+        return u"חנייה"
+    if u"מבואה" in source or u"מדרגות" in source or u"מבוא" in source:
+        return u"מבואות ומדרגות"
+    if u"אחסנה" in source or u"מחסן" in source:
+        return u"אחסנה"
+    if u"מערכות" in source or u"טכני" in source:
+        return u"מערכות טכניות"
+    if u"בליטה" in source or u"בליטות" in source:
+        return u"בליטות"
+    if u"עמודים" in source or u"מפולשת" in source:
+        return u"קומות עמודים מפולשת"
+    return u"שירות"
+
+
+def classify_main_subcat(source):
+    if u"מגורים" in source or u"דירה" in source:
+        return u"מגורים"
+    if u"מסחר" in source or u"חנות" in source or u"הסעדה" in source:
+        return u"מסחר"
+    if u"משרד" in source or u"תעסוקה" in source or u"תעשייה" in source or u"מלאכה" in source:
+        return u"תעסוקה"
+    return u"עיקרי"
+
+
 def classify_category(area, area_name):
     code = get_usage_code(area)
     if code is not None:
-        return classify_by_code(code)
-    return classify_by_name(area_name)
+        cat = classify_by_code(code)
+    else:
+        cat = classify_by_name(area_name)
+    usage_type_name = get_usage_type_name(area)
+    combined = normalize_text(area_name + " " + usage_type_name)
+    if cat == u"שירות":
+        return classify_service_subcat(combined)
+    if cat == u"עיקרי":
+        return classify_main_subcat(combined)
+    return cat
 
 
 # ---------------------------------------------------------------------------
@@ -661,6 +729,16 @@ def build_content_types_xml(sheet_count):
 
 
 # ---------------------------------------------------------------------------
+# Category constants (order determines column order in summary)
+# ---------------------------------------------------------------------------
+
+MAIN_SUBCATS = [u"מגורים", u"מסחר", u"תעסוקה", u"עיקרי"]
+SERVICE_SUBCATS = [u"חנייה", u"מבואות ומדרגות", u"אחסנה", u"מערכות טכניות", u"בליטות", u"קומות עמודים מפולשת", u"שירות"]
+SPECIAL_CATS = [u"הורדות", u"שטח מרוצף", u"מצללה"]
+ALL_TRACKED_CATS = MAIN_SUBCATS + SERVICE_SUBCATS + SPECIAL_CATS
+
+
+# ---------------------------------------------------------------------------
 # Report builder
 # ---------------------------------------------------------------------------
 
@@ -683,7 +761,7 @@ def build_report_data(results, multipliers):
     detail_rows = []
     detail_styles = {}
     detail_rows.append([
-        u"מבנה", u"קומה", u"שם שטח", u"קטגוריה",
+        u"מבנה", u"קומה", u"שם שטח", u"שם שימוש", u"קטגוריה",
         u'שטח קומה אחת (מ"ר)', u"מספר חזרות", u'סה"כ (מ"ר)',
     ])
     detail_styles[1] = TITLE_XF
@@ -697,26 +775,32 @@ def build_report_data(results, multipliers):
                 detail_rows.append([])
             current_building = b
             ri = len(detail_rows) + 1
-            detail_rows.append([u"Building " + b, "", "", "", "", "", ""])
+            detail_rows.append([u"Building " + b, "", "", "", "", "", "", ""])
             detail_styles[ri] = building_title_xf[b]
         m = multipliers.get((b, row["level"]), 1)
         ri = len(detail_rows) + 1
         detail_rows.append([
-            b, row["level"], row["name"], row["category"],
+            b, row["level"], row["name"], row.get("usage_type_name", ""), row["category"],
             row["sqm"], m,
-            "=E{0}*F{0}".format(ri),
+            "=F{0}*G{0}".format(ri),
         ])
         detail_styles[ri] = building_data_xf[b]
 
     # --- Summary sheet ---
+    # Column layout (20 cols) — values already multiplied by חזרות:
+    # A=מבנה  B=קומה  C=חזרות
+    # D=מגורים  E=מסחר  F=תעסוקה  G=עיקרי  H=סה"כ עיקרי
+    # I=חנייה  J=מבואות ומדרגות  K=אחסנה  L=מערכות טכניות  M=בליטות  N=קומות עמודים מפולשת  O=שירות  P=סה"כ שירות
+    # Q=סה"כ עיקרי+שירות
+    # R=הורדות  S=שטח מרוצף  T=מצללה
     summary_rows = []
     summary_styles = {}
     summary_rows.append([
-        u"מבנה", u"קומה",
-        u'עיקרי - קומה אחת', u'שירות - קומה אחת', u'סה"כ (עיקרי+שירות) קומה אחת',
-        u'אחר (לא נכלל)', u"מספר חזרות",
-        u'עיקרי - סה"כ', u'שירות - סה"כ', u'סה"כ (עיקרי+שירות)',
-        u'אחר - סה"כ (לא נכלל)',
+        u"מבנה", u"קומה", u"מספר חזרות",
+        u"מגורים", u"מסחר", u"תעסוקה", u"עיקרי", u'סה"כ עיקרי',
+        u"חנייה", u"מבואות ומדרגות", u"אחסנה", u"מערכות טכניות", u"בליטות", u"קומות עמודים מפולשת", u"שירות", u'סה"כ שירות',
+        u'סה"כ עיקרי+שירות',
+        u"הורדות", u"שטח מרוצף", u"מצללה",
     ])
     summary_styles[1] = TITLE_XF
 
@@ -725,42 +809,60 @@ def build_report_data(results, multipliers):
         b = row["building"]
         lv = row["level"]
         cat = row["category"]
-        if cat == u"הורדה":
+        if cat == u"אחר":
             continue
         if b not in summary:
             summary[b] = {}
         if lv not in summary[b]:
-            summary[b][lv] = {u"עיקרי": 0.0, u"שירות": 0.0, u"אחר": 0.0}
+            summary[b][lv] = {}
+            for sc in ALL_TRACKED_CATS:
+                summary[b][lv][sc] = 0.0
         if cat in summary[b][lv]:
             summary[b][lv][cat] += row["sqm"]
-        else:
-            summary[b][lv][u"אחר"] += row["sqm"]
 
-    building_total_rows = {}  # b -> excel row index of building total row
+    building_total_rows = {}
+
+    def rng(col, f, l):
+        return "=SUM({0}{1}:{0}{2})".format(col, f, l)
+
+    def cell_sum(col, row_indices):
+        if not row_indices:
+            return 0
+        return "=" + "+".join("{0}{1}".format(col, r) for r in row_indices)
 
     for b in sorted(summary.keys()):
         ri = len(summary_rows) + 1
-        summary_rows.append([u"Building " + b, "", "", "", "", "", "", "", "", "", ""])
+        summary_rows.append([u"Building " + b] + [""] * 19)
         summary_styles[ri] = building_title_xf[b]
 
         first_data_ri = len(summary_rows) + 1
 
         for lv in sorted(summary[b].keys()):
-            m = multipliers.get((b, lv), 1)
+            mult = multipliers.get((b, lv), 1)
             cats = summary[b][lv]
             ri = len(summary_rows) + 1
-            c_val = round(cats[u"עיקרי"], 2)
-            d_val = round(cats[u"שירות"], 2)
-            f_val = round(cats[u"אחר"], 2)
+            d_v = round(cats[u"מגורים"] * mult, 2)
+            e_v = round(cats[u"מסחר"] * mult, 2)
+            f_v = round(cats[u"תעסוקה"] * mult, 2)
+            g_v = round(cats[u"עיקרי"] * mult, 2)
+            i_v = round(cats[u"חנייה"] * mult, 2)
+            j_v = round(cats[u"מבואות ומדרגות"] * mult, 2)
+            k_v = round(cats[u"אחסנה"] * mult, 2)
+            l_v = round(cats[u"מערכות טכניות"] * mult, 2)
+            m_v = round(cats[u"בליטות"] * mult, 2)
+            n_v = round(cats[u"קומות עמודים מפולשת"] * mult, 2)
+            o_v = round(cats[u"שירות"] * mult, 2)
+            r_v = round(cats[u"הורדות"] * mult, 2)
+            s_v = round(cats[u"שטח מרוצף"] * mult, 2)
+            t_v = round(cats[u"מצללה"] * mult, 2)
             summary_rows.append([
-                b, lv,
-                c_val, d_val,
-                "=C{0}+D{0}".format(ri),
-                f_val, m,
-                "=C{0}*G{0}".format(ri),
-                "=D{0}*G{0}".format(ri),
-                "=H{0}+I{0}".format(ri),
-                "=F{0}*G{0}".format(ri),
+                b, lv, mult,
+                d_v, e_v, f_v, g_v,
+                "=D{0}+E{0}+F{0}+G{0}".format(ri),
+                i_v, j_v, k_v, l_v, m_v, n_v, o_v,
+                "=I{0}+J{0}+K{0}+L{0}+M{0}+N{0}+O{0}".format(ri),
+                "=H{0}+P{0}".format(ri),
+                r_v, s_v, t_v,
             ])
             summary_styles[ri] = building_data_xf[b]
 
@@ -768,16 +870,24 @@ def build_report_data(results, multipliers):
         total_ri = len(summary_rows) + 1
         building_total_rows[b] = total_ri
         summary_rows.append([
-            u'סה"כ Building ' + b, "",
-            "=SUM(C{0}:C{1})".format(first_data_ri, last_data_ri),
-            "=SUM(D{0}:D{1})".format(first_data_ri, last_data_ri),
-            "=C{0}+D{0}".format(total_ri),
-            "=SUM(F{0}:F{1})".format(first_data_ri, last_data_ri),
-            "",
-            "=SUM(H{0}:H{1})".format(first_data_ri, last_data_ri),
-            "=SUM(I{0}:I{1})".format(first_data_ri, last_data_ri),
-            "=H{0}+I{0}".format(total_ri),
-            "=SUM(K{0}:K{1})".format(first_data_ri, last_data_ri),
+            u'סה"כ Building ' + b, "", "",
+            rng("D", first_data_ri, last_data_ri),
+            rng("E", first_data_ri, last_data_ri),
+            rng("F", first_data_ri, last_data_ri),
+            rng("G", first_data_ri, last_data_ri),
+            "=D{0}+E{0}+F{0}+G{0}".format(total_ri),
+            rng("I", first_data_ri, last_data_ri),
+            rng("J", first_data_ri, last_data_ri),
+            rng("K", first_data_ri, last_data_ri),
+            rng("L", first_data_ri, last_data_ri),
+            rng("M", first_data_ri, last_data_ri),
+            rng("N", first_data_ri, last_data_ri),
+            rng("O", first_data_ri, last_data_ri),
+            "=I{0}+J{0}+K{0}+L{0}+M{0}+N{0}+O{0}".format(total_ri),
+            "=H{0}+P{0}".format(total_ri),
+            rng("R", first_data_ri, last_data_ri),
+            rng("S", first_data_ri, last_data_ri),
+            rng("T", first_data_ri, last_data_ri),
         ])
         summary_styles[total_ri] = building_title_xf[b]
         summary_rows.append([])
@@ -786,22 +896,25 @@ def build_report_data(results, multipliers):
     grand_ri = len(summary_rows) + 1
     t_rows = sorted(building_total_rows.values())
 
-    def cell_sum(col, row_indices):
-        if not row_indices:
-            return 0
-        return "=" + "+".join("{0}{1}".format(col, r) for r in row_indices)
-
     summary_rows.append([
-        u'סה"כ כולל', "",
-        cell_sum("C", t_rows),
+        u'סה"כ כולל', "", "",
         cell_sum("D", t_rows),
-        "=C{0}+D{0}".format(grand_ri),
+        cell_sum("E", t_rows),
         cell_sum("F", t_rows),
-        "",
-        cell_sum("H", t_rows),
+        cell_sum("G", t_rows),
+        "=D{0}+E{0}+F{0}+G{0}".format(grand_ri),
         cell_sum("I", t_rows),
-        "=H{0}+I{0}".format(grand_ri),
+        cell_sum("J", t_rows),
         cell_sum("K", t_rows),
+        cell_sum("L", t_rows),
+        cell_sum("M", t_rows),
+        cell_sum("N", t_rows),
+        cell_sum("O", t_rows),
+        "=I{0}+J{0}+K{0}+L{0}+M{0}+N{0}+O{0}".format(grand_ri),
+        "=H{0}+P{0}".format(grand_ri),
+        cell_sum("R", t_rows),
+        cell_sum("S", t_rows),
+        cell_sum("T", t_rows),
     ])
     summary_styles[grand_ri] = HEADER_XF
 
@@ -884,10 +997,12 @@ def main():
         name = get_area_name(area)
         sqm = get_area_sqm(area)
         cat = classify_category(area, name)
+        usage_type_name = get_usage_type_name(area)
         results.append({
             "building": b,
             "level": lv,
             "name": name,
+            "usage_type_name": usage_type_name,
             "sqm": sqm,
             "category": cat,
         })

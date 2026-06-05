@@ -125,6 +125,7 @@ Maps layer name regex patterns to element categories:
 | `model_opening_end_clearance_cm` | 15.0 | Clamp opening center away from wall ends |
 | `model_place_synthetic_openings` | false | If false, synthetic fallback openings are not placed |
 | `enable_synthetic_window_fallback` | false | If true, recognition can add fallback window metadata |
+| `prefer_inner_wall_loop` | true (in `cad_config.json`) | Prefer inner-wall cycle over centerline cycle for final wall alignment |
 | `internal_wall_min_length_cm` | 30.0 | Minimum internal wall length to keep |
 | `internal_wall_perimeter_duplicate_tol_cm` | 12.0 | Reject internal walls that overlap perimeter walls |
 

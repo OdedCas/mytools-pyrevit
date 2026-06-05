@@ -6,6 +6,14 @@ from Autodesk.Revit.DB import *
 from Autodesk.Revit.DB.Structure import StructuralType
 import math
 import os
+import clr
+
+try:
+    clr.AddReference("System.Windows.Forms")
+    from System.Windows.Forms import OpenFileDialog, DialogResult
+except Exception:
+    OpenFileDialog = None
+    DialogResult = None
 
 try:
     from collections import defaultdict
@@ -145,9 +153,9 @@ USE_CAD_LAYER_WALLS = True
 USE_CAD_LAYER_OPENINGS = True
 USE_CAD_LAYER_CLASSIFICATION = True
 ENABLE_TOPOLOGY_FALLBACK_IF_LAYER_EMPTY = True
-STRICT_LAYER_FIRST_WALLS = True
-PHASE1_WALLS_ONLY = True
-MARK_ONLY_MODE = True
+STRICT_LAYER_FIRST_WALLS = False
+PHASE1_WALLS_ONLY = False
+MARK_ONLY_MODE = False
 MARK_USE_TOPOLOGY_FIRST = True
 
 CAD_LAYER_WALL_EXT_KEYS = ["a-wall-ext", "awallext"]
@@ -3043,20 +3051,82 @@ def create_curtain_walls(curtain_data, level):
     return created
 
 # ============================================================
+# CAD source resolution
+# ============================================================
+def pick_cad_path():
+    if OpenFileDialog is None:
+        return None
+    dialog = OpenFileDialog()
+    dialog.Filter = "CAD Files|*.dwg;*.dxf|DWG Files|*.dwg|DXF Files|*.dxf"
+    dialog.Multiselect = False
+    dialog.Title = "Select CAD file to import"
+    if dialog.ShowDialog() == DialogResult.OK:
+        return dialog.FileName
+    return None
+
+
+def import_cad_file_to_active_view(cad_path):
+    view = doc.ActiveView
+    if view is None or getattr(view, "IsTemplate", False):
+        return None, "Active view is not valid for CAD import."
+    t_imp = Transaction(doc, "C2Rv5 Import CAD")
+    try:
+        t_imp.Start()
+        opts = DWGImportOptions()
+        opts.ThisViewOnly = True
+        opts.OrientToView = True
+        opts.VisibleLayersOnly = True
+
+        imported_ref = clr.Reference[ElementId](ElementId.InvalidElementId)
+        ok = doc.Import(cad_path, opts, view, imported_ref)
+        if not ok:
+            t_imp.RollBack()
+            return None, "Revit failed to import CAD file."
+
+        t_imp.Commit()
+        imported_id = imported_ref.Value
+        inst = doc.GetElement(imported_id) if imported_id else None
+        if inst is None or not isinstance(inst, ImportInstance):
+            return None, "CAD imported but ImportInstance not found."
+        return inst, None
+    except Exception as ex:
+        try:
+            if t_imp.HasStarted():
+                t_imp.RollBack()
+        except Exception:
+            pass
+        return None, str(ex)
+
+
+def resolve_import_instance_or_prompt():
+    sel = list(uidoc.Selection.GetElementIds())
+    if len(sel) == 1:
+        selected = doc.GetElement(sel[0])
+        if isinstance(selected, ImportInstance):
+            return selected
+        print("Selection is not a CAD ImportInstance. Prompting for a DWG/DXF file.")
+    elif len(sel) > 1:
+        print("Multiple selected elements. Prompting for a DWG/DXF file.")
+
+    cad_path = pick_cad_path()
+    if not cad_path:
+        raise Exception("No CAD selected. Select one ImportInstance, or choose a DWG/DXF file.")
+
+    imported, err = import_cad_file_to_active_view(cad_path)
+    if imported is None:
+        raise Exception("Failed to import CAD file: %s" % (err or "unknown error"))
+    print("Imported CAD file: %s" % cad_path)
+    return imported
+
+# ============================================================
 # MAIN
 # ============================================================
-sel = list(uidoc.Selection.GetElementIds())
 print("Running %s" % BUILD_ID)
 if MARK_ONLY_MODE:
     print("Mode: MARK ONLY (no walls/doors/windows are created).")
 if PHASE1_WALLS_ONLY:
     print("Mode: PHASE 1 (walls only) - doors/windows are skipped; walls stay continuous.")
-if len(sel) != 1:
-    raise Exception("Select one ImportInstance (CAD link) and run again.")
-
-imp = doc.GetElement(sel[0])
-if not isinstance(imp, ImportInstance):
-    raise Exception("Selection is not an ImportInstance.")
+imp = resolve_import_instance_or_prompt()
 
 raw_lines, raw_arcs, geom_by_role, role_counts = extract_lines_and_arcs(imp)
 

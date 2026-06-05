@@ -29,6 +29,7 @@ def default_config():
         "opening_host_distance_mm": 70.0,
         "opening_gap_min_cm": 55.0,
         "opening_gap_max_cm": 260.0,
+        "enable_manual_opening_fallback": False,
         "opening_host_fallback_max_dist_cm": 180.0,
         "opening_symbol_reject_name_patterns": ["opening"],
         "opening_symbol_require_visible_geometry": True,

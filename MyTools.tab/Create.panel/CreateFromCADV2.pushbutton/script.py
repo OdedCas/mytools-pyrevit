@@ -287,6 +287,19 @@ def set_param(element, bip, value):
     return False
 
 
+def set_wall_location_centerline(wall):
+    if wall is None:
+        return False
+    try:
+        p = wall.get_Parameter(BuiltInParameter.WALL_KEY_REF_PARAM)
+        if p and (not p.IsReadOnly):
+            p.Set(int(WallLocationLine.WallCenterline))
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def set_param_by_names(element, names, value):
     if element is None:
         return False
@@ -640,6 +653,166 @@ def _nearest_wall_index_for_point_cm(px_cm, py_cm, wall_meta, max_dist_cm=None):
     return best_idx, best_dist
 
 
+def _wall_angle_from_meta_deg(wm):
+    dx = ft_to_cm(wm["center_end"].X - wm["center_start"].X)
+    dy = ft_to_cm(wm["center_end"].Y - wm["center_start"].Y)
+    if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+        return 0.0
+    return math.degrees(math.atan2(dy, dx))
+
+
+def _pick_wall_for_door_arc(arc, wall_meta, max_dist_cm=45.0, angle_tol_deg=25.0):
+    """Pick best host wall for a door swing arc and infer door-center point in cm.
+
+    Returns (wall_idx, center_x_cm, center_y_cm, radius_cm, score) or (None,...).
+    """
+    cx = _safe_float(arc.get("cx"), None)
+    cy = _safe_float(arc.get("cy"), None)
+    sx = _safe_float(arc.get("sx"), None)
+    sy = _safe_float(arc.get("sy"), None)
+    ex = _safe_float(arc.get("ex"), None)
+    ey = _safe_float(arc.get("ey"), None)
+    r = _safe_float(arc.get("r"), None)
+    if None in (cx, cy, sx, sy, ex, ey, r):
+        return None, None, None, None, None
+
+    rad_candidates = []
+    for px, py in ((sx, sy), (ex, ey)):
+        vx = float(px) - float(cx)
+        vy = float(py) - float(cy)
+        L = math.sqrt((vx * vx) + (vy * vy))
+        if L <= 1e-6:
+            continue
+        ang = math.degrees(math.atan2(vy, vx))
+        rad_candidates.append({
+            "ux": vx / L,
+            "uy": vy / L,
+            "ang": ang,
+            "px": float(px),
+            "py": float(py),
+            "len": L,
+        })
+    if not rad_candidates:
+        return None, None, None, None, None
+
+    best = None
+    for idx, wm in enumerate(wall_meta):
+        csx = ft_to_cm(wm["center_start"].X)
+        csy = ft_to_cm(wm["center_start"].Y)
+        cex = ft_to_cm(wm["center_end"].X)
+        cey = ft_to_cm(wm["center_end"].Y)
+        center_dist = _pt_seg_dist_cm(cx, cy, csx, csy, cex, cey)
+        if center_dist > float(max_dist_cm):
+            continue
+
+        wang = _wall_angle_from_meta_deg(wm)
+        for rv in rad_candidates:
+            ang_delta = _angle_delta_axis_deg(wang, rv["ang"])
+            if ang_delta > float(angle_tol_deg):
+                continue
+            end_dist = _pt_seg_dist_cm(rv["px"], rv["py"], csx, csy, cex, cey)
+            # Score: center on wall + endpoint near wall + angle agreement
+            score = (center_dist * 1.5) + (end_dist * 1.0) + (ang_delta * 0.8)
+
+            # Door insertion point should be at door-center, not at hinge center.
+            # Use the wall-aligned radius endpoint direction (closed-leaf direction).
+            door_half = max(30.0, min(75.0, float(r) * 0.5))
+            px = float(cx) + (rv["ux"] * door_half)
+            py = float(cy) + (rv["uy"] * door_half)
+
+            rec = {
+                "wall_idx": idx,
+                "px_cm": px,
+                "py_cm": py,
+                "r_cm": float(r),
+                "score": float(score),
+            }
+            if best is None or rec["score"] < best["score"]:
+                best = rec
+
+    if best is None:
+        return None, None, None, None, None
+    return best["wall_idx"], best["px_cm"], best["py_cm"], best["r_cm"], best["score"]
+
+
+def _dist_cm_xy(a_xy, b_xy):
+    dx = float(a_xy[0]) - float(b_xy[0])
+    dy = float(a_xy[1]) - float(b_xy[1])
+    return math.sqrt((dx * dx) + (dy * dy))
+
+
+def _opening_interval_overlap_ratio(a0, a1, b0, b1):
+    a0 = float(a0)
+    a1 = float(a1)
+    b0 = float(b0)
+    b1 = float(b1)
+    if a1 < a0:
+        a0, a1 = a1, a0
+    if b1 < b0:
+        b0, b1 = b1, b0
+    ov = max(0.0, min(a1, b1) - max(a0, b0))
+    denom = max(1.0, min(a1 - a0, b1 - b0))
+    return ov / denom
+
+
+def _prune_conflicting_openings(openings, cfg, snapshot=None):
+    """Remove overlapping door/window duplicates on the same host edge."""
+    ops = [dict(o) for o in (openings or [])]
+    if len(ops) < 2:
+        return ops
+
+    center_tol_cm = float((cfg or {}).get("opening_conflict_center_tol_cm", 25.0))
+    overlap_tol = float((cfg or {}).get("opening_conflict_overlap_ratio", 0.55))
+    drop = set()
+
+    for i in range(len(ops)):
+        if i in drop:
+            continue
+        oi = ops[i]
+        ti = str(oi.get("type", "")).lower()
+        if ti not in ("door", "window"):
+            continue
+
+        for j in range(i + 1, len(ops)):
+            if j in drop:
+                continue
+            oj = ops[j]
+            tj = str(oj.get("type", "")).lower()
+            if tj not in ("door", "window") or tj == ti:
+                continue
+            if int(oi.get("host_edge", -9999)) != int(oj.get("host_edge", -9999)):
+                continue
+
+            same_opening = False
+            ci = (_safe_float(oi.get("center_x_cm"), None), _safe_float(oi.get("center_y_cm"), None))
+            cj = (_safe_float(oj.get("center_x_cm"), None), _safe_float(oj.get("center_y_cm"), None))
+            if (ci[0] is not None) and (ci[1] is not None) and (cj[0] is not None) and (cj[1] is not None):
+                if _dist_cm_xy(ci, cj) <= center_tol_cm:
+                    same_opening = True
+
+            if (not same_opening) and all([k in oi for k in ("start_cm", "end_cm")]) and all([k in oj for k in ("start_cm", "end_cm")]):
+                ov = _opening_interval_overlap_ratio(
+                    oi.get("start_cm", 0.0), oi.get("end_cm", 0.0),
+                    oj.get("start_cm", 0.0), oj.get("end_cm", 0.0),
+                )
+                if ov >= overlap_tol:
+                    same_opening = True
+
+            if not same_opening:
+                continue
+
+            if ti == "door" and tj == "window":
+                drop.add(j)
+            elif ti == "window" and tj == "door":
+                drop.add(i)
+                break
+
+    out = [op for idx, op in enumerate(ops) if idx not in drop]
+    if snapshot is not None and len(out) != len(ops):
+        snapshot.log("Opening conflict prune: {} -> {}".format(len(ops), len(out)))
+    return out
+
+
 def _manual_pick_opening_pairs(kind):
     pairs = []
     while True:
@@ -692,6 +865,16 @@ def _convert_pair_to_opening(p1_ft, p2_ft, kind, edges, cfg):
 
 
 def maybe_manual_openings(topology, cfg, snapshot):
+    # V2 should run fully automatic by default. Manual picking can be re-enabled
+    # explicitly by setting "force_automatic_openings": false in cad_config.json.
+    if bool((cfg or {}).get("force_automatic_openings", True)):
+        snapshot.log("Manual opening fallback bypassed (force_automatic_openings=true)")
+        return topology
+
+    if not bool((cfg or {}).get("enable_manual_opening_fallback", False)):
+        snapshot.log("Manual opening fallback disabled; using automatic recognition only")
+        return topology
+
     openings = list(topology.get("openings") or [])
     door_count = len([o for o in openings if str(o.get("type", "")).lower() == "door"])
     window_count = len([o for o in openings if str(o.get("type", "")).lower() == "window"])
@@ -794,13 +977,23 @@ def cleanup_imported_cad_instance(instance_id, snapshot):
         snapshot.log("Failed removing CAD {}: {}".format(instance_id, ex))
 
 
-def build_model_from_topology(level, topology, cfg, snapshot):
+def build_model_from_topology(level, topology, cfg, snapshot, classified=None):
     poly_cm = list(topology.get("room_polygon_cm") or [])
     if len(poly_cm) < 3:
         raise Exception("Invalid recognized room polygon")
 
-    wall_thickness_cm = float(topology.get("measurements_cm", {}).get("wall_thickness_cm", cfg.get("default_wall_thickness_cm", 20.0)))
-    wall_type = get_wall_type_nearest(cm_to_ft(wall_thickness_cm))
+    measurements = dict(topology.get("measurements_cm", {}) or {})
+    wall_thickness_cm = float(measurements.get("wall_thickness_cm", cfg.get("default_wall_thickness_cm", 20.0)))
+    perimeter_wall_thickness_cm = float(measurements.get("perimeter_wall_thickness_cm", wall_thickness_cm))
+    internal_wall_thickness_cm = float(measurements.get("internal_wall_thickness_cm", perimeter_wall_thickness_cm))
+    wall_thickness_clusters_cm = [
+        float(v) for v in (measurements.get("wall_thickness_clusters_cm") or []) if _safe_float(v, None) is not None
+    ]
+    if not wall_thickness_clusters_cm:
+        wall_thickness_clusters_cm = [float(perimeter_wall_thickness_cm)]
+
+    wall_type = get_wall_type_nearest(cm_to_ft(perimeter_wall_thickness_cm))
+    internal_wall_type = get_wall_type_nearest(cm_to_ft(internal_wall_thickness_cm)) or wall_type
     floor_type = get_floor_type()
     if wall_type is None or floor_type is None:
         raise Exception("Missing WallType or FloorType in project")
@@ -819,7 +1012,6 @@ def build_model_from_topology(level, topology, cfg, snapshot):
     edge_to_run = dict(wall_runs_data.get("edge_to_run") or {})
 
     wall_height_ft = cm_to_ft(300.0)
-    half = wall_type.Width * 0.5
     min_wall_len_cm = float(cfg.get("model_wall_min_length_cm", 20.0))
     create_roof = bool(cfg.get("model_create_roof", False))
     skip_low_conf = bool(cfg.get("model_skip_low_confidence_openings", False))
@@ -827,6 +1019,7 @@ def build_model_from_topology(level, topology, cfg, snapshot):
 
     walls = []
     wall_meta = []
+    all_wall_meta = []
     run_to_wall_idx = {}
     door_ids = []
     window_ids = []
@@ -847,20 +1040,17 @@ def build_model_from_topology(level, topology, cfg, snapshot):
             if ln <= 1e-9:
                 continue
 
-            if area2 > 0.0:
-                ox = dy / ln
-                oy = -dx / ln
-            else:
-                ox = -dy / ln
-                oy = dx / ln
-
-            c0 = XYZ(p0.X + (ox * half), p0.Y + (oy * half), 0.0)
-            c1 = XYZ(p1.X + (ox * half), p1.Y + (oy * half), 0.0)
+            # The recognized perimeter in V2 is already wall-axis geometry.
+            # Do not offset again by half wall width.
+            c0 = XYZ(p0.X, p0.Y, 0.0)
+            c1 = XYZ(p1.X, p1.Y, 0.0)
 
             wall = Wall.Create(doc, Line.CreateBound(c0, c1), wall_type.Id, level.Id, wall_height_ft, 0.0, False, False)
+            set_wall_location_centerline(wall)
             run_to_wall_idx[run_idx] = len(walls)
             walls.append(wall)
-            wall_meta.append({
+            wm = {
+                "wall": wall,
                 "run_idx": run_idx,
                 "center_start": c0,
                 "center_end": c1,
@@ -868,7 +1058,9 @@ def build_model_from_topology(level, topology, cfg, snapshot):
                 "dir_y": dy / ln,
                 "len_ft": ln,
                 "len_cm": float(run.get("len_cm", 0.0)),
-            })
+            }
+            wall_meta.append(wm)
+            all_wall_meta.append(wm)
 
         if len(walls) < 3:
             raise Exception("Failed to create enough walls")
@@ -876,6 +1068,7 @@ def build_model_from_topology(level, topology, cfg, snapshot):
         # Create internal partition walls (detected centerline edges inside the polygon)
         internal_walls_cm = list(topology.get("internal_walls_cm") or [])
         internal_wall_ids = []
+        internal_walls = []
         internal_wall_rejected = 0
         internal_wall_errors = []
         min_internal_len_cm = float(cfg.get("internal_wall_min_length_cm", 30.0))
@@ -938,8 +1131,20 @@ def build_model_from_topology(level, topology, cfg, snapshot):
                     internal_wall_rejected += 1
                     internal_wall_reject_breakdown["too_short"] += 1
                     continue
-                iw_wall = Wall.Create(doc, Line.CreateBound(iw_p0, iw_p1), wall_type.Id, level.Id, wall_height_ft, 0.0, False, False)
+                iw_wall = Wall.Create(doc, Line.CreateBound(iw_p0, iw_p1), internal_wall_type.Id, level.Id, wall_height_ft, 0.0, False, False)
+                set_wall_location_centerline(iw_wall)
+                internal_walls.append(iw_wall)
                 internal_wall_ids.append(iw_wall.Id.IntegerValue)
+                all_wall_meta.append({
+                    "wall": iw_wall,
+                    "run_idx": None,
+                    "center_start": iw_p0,
+                    "center_end": iw_p1,
+                    "dir_x": iw_dx / iw_ln,
+                    "dir_y": iw_dy / iw_ln,
+                    "len_ft": iw_ln,
+                    "len_cm": iw_len_cm,
+                })
             except Exception as ex:
                 internal_wall_errors.append(str(ex))
                 internal_wall_reject_breakdown["error"] += 1
@@ -949,7 +1154,7 @@ def build_model_from_topology(level, topology, cfg, snapshot):
             roof = Floor.Create(doc, [build_loop(inner_pts)], floor_type.Id, level.Id)
             set_param(roof, BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM, wall_height_ft)
 
-        openings = list(topology.get("openings") or [])
+        openings = _prune_conflicting_openings(list(topology.get("openings") or []), cfg, snapshot)
         min_opening_conf = float(cfg.get("model_min_opening_confidence", 0.45))
         end_clear_cm = float(cfg.get("model_opening_end_clearance_cm", 15.0))
         end_clear_ft = cm_to_ft(end_clear_cm)
@@ -959,6 +1164,8 @@ def build_model_from_topology(level, topology, cfg, snapshot):
         opening_family_choices = []
         opening_family_rejects = []
         opening_host_fallback_count = 0
+        arc_door_supplement_placed = 0
+        arc_door_supplement_skipped = 0
 
         for op in openings:
             otype = str(op.get("type", "")).lower()
@@ -1120,6 +1327,145 @@ def build_model_from_topology(level, topology, cfg, snapshot):
 
             opening_attempts.append(attempt)
 
+        # Supplemental door placement directly from door arcs.
+        # This recovers doors on internal walls that perimeter-edge opening
+        # recognition cannot host.
+        if classified is not None and all_wall_meta:
+            arc_host_max_cm = float(cfg.get("door_arc_host_max_dist_cm", 45.0))
+            arc_dedup_cm = float(cfg.get("door_arc_dedup_dist_cm", 35.0))
+            arc_host_angle_tol_deg = float(cfg.get("door_arc_host_angle_tol_deg", 28.0))
+
+            placed_recs = []
+            for ai, att in enumerate(opening_attempts):
+                if att.get("status") != "placed":
+                    continue
+                pxy = att.get("point_xy_ft")
+                mw_idx = att.get("mapped_wall_idx", None)
+                if pxy is None or mw_idx is None:
+                    continue
+                placed_recs.append({
+                    "idx": ai,
+                    "type": str(att.get("type", "")).lower(),
+                    "wall_idx": int(mw_idx),
+                    "pt_cm": (ft_to_cm(float(pxy[0])), ft_to_cm(float(pxy[1]))),
+                })
+
+            for arc in list(classified.get("door_arcs") or []):
+                ax_cm = _safe_float(arc.get("cx"), None)
+                ay_cm = _safe_float(arc.get("cy"), None)
+                ar_cm = _safe_float(arc.get("r"), None)
+                if ax_cm is None or ay_cm is None or ar_cm is None:
+                    arc_door_supplement_skipped += 1
+                    continue
+                if ar_cm < 55.0 or ar_cm > 150.0:
+                    arc_door_supplement_skipped += 1
+                    continue
+
+                host_idx, pick_x_cm, pick_y_cm, pick_r_cm, _pick_score = _pick_wall_for_door_arc(
+                    arc,
+                    all_wall_meta,
+                    max_dist_cm=arc_host_max_cm,
+                    angle_tol_deg=arc_host_angle_tol_deg,
+                )
+                if host_idx is None or host_idx < 0 or host_idx >= len(all_wall_meta):
+                    arc_door_supplement_skipped += 1
+                    continue
+                if pick_x_cm is None or pick_y_cm is None:
+                    arc_door_supplement_skipped += 1
+                    continue
+
+                # Width is estimated from arc radius, but dedup should use the predicted
+                # door-center point on the host wall (not the hinge point).
+                est_door_w_cm = max(60.0, min(150.0, float(pick_r_cm if pick_r_cm is not None else ar_cm)))
+                dedup_tol_cm = max(float(arc_dedup_cm), min(55.0, est_door_w_cm * 0.40))
+
+                # Skip if a door is already placed on the same wall at this location.
+                duplicate_door = False
+                for pr in placed_recs:
+                    if pr["type"] != "door":
+                        continue
+                    if int(pr["wall_idx"]) != int(host_idx):
+                        continue
+                    if _dist_cm_xy(pr["pt_cm"], (pick_x_cm, pick_y_cm)) <= dedup_tol_cm:
+                        duplicate_door = True
+                        break
+                if duplicate_door:
+                    arc_door_supplement_skipped += 1
+                    continue
+
+                # If a window was placed at the same arc location on the same wall,
+                # replace it with a door.
+                for pr in placed_recs:
+                    if pr["type"] != "window":
+                        continue
+                    if int(pr["wall_idx"]) != int(host_idx):
+                        continue
+                    if _dist_cm_xy(pr["pt_cm"], (pick_x_cm, pick_y_cm)) > dedup_tol_cm:
+                        continue
+                    try:
+                        win_att = opening_attempts[pr["idx"]]
+                        win_id = win_att.get("instance_id")
+                        if win_id:
+                            doc.Delete(ElementId(int(win_id)))
+                            try:
+                                window_ids.remove(int(win_id))
+                            except Exception:
+                                pass
+                            win_att["status"] = "replaced_by_arc_door"
+                    except Exception:
+                        pass
+
+                host_wall = all_wall_meta[host_idx].get("wall")
+                if host_wall is None:
+                    arc_door_supplement_skipped += 1
+                    continue
+
+                dw = cm_to_ft(est_door_w_cm)  # door leaf width ~= swing radius
+                dh = cm_to_ft(float(cfg.get("default_door_height_cm", 210.0)))
+                sym = get_symbol_by_width(BuiltInCategory.OST_Doors, dw, cfg=cfg, audit=opening_family_rejects)
+                if sym is None:
+                    arc_door_supplement_skipped += 1
+                    continue
+                if not sym.IsActive:
+                    sym.Activate()
+                    doc.Regenerate()
+
+                raw_pt = XYZ(cm_to_ft(pick_x_cm), cm_to_ft(pick_y_cm), 0.0)
+                place_pt = _project_point_to_wall_axis(host_wall, raw_pt)
+                try:
+                    inst = doc.Create.NewFamilyInstance(place_pt, sym, host_wall, level, Structure.StructuralType.NonStructural)
+                    set_opening_size(inst, dw, dh, BuiltInParameter.DOOR_WIDTH, BuiltInParameter.DOOR_HEIGHT)
+                    door_ids.append(inst.Id.IntegerValue)
+                    opening_attempts.append({
+                        "type": "door",
+                        "status": "placed",
+                        "instance_id": inst.Id.IntegerValue,
+                        "symbol": _symbol_display_name(sym),
+                        "width_cm": float(est_door_w_cm),
+                        "confidence": 0.9,
+                        "mapped_wall_idx": int(host_idx),
+                        "point_xy_ft": [place_pt.X, place_pt.Y],
+                        "anchor_xy_cm": [ax_cm, ay_cm],
+                        "predicted_center_xy_cm": [float(pick_x_cm), float(pick_y_cm)],
+                        "source": "door_arc_supplement",
+                    })
+                    opening_family_choices.append({
+                        "type": "door",
+                        "instance_id": inst.Id.IntegerValue,
+                        "symbol": _symbol_display_name(sym),
+                        "width_ft": dw,
+                        "source": "door_arc_supplement",
+                    })
+                    placed_recs.append({
+                        "idx": len(opening_attempts) - 1,
+                        "type": "door",
+                        "wall_idx": int(host_idx),
+                        "pt_cm": (float(pick_x_cm), float(pick_y_cm)),
+                    })
+                    arc_door_supplement_placed += 1
+                except Exception:
+                    arc_door_supplement_skipped += 1
+
         t_geo.Commit()
 
         placed_attempts = [a for a in opening_attempts if a.get("status") == "placed"]
@@ -1145,6 +1491,11 @@ def build_model_from_topology(level, topology, cfg, snapshot):
                 "opening_failed_count": len(failed_attempts),
                 "opening_skipped_count": len(skipped_attempts),
                 "opening_attempts": opening_attempts[:120],
+                "arc_door_supplement_placed": int(arc_door_supplement_placed),
+                "arc_door_supplement_skipped": int(arc_door_supplement_skipped),
+                "perimeter_wall_thickness_cm": float(perimeter_wall_thickness_cm),
+                "internal_wall_thickness_cm": float(internal_wall_thickness_cm),
+                "wall_thickness_clusters_cm": wall_thickness_clusters_cm,
             },
             "dimensions": {
                 "ok": False,
@@ -1237,8 +1588,6 @@ def run_command():
     try:
         raw = extract_cad_from_view(doc, plan_view, cfg, target_instance_id=selected_id)
         classified = classify_entities(raw.get("lines", []), raw.get("arcs", []), layer_map, cfg=cfg)
-        topology = recognize_topology(classified, cfg)
-        topology = maybe_manual_openings(topology, cfg, snapshot)
 
         snapshot.save_json("01_raw_cad.json", raw)
         snapshot.save_json("02_classified.json", {
@@ -1253,9 +1602,12 @@ def run_command():
             "unclassified_arcs": len(classified.get("unclassified_arcs", [])),
             "ignored": classified.get("ignored", 0),
         })
+
+        topology = recognize_topology(classified, cfg)
+        topology = maybe_manual_openings(topology, cfg, snapshot)
         snapshot.save_json("03_topology.json", topology)
 
-        out = build_model_from_topology(level, topology, cfg, snapshot)
+        out = build_model_from_topology(level, topology, cfg, snapshot, classified=classified)
         model_created = True
 
         if post_action == "replace":

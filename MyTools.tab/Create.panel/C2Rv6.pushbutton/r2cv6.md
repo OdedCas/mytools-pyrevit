@@ -38,7 +38,7 @@ For the current test DWG, one small false interior fragment still survives in th
 
 The next debugging step, if needed, should be:
 
-1. export/log final `int_center` line segments before Revit wall creation
+1. inspect final `int_center` line segments before Revit wall creation
 2. identify the exact surviving segment in coordinates
 3. remove that case with a geometric rule instead of broad tolerance changes
 
