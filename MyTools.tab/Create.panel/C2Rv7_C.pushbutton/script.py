@@ -5225,14 +5225,88 @@ def _create_apartment_areas(v2, level, cfg, ext_center, int_center, core_center,
     core_lines = [_extend_line_to_outer_polygon_cm(ln, outer_polygon, core_near_cm, core_max_cm)
                   for ln in (core_center or [])]
 
-    # Sep lines: extend endpoints that are within ~3×wall-thickness of the OUTER
-    # boundary.  Endpoints deep in the interior (near staircase or another sep-line)
-    # are left at their original position — their small residual gap is closed by the
-    # graph snap tolerance below.  This prevents cross-building extension artifacts.
+    # Sep lines: extend endpoints that are within near_cm of EITHER the outer
+    # polygon OR a core (staircase) line.  This closes the 30-cm gap to the outer
+    # wall AND the small gap to the staircase boundary, without ever extending
+    # deep-interior endpoints across the building.
     sep_near_cm = max(80.0, float(ext_thick_cm) * 3.0)
     sep_max_cm  = max(160.0, float(ext_thick_cm) * 6.0)
-    sep_lines = [_extend_line_to_outer_polygon_cm(ln, outer_polygon, sep_near_cm, sep_max_cm)
-                 for ln in sep_lines]
+
+    def _ext_sep_endpoint(pt, other, polygon, extra, near, mx):
+        """Extend pt if within near of polygon or any extra segment."""
+        dist_poly = _point_polyline_distance_cm(pt, polygon)
+        dist_extra = mx + 1.0
+        for seg in (extra or []):
+            d, _ = _nearest_point_on_segment_cm(
+                pt,
+                (float(seg.get("x1", 0.0)), float(seg.get("y1", 0.0))),
+                (float(seg.get("x2", 0.0)), float(seg.get("y2", 0.0))),
+            )
+            if d < dist_extra:
+                dist_extra = d
+        if dist_poly > near and dist_extra > near:
+            return pt
+        dx = float(pt[0]) - float(other[0])
+        dy = float(pt[1]) - float(other[1])
+        ln = math.sqrt(dx * dx + dy * dy)
+        if ln <= 1.0e-9:
+            return pt
+        d = (dx / ln, dy / ln)
+        best = None
+        for i in range(len(polygon)):
+            hit = _ray_segment_intersection_cm(
+                pt, d, polygon[i], polygon[(i + 1) % len(polygon)])
+            if hit is None:
+                continue
+            t, hp = hit
+            if t < 0.5 or t > mx:
+                continue
+            if best is None or t < best[0]:
+                best = (t, hp)
+        for seg in (extra or []):
+            a = (float(seg.get("x1", 0.0)), float(seg.get("y1", 0.0)))
+            b = (float(seg.get("x2", 0.0)), float(seg.get("y2", 0.0)))
+            hit = _ray_segment_intersection_cm(pt, d, a, b)
+            if hit is None:
+                continue
+            t, hp = hit
+            if t < 0.5 or t > mx:
+                continue
+            if best is None or t < best[0]:
+                best = (t, hp)
+        if best is not None:
+            return best[1]
+        best_snap = None
+        for i in range(len(polygon)):
+            dd, hp = _nearest_point_on_segment_cm(
+                pt, polygon[i], polygon[(i + 1) % len(polygon)])
+            if dd > near:
+                continue
+            if best_snap is None or dd < best_snap[0]:
+                best_snap = (dd, hp)
+        for seg in (extra or []):
+            a = (float(seg.get("x1", 0.0)), float(seg.get("y1", 0.0)))
+            b = (float(seg.get("x2", 0.0)), float(seg.get("y2", 0.0)))
+            dd, hp = _nearest_point_on_segment_cm(pt, a, b)
+            if dd > near:
+                continue
+            if best_snap is None or dd < best_snap[0]:
+                best_snap = (dd, hp)
+        return best_snap[1] if best_snap else pt
+
+    def _ext_sep_line(ln):
+        p1 = (float(ln.get("x1", 0.0)), float(ln.get("y1", 0.0)))
+        p2 = (float(ln.get("x2", 0.0)), float(ln.get("y2", 0.0)))
+        n1 = _ext_sep_endpoint(p1, p2, outer_polygon, core_lines,
+                               sep_near_cm, sep_max_cm)
+        n2 = _ext_sep_endpoint(p2, p1, outer_polygon, core_lines,
+                               sep_near_cm, sep_max_cm)
+        out = dict(ln)
+        out["x1"], out["y1"] = n1
+        out["x2"], out["y2"] = n2
+        return out
+
+    sep_lines = [_ext_sep_line(ln) for ln in sep_lines]
 
     # Graph snap tolerance: use the larger of the configured value and half the
     # exterior wall thickness so small gaps between sep-lines, and between
