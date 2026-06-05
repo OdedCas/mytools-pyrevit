@@ -5166,19 +5166,23 @@ def _create_apartment_areas(v2, level, cfg, ext_center, int_center, core_center,
     else:
         _diag = 500.0
 
-    # Step 1 — Core lines: extend with a small tolerance so they close the
-    # staircase polygon without spanning the whole building.
+    # Core lines: extend with small tolerance to close the staircase polygon.
     core_near_cm = max(80.0, float(ext_thick_cm) * 3.0)
     core_max_cm  = max(160.0, float(ext_thick_cm) * 6.0)
     core_lines = [_extend_line_to_outer_polygon_cm(ln, outer_polygon, core_near_cm, core_max_cm)
                   for ln in (core_center or [])]
 
-    # Step 2 — Sep lines: each endpoint fires a ray and stops at the NEAREST
-    # boundary — either the outer wall or a staircase core line.  This prevents
-    # apartment dividers from crossing through the core to the opposite outer wall.
-    all_boundaries = outer_segments + core_lines
-    sep_lines = [_extend_line_to_segments(ln, all_boundaries, _diag)
+    # Sep lines — multi-pass extension so perpendicular dividers connect.
+    # Pass 1: each endpoint fires a ray to the outer boundary (large tolerance).
+    # Pass 2-4: re-fire to (outer + already-extended sep_lines) so that an
+    #   endpoint that overshot snaps back to the nearest perpendicular sep_line.
+    #   No hardcoded distances — uses building diagonal derived from geometry.
+    sep_lines = [_extend_line_to_segments(ln, outer_segments, _diag)
                  for ln in sep_lines]
+    for _pass in range(3):
+        targets = outer_segments + sep_lines
+        sep_lines = [_extend_line_to_segments(ln, targets, _diag)
+                     for ln in sep_lines]
 
     boundary_segments = outer_segments + sep_lines + core_lines
     graph = _build_area_graph_cm(boundary_segments, snap_tol_cm, min_boundary_cm)
