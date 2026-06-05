@@ -4762,6 +4762,63 @@ def _extend_line_to_outer_polygon_cm(ln, outer_polygon, near_cm, max_extend_cm):
     return out
 
 
+def _extend_endpoint_to_segments(pt, other, segments, max_extend_cm):
+    """Extend endpoint toward the nearest segment in a list of {x1,y1,x2,y2} dicts.
+
+    Fires a ray from pt in the direction (pt - other) and returns the nearest
+    hit point within max_extend_cm.  Falls back to nearest-point snap for
+    parallel walls.  No fixed distance threshold — works at any building scale.
+    """
+    dx = float(pt[0]) - float(other[0])
+    dy = float(pt[1]) - float(other[1])
+    ln = math.sqrt(dx * dx + dy * dy)
+    if ln <= 1.0e-9:
+        return pt
+    d = (dx / ln, dy / ln)
+    best = None
+    for seg in (segments or []):
+        a = (float(seg.get("x1", 0.0)), float(seg.get("y1", 0.0)))
+        b = (float(seg.get("x2", 0.0)), float(seg.get("y2", 0.0)))
+        hit = _ray_segment_intersection_cm(pt, d, a, b)
+        if hit is None:
+            continue
+        t, hp = hit
+        if t < 1.0:             # skip intersections at/behind the endpoint
+            continue
+        if t > float(max_extend_cm):
+            continue
+        if best is None or t < best[0]:
+            best = (t, hp)
+    if best is not None:
+        return best[1]
+    # Parallel fallback: snap to nearest point on any segment within 50 cm
+    snap_tol = 50.0
+    best_snap = None
+    for seg in (segments or []):
+        a = (float(seg.get("x1", 0.0)), float(seg.get("y1", 0.0)))
+        b = (float(seg.get("x2", 0.0)), float(seg.get("y2", 0.0)))
+        dist, hp = _nearest_point_on_segment_cm(pt, a, b)
+        if dist > snap_tol:
+            continue
+        if best_snap is None or dist < best_snap[0]:
+            best_snap = (dist, hp)
+    if best_snap is not None:
+        return best_snap[1]
+    return pt
+
+
+def _extend_line_to_segments(ln, segments, max_extend_cm):
+    """Extend both endpoints of ln to the nearest segment in segments."""
+    p1 = (float(ln.get("x1", 0.0)), float(ln.get("y1", 0.0)))
+    p2 = (float(ln.get("x2", 0.0)), float(ln.get("y2", 0.0)))
+    n1 = _extend_endpoint_to_segments(p1, p2, segments, max_extend_cm)
+    n2 = _extend_endpoint_to_segments(p2, p1, segments, max_extend_cm)
+    out = dict(ln)
+    out["x1"], out["y1"] = n1
+    out["x2"], out["y2"] = n2
+    return out
+
+
 def _segment_intersection_params_cm(a, b):
     ax, ay = float(a["x1"]), float(a["y1"])
     bx, by = float(a["x2"]), float(a["y2"])
@@ -5101,25 +5158,27 @@ def _create_apartment_areas(v2, level, cfg, ext_center, int_center, core_center,
         if float(t_cm) + 1.0e-6 >= sep_min_cm:
             sep_lines.append(ln)
 
-    # Sep-lines (apartment dividers) must reach the outer boundary regardless of
-    # building size — derive tolerances from the bounding-box diagonal.
+    # Derive max extension from the actual building diagonal — no hardcoded lengths.
     if outer_polygon:
         _xs = [p[0] for p in outer_polygon]
         _ys = [p[1] for p in outer_polygon]
         _diag = math.sqrt((max(_xs) - min(_xs)) ** 2 + (max(_ys) - min(_ys)) ** 2)
     else:
         _diag = 500.0
-    sep_near_cm = max(_diag * 0.6, 80.0)
-    sep_max_cm  = max(_diag, 160.0)
-    sep_lines = [_extend_line_to_outer_polygon_cm(ln, outer_polygon, sep_near_cm, sep_max_cm)
-                 for ln in sep_lines]
 
-    # Core lines (staircase/elevator walls) only need to close the core polygon
-    # among themselves — use a small tolerance so they never span the whole building.
+    # Step 1 — Core lines: extend with a small tolerance so they close the
+    # staircase polygon without spanning the whole building.
     core_near_cm = max(80.0, float(ext_thick_cm) * 3.0)
     core_max_cm  = max(160.0, float(ext_thick_cm) * 6.0)
     core_lines = [_extend_line_to_outer_polygon_cm(ln, outer_polygon, core_near_cm, core_max_cm)
                   for ln in (core_center or [])]
+
+    # Step 2 — Sep lines: each endpoint fires a ray and stops at the NEAREST
+    # boundary — either the outer wall or a staircase core line.  This prevents
+    # apartment dividers from crossing through the core to the opposite outer wall.
+    all_boundaries = outer_segments + core_lines
+    sep_lines = [_extend_line_to_segments(ln, all_boundaries, _diag)
+                 for ln in sep_lines]
 
     boundary_segments = outer_segments + sep_lines + core_lines
     graph = _build_area_graph_cm(boundary_segments, snap_tol_cm, min_boundary_cm)
