@@ -5101,19 +5101,24 @@ def _create_apartment_areas(v2, level, cfg, ext_center, int_center, core_center,
         if float(t_cm) + 1.0e-6 >= sep_min_cm:
             sep_lines.append(ln)
 
-    # Scale extension tolerances to the actual building size so interior walls
-    # always reach the outer boundary regardless of building dimensions.
+    # Sep-lines (apartment dividers) must reach the outer boundary regardless of
+    # building size — derive tolerances from the bounding-box diagonal.
     if outer_polygon:
         _xs = [p[0] for p in outer_polygon]
         _ys = [p[1] for p in outer_polygon]
         _diag = math.sqrt((max(_xs) - min(_xs)) ** 2 + (max(_ys) - min(_ys)) ** 2)
     else:
         _diag = 500.0
-    near_cm = max(_diag * 0.6, 80.0)
-    max_extend_cm = max(_diag, 160.0)
-    sep_lines = [_extend_line_to_outer_polygon_cm(ln, outer_polygon, near_cm, max_extend_cm)
+    sep_near_cm = max(_diag * 0.6, 80.0)
+    sep_max_cm  = max(_diag, 160.0)
+    sep_lines = [_extend_line_to_outer_polygon_cm(ln, outer_polygon, sep_near_cm, sep_max_cm)
                  for ln in sep_lines]
-    core_lines = [_extend_line_to_outer_polygon_cm(ln, outer_polygon, near_cm, max_extend_cm)
+
+    # Core lines (staircase/elevator walls) only need to close the core polygon
+    # among themselves — use a small tolerance so they never span the whole building.
+    core_near_cm = max(80.0, float(ext_thick_cm) * 3.0)
+    core_max_cm  = max(160.0, float(ext_thick_cm) * 6.0)
+    core_lines = [_extend_line_to_outer_polygon_cm(ln, outer_polygon, core_near_cm, core_max_cm)
                   for ln in (core_center or [])]
 
     boundary_segments = outer_segments + sep_lines + core_lines
