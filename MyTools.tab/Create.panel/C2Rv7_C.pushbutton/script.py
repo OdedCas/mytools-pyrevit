@@ -5101,8 +5101,16 @@ def _create_apartment_areas(v2, level, cfg, ext_center, int_center, core_center,
         if float(t_cm) + 1.0e-6 >= sep_min_cm:
             sep_lines.append(ln)
 
-    near_cm = max(80.0, float(ext_thick_cm) * 3.0)
-    max_extend_cm = max(160.0, float(ext_thick_cm) * 6.0)
+    # Scale extension tolerances to the actual building size so interior walls
+    # always reach the outer boundary regardless of building dimensions.
+    if outer_polygon:
+        _xs = [p[0] for p in outer_polygon]
+        _ys = [p[1] for p in outer_polygon]
+        _diag = math.sqrt((max(_xs) - min(_xs)) ** 2 + (max(_ys) - min(_ys)) ** 2)
+    else:
+        _diag = 500.0
+    near_cm = max(_diag * 0.6, 80.0)
+    max_extend_cm = max(_diag, 160.0)
     sep_lines = [_extend_line_to_outer_polygon_cm(ln, outer_polygon, near_cm, max_extend_cm)
                  for ln in sep_lines]
     core_lines = [_extend_line_to_outer_polygon_cm(ln, outer_polygon, near_cm, max_extend_cm)
@@ -5110,6 +5118,27 @@ def _create_apartment_areas(v2, level, cfg, ext_center, int_center, core_center,
 
     boundary_segments = outer_segments + sep_lines + core_lines
     graph = _build_area_graph_cm(boundary_segments, snap_tol_cm, min_boundary_cm)
+
+    if snapshot:
+        try:
+            all_faces = graph.get("faces", [])
+            face_areas = sorted([abs(_polygon_area_cm2(f)) / 10000.0 for f in all_faces], reverse=True)
+            snapshot.log("APT-DBG ext_loop={} outer_segs={} sep={} core={} graph_edges={} graph_faces={} face_sqm={}".format(
+                len(ext_loop), len(outer_segments), len(sep_lines), len(core_lines),
+                len(graph.get("edges", [])), len(all_faces),
+                ",".join("{:.1f}".format(a) for a in face_areas[:8])))
+            snapshot.log("APT-DBG outer_poly_area={:.1f}sqm ext_thick={}cm snap_tol={}cm".format(
+                abs(_polygon_area_cm2(outer_polygon)) / 10000.0, ext_thick_cm, snap_tol_cm))
+            snapshot.save_json("apt_debug_outer_polygon.json", {
+                "ext_loop": [[round(x, 1), round(y, 1)] for x, y in ext_loop],
+                "outer_polygon": [[round(x, 1), round(y, 1)] for x, y in outer_polygon],
+                "sep_lines": [{"x1": round(l["x1"],1), "y1": round(l["y1"],1),
+                               "x2": round(l["x2"],1), "y2": round(l["y2"],1)} for l in sep_lines],
+                "core_lines_count": len(core_lines),
+                "face_areas_sqm": [round(a, 2) for a in face_areas[:20]],
+            })
+        except Exception:
+            pass
 
     core_graph = _build_area_graph_cm(core_lines, snap_tol_cm, min_boundary_cm)
     core_polys = [p for p in core_graph.get("faces", []) if abs(_polygon_area_cm2(p)) >= 10000.0]
