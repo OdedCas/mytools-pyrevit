@@ -4699,6 +4699,22 @@ def _ray_segment_intersection_cm(p, d, a, b):
     return (t, (px + t * dx, py + t * dy))
 
 
+def _nearest_point_on_segment_cm(pt, a, b):
+    """Return (distance, point) of closest point on segment a-b to pt."""
+    ax, ay = float(a[0]), float(a[1])
+    bx, by = float(b[0]), float(b[1])
+    px, py = float(pt[0]), float(pt[1])
+    dx, dy = bx - ax, by - ay
+    seg_len2 = dx * dx + dy * dy
+    if seg_len2 < 1.0e-18:
+        d = math.sqrt((px - ax) ** 2 + (py - ay) ** 2)
+        return (d, (ax, ay))
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / seg_len2))
+    cx, cy = ax + t * dx, ay + t * dy
+    d = math.sqrt((px - cx) ** 2 + (py - cy) ** 2)
+    return (d, (cx, cy))
+
+
 def _extend_endpoint_to_polygon(pt, other, polygon, near_cm, max_extend_cm):
     if _point_polyline_distance_cm(pt, polygon) > float(near_cm):
         return pt
@@ -4718,9 +4734,21 @@ def _extend_endpoint_to_polygon(pt, other, polygon, near_cm, max_extend_cm):
             continue
         if best is None or t < best[0]:
             best = (t, hp)
-    if best is None:
-        return pt
-    return best[1]
+    if best is not None:
+        return best[1]
+    # Fallback: ray missed (wall parallel to outer boundary segment).
+    # Snap the endpoint to the nearest point on the outer polygon boundary
+    # if it is within max_extend_cm.
+    best_snap = None
+    for i in range(len(polygon)):
+        dist, hp = _nearest_point_on_segment_cm(pt, polygon[i], polygon[(i + 1) % len(polygon)])
+        if dist > float(max_extend_cm):
+            continue
+        if best_snap is None or dist < best_snap[0]:
+            best_snap = (dist, hp)
+    if best_snap is not None:
+        return best_snap[1]
+    return pt
 
 
 def _extend_line_to_outer_polygon_cm(ln, outer_polygon, near_cm, max_extend_cm):
@@ -4952,6 +4980,83 @@ def _find_or_create_area_plan(v2, level, snapshot=None):
         return None
 
 
+def _refine_loop_corners(polygon, max_correct_cm=60.0):
+    """Replace diagonal bridge segments with proper right-angle corners.
+
+    When _chain_ext_wall_loop bridges a gap between two wall segments it
+    inserts a diagonal edge.  This function detects those diagonal edges,
+    computes the intersection of the two flanking wall lines, and replaces
+    the two bridge-endpoint vertices with that single clean corner vertex.
+    Works iteratively so that multiple consecutive bridges are all removed.
+    """
+    if len(polygon) < 4:
+        return list(polygon)
+
+    def _dir(a, b):
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        ln = math.sqrt(dx * dx + dy * dy)
+        return (dx / ln, dy / ln) if ln > 1.0e-9 else None
+
+    def _isect(p1, d1, p2, d2):
+        den = d1[0] * d2[1] - d1[1] * d2[0]
+        if abs(den) < 1.0e-9:
+            return None
+        dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+        t = (dx * d2[1] - dy * d2[0]) / den
+        return (p1[0] + t * d1[0], p1[1] + t * d1[1])
+
+    result = list(polygon)
+    for _pass in range(len(polygon) + 4):
+        n = len(result)
+        if n < 4:
+            break
+        bridge_idx = None
+        for i in range(n):
+            a = result[i]
+            b = result[(i + 1) % n]
+            dx = abs(b[0] - a[0])
+            dy = abs(b[1] - a[1])
+            total = math.sqrt(dx * dx + dy * dy)
+            if total < 1.0:
+                continue
+            # Diagonal: neither edge is mostly horizontal nor mostly vertical
+            if dx / total > 0.12 and dy / total > 0.12:
+                bridge_idx = i
+                break
+        if bridge_idx is None:
+            break
+        bi = bridge_idx
+        n = len(result)
+        ai = (bi - 1) % n
+        ci = (bi + 1) % n
+        di = (bi + 2) % n
+        da = _dir(result[ai], result[bi])
+        dc = _dir(result[ci], result[di])
+        if da is None or dc is None:
+            break
+        # The two flanking walls must be roughly perpendicular
+        dot = abs(da[0] * dc[0] + da[1] * dc[1])
+        if dot > 0.4:
+            break
+        hit = _isect(result[ai], da, result[ci], dc)
+        if hit is None:
+            break
+        mid = ((result[bi][0] + result[ci][0]) * 0.5,
+               (result[bi][1] + result[ci][1]) * 0.5)
+        if math.sqrt((hit[0] - mid[0]) ** 2 + (hit[1] - mid[1]) ** 2) > max_correct_cm:
+            break
+        new_r = []
+        for idx in range(n):
+            if idx == bi:
+                new_r.append(hit)
+            elif idx == ci:
+                pass
+            else:
+                new_r.append(result[idx])
+        result = new_r
+    return result
+
+
 def _create_apartment_areas(v2, level, cfg, ext_center, int_center, core_center,
                             int_raw, ext_thick_cm, int_thick_cm, core_thick_cm,
                             snapshot=None):
@@ -4972,7 +5077,11 @@ def _create_apartment_areas(v2, level, cfg, ext_center, int_center, core_center,
     snap_tol_cm = float((cfg or {}).get("apartment_area_snap_tol_cm", 4.0))
     min_boundary_cm = float((cfg or {}).get("apartment_area_min_boundary_segment_cm", 5.0))
 
-    ext_loop = _chain_center_loop_cm(ext_center, max(6.0, snap_tol_cm * 2.0), snapshot=snapshot)
+    # Snap tolerance: large enough to close the half-wall-thickness gap that
+    # appears when ext_center endpoints stop at the face of the adjacent wall.
+    chain_tol_cm = max(snap_tol_cm * 2.0, ext_thick_cm * 0.7, 20.0)
+    ext_loop = _chain_center_loop_cm(ext_center, chain_tol_cm, snapshot=snapshot)
+    ext_loop = _refine_loop_corners(ext_loop, max_correct_cm=max(60.0, ext_thick_cm * 2.5))
     if len(ext_loop) < 3:
         if snapshot:
             try:

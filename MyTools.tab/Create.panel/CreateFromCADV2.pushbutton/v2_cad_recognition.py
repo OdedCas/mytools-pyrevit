@@ -79,6 +79,29 @@ def _centroid_of_line_mids(lines):
     return (sx / n, sy / n)
 
 
+def _line_bbox_area(lines):
+    vals = []
+    for ln in (lines or []):
+        try:
+            x1 = float(ln["x1"])
+            y1 = float(ln["y1"])
+            x2 = float(ln["x2"])
+            y2 = float(ln["y2"])
+        except Exception:
+            continue
+        vals.append((x1, y1))
+        vals.append((x2, y2))
+    if len(vals) < 2:
+        return 0.0
+    xs = [p[0] for p in vals]
+    ys = [p[1] for p in vals]
+    w = max(xs) - min(xs)
+    h = max(ys) - min(ys)
+    if w <= 0.0 or h <= 0.0:
+        return 0.0
+    return float(w * h)
+
+
 def _merge_collinear_overlapping(lines, perp_tol=5.0, gap_tol=2.0):
     """Merge overlapping collinear lines into maximal segments.
 
@@ -124,11 +147,13 @@ def _merge_collinear_overlapping(lines, perp_tol=5.0, gap_tol=2.0):
         })
 
     # Group by angle bucket (within 2 degrees)
-    from collections import defaultdict
-    angle_groups = defaultdict(list)
+    angle_groups = {}
     for e in entries:
         if e is not None:
-            angle_groups[e["ang"]].append(e)
+            k = e["ang"]
+            if k not in angle_groups:
+                angle_groups[k] = []
+            angle_groups[k].append(e)
 
     merged_out = []
     used = set()
@@ -257,23 +282,35 @@ def _extend_to_intersections(lines, ext_tol=50.0):
             ix = x1i + t * uxi
             iy = y1i + t * uyi
 
-            # Check if intersection is near the end of line i (within ext_tol)
-            # t=0 is start, t=leni is end
+            # Skip if intersection is completely outside either segment's tolerance band
             if t < -ext_tol or t > leni + ext_tol:
                 continue
             if s < -ext_tol or s > lenj + ext_tol:
                 continue
 
-            # Extend line i: if intersection is beyond start/end
+            # Trim tolerance: small window for catching overshoots (≤20 cm).
+            # Kept well below ext_tol so T-junction through-walls are never snapped.
+            trim_tol = min(ext_tol * 0.35, 20.0)
+
+            # Line i: extend if outside, trim if slightly inside near an endpoint
             if t < 0:
                 end_ext[i]["start"].append((ix, iy, -t))
             elif t > leni:
                 end_ext[i]["end"].append((ix, iy, t - leni))
-            # Similarly for line j
+            elif t <= trim_tol:
+                end_ext[i]["start"].append((ix, iy, t))
+            elif t >= leni - trim_tol:
+                end_ext[i]["end"].append((ix, iy, leni - t))
+
+            # Line j: same logic
             if s < 0:
                 end_ext[j]["start"].append((ix, iy, -s))
             elif s > lenj:
                 end_ext[j]["end"].append((ix, iy, s - lenj))
+            elif s <= trim_tol:
+                end_ext[j]["start"].append((ix, iy, s))
+            elif s >= lenj - trim_tol:
+                end_ext[j]["end"].append((ix, iy, lenj - s))
 
     # Apply extensions: pick the closest intersection at each end
     out = []
@@ -598,6 +635,7 @@ def _collapse_double_wall_lines(lines, cfg):
             "paired_count": 0,
             "estimated_wall_thickness_cm": None,
             "pairs": [],
+            "pair_distances_cm": [],
         }
 
     selected_pairs, pair_dists, used = _find_wall_pairs(lines, cfg)
@@ -609,6 +647,7 @@ def _collapse_double_wall_lines(lines, cfg):
             "paired_count": 0,
             "estimated_wall_thickness_cm": None,
             "pairs": [],
+            "pair_distances_cm": [],
         }
 
     # Use centerlines as initial collapse (works for any shape)
@@ -629,7 +668,59 @@ def _collapse_double_wall_lines(lines, cfg):
         "paired_count": len(selected_pairs),
         "estimated_wall_thickness_cm": est,
         "pairs": selected_pairs,
+        "pair_distances_cm": [float(d) for d in pair_dists],
     }
+
+
+def _cluster_1d(values, tol):
+    vals = sorted([float(v) for v in (values or []) if float(v) > 0.0])
+    if not vals:
+        return []
+
+    clusters = [[vals[0]]]
+    for v in vals[1:]:
+        curr = clusters[-1]
+        cmean = sum(curr) / float(len(curr))
+        if abs(v - cmean) <= float(tol):
+            curr.append(v)
+        else:
+            clusters.append([v])
+
+    # Largest support first, then thicker walls first.
+    ranked = sorted(
+        [(sum(c) / float(len(c)), len(c)) for c in clusters],
+        key=lambda x: (x[1], x[0]),
+        reverse=True,
+    )
+    return [float(r[0]) for r in ranked]
+
+
+def _select_pair_lines_by_thickness(lines, pairs, pair_dists, target_thickness_cm, tol_cm):
+    idxs = set()
+    if not pairs or not pair_dists:
+        return []
+    tol = float(tol_cm)
+    target = float(target_thickness_cm)
+    for k, pair in enumerate(pairs):
+        if k >= len(pair_dists):
+            break
+        try:
+            d = float(pair_dists[k])
+        except Exception:
+            continue
+        if _abs(d - target) > tol:
+            continue
+        try:
+            i, j = pair
+            i = int(i)
+            j = int(j)
+        except Exception:
+            continue
+        if 0 <= i < len(lines):
+            idxs.add(i)
+        if 0 <= j < len(lines):
+            idxs.add(j)
+    return [lines[i] for i in sorted(list(idxs))]
 
 
 def _line_key(ln):
@@ -895,7 +986,9 @@ def _find_cycles(nodes, adj, max_len, max_cycles):
             if nxt < start:
                 continue
             visited.add(nxt)
-            dfs(start, nxt, curr, path + [nxt], visited)
+            path.append(nxt)
+            dfs(start, nxt, curr, path, visited)
+            path.pop()
             visited.remove(nxt)
 
     for start in range(len(nodes)):
@@ -2339,6 +2432,58 @@ def recognize_topology(classified, cfg):
         raise ValueError("Wall recognition failed: no line candidates")
 
     pairs = collapse_dbg.get("pairs", [])
+    pair_dists_dbg = list(collapse_dbg.get("pair_distances_cm") or [])
+
+    # Build a robust perimeter-reference bbox from paired wall traces first
+    # (less sensitive to noisy far-away drafting lines).
+    bbox_lines = []
+    if pairs:
+        used = set()
+        for pi, pj in pairs:
+            try:
+                if 0 <= int(pi) < len(wall_lines_raw):
+                    used.add(int(pi))
+                if 0 <= int(pj) < len(wall_lines_raw):
+                    used.add(int(pj))
+            except Exception:
+                continue
+        if used:
+            bbox_lines = [wall_lines_raw[i] for i in sorted(list(used))]
+
+    bbox_area_raw_cm2 = _line_bbox_area(bbox_lines) if bbox_lines else _line_bbox_area(wall_lines)
+    if bbox_area_raw_cm2 <= 1.0e-9:
+        bbox_area_raw_cm2 = _line_bbox_area(wall_lines_raw)
+
+    min_bbox_area_ratio = float(cfg.get("perimeter_min_bbox_area_ratio", 0.08))
+    min_bbox_area_ratio_inner = float(
+        cfg.get("perimeter_min_bbox_area_ratio_inner", max(min_bbox_area_ratio, 0.12))
+    )
+
+    def _solution_area_ratio(sol):
+        if sol is None:
+            return 0.0
+        picked = sol.get("picked") or {}
+        area = float(picked.get("area", 0.0))
+        if bbox_area_raw_cm2 <= 1.0e-9:
+            return 1.0
+        return area / bbox_area_raw_cm2
+
+    candidate_pool = []
+
+    def _accept_solution(sol, ratio_min, mode_name, lines_for_mode):
+        if sol is None:
+            return False
+        ratio = _solution_area_ratio(sol)
+        sol["_bbox_area_cm2"] = float(bbox_area_raw_cm2)
+        sol["_bbox_area_ratio"] = float(ratio)
+        sol["_bbox_ratio_required"] = float(ratio_min)
+        candidate_pool.append({
+            "cand": sol,
+            "mode": mode_name,
+            "lines": list(lines_for_mode or []),
+        })
+        return ratio >= float(ratio_min)
+
     solve_mode = "collapsed"
     solve_out = None
 
@@ -2347,9 +2492,11 @@ def recognize_topology(classified, cfg):
     if pairs:
         centerlines_only = _collapse_to_centerlines(wall_lines_raw, pairs, include_unpaired=False)
         if centerlines_only:
-            solve_out = _find_room_cycle_from_lines(centerlines_only, classified, cfg, relax_gap=False)
-            if solve_out is not None:
+            cand = _find_room_cycle_from_lines(centerlines_only, classified, cfg, relax_gap=False)
+            if _accept_solution(cand, min_bbox_area_ratio, "centerlines_only", centerlines_only):
+                solve_out = cand
                 solve_mode = "centerlines_only"
+                wall_lines = centerlines_only
 
     # Strategy 2: Inner-wall-only + unpaired lines.
     # For each pair, pick the shorter line (inner wall is shorter than outer).
@@ -2357,8 +2504,9 @@ def recognize_topology(classified, cfg):
     if solve_out is None and pairs:
         lines_centroid = _centroid_of_line_mids(wall_lines_raw)
         inner_lines = _collapse_pick_inner(wall_lines_raw, pairs, lines_centroid)
-        solve_out = _find_room_cycle_from_lines(inner_lines, classified, cfg, relax_gap=False)
-        if solve_out is not None:
+        cand = _find_room_cycle_from_lines(inner_lines, classified, cfg, relax_gap=False)
+        if _accept_solution(cand, min_bbox_area_ratio_inner, "inner_walls", inner_lines):
+            solve_out = cand
             solve_mode = "inner_walls"
             wall_lines = inner_lines
 
@@ -2366,30 +2514,92 @@ def recognize_topology(classified, cfg):
     if solve_out is None and pairs:
         lines_centroid = _centroid_of_line_mids(wall_lines_raw)
         inner_lines = _collapse_pick_inner(wall_lines_raw, pairs, lines_centroid)
-        solve_out = _find_room_cycle_from_lines(inner_lines, classified, cfg, relax_gap=True)
-        if solve_out is not None:
+        cand = _find_room_cycle_from_lines(inner_lines, classified, cfg, relax_gap=True)
+        if _accept_solution(cand, min_bbox_area_ratio_inner, "inner_walls_relaxed", inner_lines):
+            solve_out = cand
             solve_mode = "inner_walls_relaxed"
             wall_lines = inner_lines
 
+    # Strategy 3b: use only raw traces that belong to the thick wall pairs
+    # (typically exterior walls), then solve a perimeter loop and later snap to
+    # wall centers. This removes most interior branches/noise from the graph.
+    if solve_out is None and pairs and pair_dists_dbg:
+        thick_clusters = _cluster_1d(pair_dists_dbg, float(cfg.get("wall_thickness_cluster_tol_cm", 2.5)))
+        if thick_clusters:
+            thick_target = max(thick_clusters)
+            thick_pair_lines = _select_pair_lines_by_thickness(
+                wall_lines_raw,
+                pairs,
+                pair_dists_dbg,
+                thick_target,
+                float(cfg.get("wall_thickness_cluster_tol_cm", 2.5)),
+            )
+            if thick_pair_lines:
+                cand = _find_room_cycle_from_lines(thick_pair_lines, classified, cfg, relax_gap=False)
+                if _accept_solution(cand, min_bbox_area_ratio, "outer_thick_raw", thick_pair_lines):
+                    solve_out = cand
+                    solve_mode = "outer_thick_raw"
+                    wall_lines = thick_pair_lines
+
+    if solve_out is None and pairs and pair_dists_dbg:
+        thick_clusters = _cluster_1d(pair_dists_dbg, float(cfg.get("wall_thickness_cluster_tol_cm", 2.5)))
+        if thick_clusters:
+            thick_target = max(thick_clusters)
+            thick_pair_lines = _select_pair_lines_by_thickness(
+                wall_lines_raw,
+                pairs,
+                pair_dists_dbg,
+                thick_target,
+                float(cfg.get("wall_thickness_cluster_tol_cm", 2.5)),
+            )
+            if thick_pair_lines:
+                cand = _find_room_cycle_from_lines(thick_pair_lines, classified, cfg, relax_gap=True)
+                if _accept_solution(cand, min_bbox_area_ratio, "outer_thick_raw_relaxed", thick_pair_lines):
+                    solve_out = cand
+                    solve_mode = "outer_thick_raw_relaxed"
+                    wall_lines = thick_pair_lines
+
     # Strategy 4: Centerlines + unpaired lines (original collapsed approach).
     if solve_out is None:
-        solve_out = _find_room_cycle_from_lines(wall_lines, classified, cfg, relax_gap=False)
-        if solve_out is not None:
+        cand = _find_room_cycle_from_lines(wall_lines, classified, cfg, relax_gap=False)
+        if _accept_solution(cand, min_bbox_area_ratio, "collapsed", wall_lines):
+            solve_out = cand
             solve_mode = "collapsed"
 
     # Strategy 5: Raw lines fallback (both inner and outer wall traces).
     if solve_out is None and wall_lines_raw:
         solve_mode = "raw_fallback"
-        solve_out = _find_room_cycle_from_lines(wall_lines_raw, classified, cfg, relax_gap=False)
-        if solve_out is not None:
+        cand = _find_room_cycle_from_lines(wall_lines_raw, classified, cfg, relax_gap=False)
+        if _accept_solution(cand, min_bbox_area_ratio, "raw_fallback", wall_lines_raw):
+            solve_out = cand
             wall_lines = list(wall_lines_raw)
 
     # Strategy 6: Raw lines with relaxed bridge tolerance.
     if solve_out is None and wall_lines_raw:
         solve_mode = "raw_relaxed_bridge"
-        solve_out = _find_room_cycle_from_lines(wall_lines_raw, classified, cfg, relax_gap=True)
-        if solve_out is not None:
+        cand = _find_room_cycle_from_lines(wall_lines_raw, classified, cfg, relax_gap=True)
+        if _accept_solution(cand, min_bbox_area_ratio, "raw_relaxed_bridge", wall_lines_raw):
+            solve_out = cand
             wall_lines = list(wall_lines_raw)
+
+    # Safety fallback: if ratio gate rejected everything, keep the largest
+    # detected closed loop instead of failing the entire conversion.
+    if solve_out is None and candidate_pool:
+        best = None
+        for rec in candidate_pool:
+            c = rec.get("cand") or {}
+            p = c.get("picked") or {}
+            area = float(p.get("area", 0.0))
+            score = float(p.get("score", -1.0e12))
+            ratio = float(c.get("_bbox_area_ratio", 0.0))
+            key = (area, ratio, score)
+            if best is None or key > best[0]:
+                best = (key, rec)
+        if best is not None:
+            rec = best[1]
+            solve_out = rec["cand"]
+            solve_mode = str(rec.get("mode", "fallback")) + "_ratio_fallback"
+            wall_lines = list(rec.get("lines") or wall_lines)
 
     if solve_out is None:
         raise ValueError("Wall recognition failed: no closed room loop")
@@ -2409,11 +2619,29 @@ def recognize_topology(classified, cfg):
     estimated_wall = collapse_dbg.get("estimated_wall_thickness_cm")
     wall_thickness_cm = float(estimated_wall) if estimated_wall is not None else default_wall
 
+    pair_distances_cm = list(collapse_dbg.get("pair_distances_cm") or [])
+    cluster_tol_cm = float(cfg.get("wall_thickness_cluster_tol_cm", 2.5))
+    wall_thickness_clusters_cm = _cluster_1d(pair_distances_cm, cluster_tol_cm)
+    if not wall_thickness_clusters_cm:
+        wall_thickness_clusters_cm = [float(wall_thickness_cm)]
+    # Practical interpretation for BIM typing:
+    # thicker cluster -> perimeter walls, thinner cluster -> partitions.
+    perimeter_wall_thickness_cm = max(wall_thickness_clusters_cm)
+    internal_wall_thickness_cm = min(wall_thickness_clusters_cm)
+
     # Snap to pair centerlines only when the cycle came from raw traces
     # (not already on centerlines). Centerlines_only polygons are already
     # at the correct midpoint position — snapping would push them to
     # inner/outer wall traces.
-    if pairs and solve_mode in ("collapsed", "raw_fallback", "raw_relaxed_bridge"):
+    if pairs and solve_mode in (
+        "collapsed",
+        "raw_fallback",
+        "raw_relaxed_bridge",
+        "outer_thick_raw",
+        "outer_thick_raw_relaxed",
+        "outer_thick_raw_ratio_fallback",
+        "outer_thick_raw_relaxed_ratio_fallback",
+    ):
         poly_raw = _snap_poly_to_wall_centers(
             poly_raw, wall_lines_raw, pairs, wall_thickness_cm)
     elif solve_mode not in ("centerlines_only",):
@@ -2697,6 +2925,9 @@ def recognize_topology(classified, cfg):
         "room_width_cm": max(1.0, room_w),
         "room_height_cm": max(1.0, room_h),
         "wall_thickness_cm": wall_thickness_cm,
+        "wall_thickness_clusters_cm": [float(v) for v in wall_thickness_clusters_cm],
+        "perimeter_wall_thickness_cm": float(perimeter_wall_thickness_cm),
+        "internal_wall_thickness_cm": float(internal_wall_thickness_cm),
         "door_width_cm": door_width,
         "door_height_cm": default_door_h,
         "door_left_offset_cm": door_left,
@@ -2721,6 +2952,10 @@ def recognize_topology(classified, cfg):
         "wall_line_candidates_raw": len(wall_lines_raw),
         "paired_wall_line_count": int(collapse_dbg.get("paired_count") or 0),
         "estimated_wall_thickness_cm": collapse_dbg.get("estimated_wall_thickness_cm"),
+        "pair_distance_count": len(pair_distances_cm),
+        "wall_thickness_clusters_cm": [float(v) for v in wall_thickness_clusters_cm],
+        "perimeter_wall_thickness_cm": float(perimeter_wall_thickness_cm),
+        "internal_wall_thickness_cm": float(internal_wall_thickness_cm),
         "dimension_line_count": len(dim_lines),
         "dimension_span_hint_used_count": int(dim_hints.get("used_lines") or 0),
         "dimension_opening_hint_used_count": int(opening_dim_used),
@@ -2747,6 +2982,10 @@ def recognize_topology(classified, cfg):
         "internal_wall_graph_segment_count": len(internal_segs),
         "cycle_count": len(cycles),
         "picked_area_cm2": picked["area"],
+        "input_bbox_area_cm2": float(bbox_area_raw_cm2),
+        "picked_area_to_bbox_ratio": float(_solution_area_ratio(solve_out)),
+        "perimeter_min_bbox_area_ratio": float(min_bbox_area_ratio),
+        "perimeter_min_bbox_area_ratio_inner": float(min_bbox_area_ratio_inner),
         "picked_support": picked["support"],
         "internal_wall_count": len(internal_walls),
         "internal_wall_candidate_count": int(internal_wall_stats.get("candidate_count", 0)),
