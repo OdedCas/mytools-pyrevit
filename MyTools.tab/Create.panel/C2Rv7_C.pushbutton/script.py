@@ -5448,7 +5448,8 @@ def _create_apartment_areas(v2, level, cfg, ext_center, int_center, core_center,
                         p_num.Set("A-{:02d}".format(idx + 1))
                     p_comments = area.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
                     if p_comments and not p_comments.IsReadOnly:
-                        p_comments.Set("C2Rv7 apartment area; detected {:.1f} sqm".format(cell["area_sqm"]))
+                        n_rooms = _rooms_from_sqm(cell["area_sqm"])
+                        p_comments.Set("{} rooms".format(n_rooms))
                 except Exception:
                     pass
                 try:
@@ -5485,7 +5486,89 @@ def _create_apartment_areas(v2, level, cfg, ext_center, int_center, core_center,
             snapshot.log("Apartment areas created: {} areas, {} tags".format(len(area_ids), len(tag_ids)))
         except Exception:
             pass
+
+    # Create apartment schedule
+    try:
+        _create_apartment_schedule(v2, level, area_view.AreaScheme, snapshot=snapshot)
+    except Exception:
+        pass
+
     return area_ids, tag_ids
+
+
+def _rooms_from_sqm(sqm):
+    """Return number of rooms based on apartment area (Israeli standard)."""
+    if sqm <= 55:
+        return 2
+    elif sqm <= 85:
+        return 3
+    elif sqm <= 110:
+        return 4
+    elif sqm <= 125:
+        return 5
+    else:
+        return 6
+
+
+def _create_apartment_schedule(v2, level, area_scheme, snapshot=None):
+    """Create a ViewSchedule listing apartments with area and room count."""
+    from Autodesk.Revit.DB import ViewSchedule, ScheduleDefinition, ElementId
+    try:
+        t = v2.Transaction(v2.doc, "C2Rv7_C Create Apartment Schedule")
+        t.Start()
+        try:
+            sched = ViewSchedule.CreateAreaSchedule(
+                v2.doc, level.Id, area_scheme.Id)
+            sched.Name = "Apartment Schedule - {}".format(level.Name)
+            sdef = sched.Definition
+
+            # Map wanted built-in params to display headings
+            wanted = {
+                BuiltInParameter.ROOM_NUMBER:                   "No.",
+                BuiltInParameter.ROOM_NAME:                     "Apartment",
+                BuiltInParameter.ROOM_AREA:                     "Area (m\xb2)",
+                BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS:   "Rooms",
+            }
+            added = set()
+            for sf in sdef.GetSchedulableFields():
+                try:
+                    pid = sf.ParameterId
+                    for bip, heading in wanted.items():
+                        if pid == ElementId(bip) and bip not in added:
+                            f = sdef.AddField(sf)
+                            try:
+                                f.ColumnHeading = heading
+                            except Exception:
+                                pass
+                            added.add(bip)
+                            break
+                except Exception:
+                    continue
+            t.Commit()
+            if snapshot:
+                try:
+                    snapshot.log("Apartment schedule created: {}".format(sched.Name))
+                except Exception:
+                    pass
+            return sched.Id.IntegerValue
+        except Exception as ex:
+            try:
+                t.RollBack()
+            except Exception:
+                pass
+            if snapshot:
+                try:
+                    snapshot.log("Apartment schedule failed: {}".format(ex))
+                except Exception:
+                    pass
+            return None
+    except Exception as ex:
+        if snapshot:
+            try:
+                snapshot.log("Apartment schedule outer error: {}".format(ex))
+            except Exception:
+                pass
+        return None
 
 
 def _create_exterior_dimensions(v2, level, wall_ids, door_ids, window_ids,
