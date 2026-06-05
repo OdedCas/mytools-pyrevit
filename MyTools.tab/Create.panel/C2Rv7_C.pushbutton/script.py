@@ -4807,6 +4807,59 @@ def _extend_endpoint_to_segments(pt, other, segments, max_extend_cm):
     return pt
 
 
+def _trim_sep_lines_at_mutual_intersections(sep_lines_orig, sep_lines_ext):
+    """After extending sep-lines to outer boundary, trim them at mutual crossings.
+
+    Each extended sep-line may now cross other sep-lines.  We keep only the
+    portion that contains the ORIGINAL wall midpoint so that, e.g., a vertical
+    divider that was only in the upper half of the building doesn't accidentally
+    extend into the lower half after the outer-boundary extension.
+
+    Works for any building — uses only the geometry of the lines themselves.
+    """
+    result = [dict(ln) for ln in sep_lines_ext]
+    for i in range(len(result)):
+        x1e = float(result[i]["x1"])
+        y1e = float(result[i]["y1"])
+        x2e = float(result[i]["x2"])
+        y2e = float(result[i]["y2"])
+        ddx = x2e - x1e
+        ddy = y2e - y1e
+        seg_len = math.sqrt(ddx * ddx + ddy * ddy)
+        if seg_len < 1.0:
+            continue
+        # Parameter [0,1] of original midpoint along the extended line
+        ox = (float(sep_lines_orig[i]["x1"]) + float(sep_lines_orig[i]["x2"])) * 0.5
+        oy = (float(sep_lines_orig[i]["y1"]) + float(sep_lines_orig[i]["y2"])) * 0.5
+        t_orig = ((ox - x1e) * ddx + (oy - y1e) * ddy) / (seg_len * seg_len)
+        best_s = 0.0   # trim start no further than this
+        best_e = 1.0   # trim end no further than this
+        for j in range(len(sep_lines_ext)):
+            if i == j:
+                continue
+            hit = _segment_intersection_params_cm(result[i], result[j])
+            if hit is None:
+                continue
+            ta, tb, _pt = hit
+            # Ignore endpoint-only touches
+            if ta < 1.0e-5 or ta > 1.0 - 1.0e-5:
+                continue
+            if tb < 1.0e-5 or tb > 1.0 - 1.0e-5:
+                continue
+            if ta < t_orig:
+                if ta > best_s:
+                    best_s = ta
+            else:
+                if ta < best_e:
+                    best_e = ta
+        if best_s > 0.0 or best_e < 1.0:
+            result[i]["x1"] = x1e + best_s * ddx
+            result[i]["y1"] = y1e + best_s * ddy
+            result[i]["x2"] = x1e + best_e * ddx
+            result[i]["y2"] = y1e + best_e * ddy
+    return result
+
+
 def _extend_line_to_segments(ln, segments, max_extend_cm):
     """Extend both endpoints of ln to the nearest segment in segments."""
     p1 = (float(ln.get("x1", 0.0)), float(ln.get("y1", 0.0)))
@@ -5172,17 +5225,16 @@ def _create_apartment_areas(v2, level, cfg, ext_center, int_center, core_center,
     core_lines = [_extend_line_to_outer_polygon_cm(ln, outer_polygon, core_near_cm, core_max_cm)
                   for ln in (core_center or [])]
 
-    # Sep lines — multi-pass extension so perpendicular dividers connect.
-    # Pass 1: each endpoint fires a ray to the outer boundary (large tolerance).
-    # Pass 2-4: re-fire to (outer + already-extended sep_lines) so that an
-    #   endpoint that overshot snaps back to the nearest perpendicular sep_line.
-    #   No hardcoded distances — uses building diagonal derived from geometry.
+    # Sep lines — two-step approach, fully geometry-driven:
+    # Step 1: extend every endpoint to the outer boundary (building-diagonal scale).
+    # Step 2: trim each extended line at its intersections with other sep-lines,
+    #   keeping only the portion that contains the ORIGINAL wall midpoint.
+    #   This ensures a vertical divider that was only in the upper half doesn't
+    #   bleed into the lower half after extension.  Works for any building shape.
+    sep_lines_orig = list(sep_lines)
     sep_lines = [_extend_line_to_segments(ln, outer_segments, _diag)
                  for ln in sep_lines]
-    for _pass in range(3):
-        targets = outer_segments + sep_lines
-        sep_lines = [_extend_line_to_segments(ln, targets, _diag)
-                     for ln in sep_lines]
+    sep_lines = _trim_sep_lines_at_mutual_intersections(sep_lines_orig, sep_lines)
 
     boundary_segments = outer_segments + sep_lines + core_lines
     graph = _build_area_graph_cm(boundary_segments, snap_tol_cm, min_boundary_cm)
