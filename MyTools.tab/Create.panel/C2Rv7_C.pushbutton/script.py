@@ -5077,11 +5077,11 @@ def _create_apartment_areas(v2, level, cfg, ext_center, int_center, core_center,
     snap_tol_cm = float((cfg or {}).get("apartment_area_snap_tol_cm", 4.0))
     min_boundary_cm = float((cfg or {}).get("apartment_area_min_boundary_segment_cm", 5.0))
 
-    # Snap tolerance: large enough to close the half-wall-thickness gap that
-    # appears when ext_center endpoints stop at the face of the adjacent wall.
-    chain_tol_cm = max(snap_tol_cm * 2.0, ext_thick_cm * 0.7, 20.0)
-    ext_loop = _chain_center_loop_cm(ext_center, chain_tol_cm, snapshot=snapshot)
-    ext_loop = _refine_loop_corners(ext_loop, max_correct_cm=max(60.0, ext_thick_cm * 2.5))
+    ext_loop = _chain_center_loop_cm(ext_center, max(6.0, snap_tol_cm * 2.0), snapshot=snapshot)
+    try:
+        ext_loop = _refine_loop_corners(ext_loop, max_correct_cm=max(60.0, ext_thick_cm * 2.5))
+    except Exception:
+        pass
     if len(ext_loop) < 3:
         if snapshot:
             try:
