@@ -93,6 +93,7 @@ PANEL_DIR = os.path.dirname(SCRIPT_DIR)
 V2_DIR = os.path.join(PANEL_DIR, "CreateFromCADV2.pushbutton")
 _REC_MOD = None
 _LLM_QA_MOD = None
+_AP_MOD = None
 
 if V2_DIR not in sys.path:
     sys.path.append(V2_DIR)
@@ -116,6 +117,21 @@ def _load_recognition_helpers():
     except Exception as ex:
         raise Exception("Failed loading recognition helpers: {} ({})".format(path, ex))
     return _REC_MOD
+
+
+def _load_apartment_planner():
+    """Load apartment_planner.py if present. Returns module or None; never raises."""
+    global _AP_MOD
+    if _AP_MOD is not None:
+        return _AP_MOD
+    path = os.path.join(SCRIPT_DIR, "apartment_planner.py")
+    if not os.path.isfile(path):
+        return None
+    try:
+        _AP_MOD = imp.load_source("c2rv7_apartment_planner", path)
+    except Exception:
+        _AP_MOD = None
+    return _AP_MOD
 
 
 def _load_llm_qa():
@@ -5585,7 +5601,7 @@ def _create_exterior_dimensions(v2, level, wall_ids, door_ids, window_ids,
     Row 3 (farthest): Overall dimension of the entire side.
     """
     from Autodesk.Revit.DB import (
-        Options, XYZ, Line, ReferenceArray, ViewPlan, Transaction,
+        Options, XYZ, Line, ReferenceArray, ViewPlan, Transaction, ViewType,
     )
     try:
         from Autodesk.Revit.DB import FamilyInstanceReferenceType
@@ -5595,12 +5611,20 @@ def _create_exterior_dimensions(v2, level, wall_ids, door_ids, window_ids,
     dim_ids = []
 
     # --- Get floor plan view ---
+    # Must be an actual Floor Plan. The apartment workflow creates Area Plans
+    # (ViewPlan.CreateAreaPlan) on the same level, and those are also ViewPlans;
+    # if one gets picked here the dimensions land on the area plan and never
+    # appear on the user's floor plan.
     plan_view = None
     for vp in FilteredElementCollector(v2.doc).OfClass(ViewPlan).ToElements():
-        if vp.GenLevel is not None and vp.GenLevel.Id == level.Id:
-            if not vp.IsTemplate:
-                plan_view = vp
-                break
+        if vp.IsTemplate:
+            continue
+        if vp.GenLevel is None or vp.GenLevel.Id != level.Id:
+            continue
+        if vp.ViewType != ViewType.FloorPlan:
+            continue  # skip Area Plans / Ceiling Plans on this level
+        plan_view = vp
+        break
     if plan_view is None:
         if snapshot:
             try:
@@ -5617,9 +5641,12 @@ def _create_exterior_dimensions(v2, level, wall_ids, door_ids, window_ids,
         For a wall PARALLEL to the measurement direction: returns end faces.
         For a wall PERPENDICULAR to it: returns side faces (exterior face).
         """
+        # NOTE: do NOT set opts.View. In Revit 2024, Options.View restricts
+        # geometry to the plan-cut section and end-cap face References come back
+        # null (works in 2025 but not 2024). Element-level geometry gives stable
+        # face References for NewDimension in every version. (ext_dim_oai lesson.)
         opts = Options()
         opts.ComputeReferences = True
-        opts.View = plan_view
         refs = []
         try:
             geom = wall.get_Geometry(opts)
@@ -6851,6 +6878,36 @@ def _apply_layer_first_wall_mode(v2, selected_import):
             apartment_area_ids, apartment_area_tag_ids = _create_apartment_areas(
                 v2, level, cfg, ext_center, int_center, core_center,
                 int_raw, ext_thick_cm, int_thick_cm, core_thick_cm, snapshot)
+
+        # =======================================================================
+        # STEP 3.6 — APARTMENT PLANNER
+        # =======================================================================
+        ap_mod = _load_apartment_planner()
+        if ap_mod is not None and apartment_area_ids:
+            td_ap = TaskDialog("C2Rv7_C")
+            td_ap.MainInstruction = "Run Apartment Planner?"
+            td_ap.MainContent = (
+                "Auto-partition {} apartment area(s) into rooms\n"
+                "based on Israeli building code minimum requirements.\n"
+                "Model Lines will be drawn as partition guides."
+            ).format(len(apartment_area_ids))
+            td_ap.CommonButtons = TaskDialogCommonButtons.Yes | TaskDialogCommonButtons.No
+            td_ap.DefaultButton = TaskDialogResult.No
+            if td_ap.Show() == TaskDialogResult.Yes:
+                for _ap_id in apartment_area_ids:
+                    try:
+                        _ap_elem = v2.doc.GetElement(ElementId(_ap_id))
+                        if _ap_elem is None:
+                            continue
+                        ap_mod.run_apartment_planner(
+                            v2, level,
+                            area_elem=_ap_elem,
+                            snapshot=snapshot,
+                            uidoc=__revit__.ActiveUIDocument)
+                    except Exception as _ap_ex:
+                        if snapshot is not None:
+                            snapshot.log("ApartmentPlanner error id={}: {}".format(
+                                _ap_id, _ap_ex))
 
         # =======================================================================
         # STEP 4 — DIMENSIONS
