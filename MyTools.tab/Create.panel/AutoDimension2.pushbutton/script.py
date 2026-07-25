@@ -25,6 +25,7 @@ Each tier references only its own (near) facade -- never across the building.
 # and its Idling handler survive to run the Create Dimensions button.
 __persistentengine__ = True
 
+import math
 import os
 import clr
 
@@ -108,6 +109,15 @@ IGUIDE_MARK = u"AUTODIM_IGUIDE"
 # Also drop a text note at each exterior opening with its sill/head height
 # above the level (elevation data a plan dimension cannot show).
 ANNOTATE_OPENING_HEIGHTS = True
+
+# Find exterior walls by flood-filling the building footprint instead of the
+# old "is any wall further out?" overlap test, which dropped walls on steps,
+# recesses and U-shaped notches. Set to False to fall back to the old test.
+USE_FOOTPRINT_EXTERIOR_DETECTION = True
+
+# Drop interior chain segments at or below one wall thickness, so the interior
+# strings stop reporting wall thicknesses as if they were rooms.
+FILTER_INTERIOR_THICKNESS = True
 
 # Perp positions where the interior guides were auto-seeded (building center).
 # A guide left untouched at its seed position is a template, not a request, so it
@@ -1100,6 +1110,7 @@ def _pick_reference_points(prompt):
 def _interior_dimension_at_point(point, axis, wall_infos, dims_to_adjust, index):
     """Dimension every wall face crossed by one user-selected reference line."""
     face_pairs = []
+    crossed = []
     tolerance = mm_to_ft(INTERSECT_TOL_MM)
 
     for ei in wall_infos:
@@ -1124,6 +1135,7 @@ def _interior_dimension_at_point(point, axis, wall_infos, dims_to_adjust, index)
                 continue
             face_pairs.append((ref_lo, c_lo))
             face_pairs.append((ref_hi, c_hi))
+            crossed.append(ei)
         except Exception:
             continue
 
@@ -1145,12 +1157,23 @@ def _interior_dimension_at_point(point, axis, wall_infos, dims_to_adjust, index)
     if len(deduped) < 2:
         return 0
 
+    # A wall's own two faces sit exactly one thickness apart, so leaving both in
+    # the chain reports wall thicknesses as if they were rooms. Collapse them
+    # with the same filter the exterior tiers use.
+    n_before = len(deduped)
+    if FILTER_INTERIOR_THICKNESS and crossed:
+        ttol = _max_wall_thickness(crossed) * 1.1
+        deduped = _drop_thickness_refs(deduped, ttol)
+        if len(deduped) < 2:
+            return 0
+
     refs = [ref for ref, unused_coord in deduped]
     low = deduped[0][1]
     high = deduped[-1][1]
-    _seg_log(u"  int dim axis={} at_perp_mm={} faces={} low_mm={} high_mm={}".format(
+    _seg_log(u"  int dim axis={} at_perp_mm={} faces={}->{} low_mm={} high_mm={}".format(
         axis, int(round(ft_to_mm(point.X if axis == "y" else point.Y))),
-        len(deduped), int(round(ft_to_mm(low))), int(round(ft_to_mm(high)))))
+        n_before, len(deduped), int(round(ft_to_mm(low))),
+        int(round(ft_to_mm(high)))))
     if axis == "x":
         p0 = XYZ(low, point.Y, 0)
         p1 = XYZ(high, point.Y, 0)
@@ -1265,12 +1288,148 @@ def _find_exterior_face_refs(all_elems, axis):
     return faces
 
 
+def _wall_thickness_ft(elem):
+    """Wall thickness in feet, or None."""
+    try:
+        w = elem.Width
+        if w and w > 0:
+            return w
+    except Exception:
+        pass
+    try:
+        w = elem.WallType.Width
+        if w and w > 0:
+            return w
+    except Exception:
+        pass
+    return None
+
+
+def _compute_exterior_wall_ids_footprint(all_elems):
+    """Exterior walls = the walls on the boundary of the building FOOTPRINT.
+
+    The old test ("is any wall further out sharing perpendicular overlap?")
+    only holds for a rectangular box. On an L-shape, a step or a U-shaped
+    notch, genuinely exterior walls sit between other walls and were dropped,
+    so their openings never reached tier 1 and their facade never broke tier 2.
+
+    Instead, rasterize the plan, flood-fill the empty space inward from
+    outside the bounding box, and keep every wall that touches space reachable
+    from outside. That is a footprint-boundary test, so it handles any
+    footprint shape. The grid step is derived from the thinnest wall present
+    (never a hardcoded distance) so no wall can be thinner than a cell and
+    leak the fill through itself.
+
+    Returns None when the model is too degenerate to rasterize, so the caller
+    can fall back to the old heuristic.
+    """
+    walls = []
+    for ei in all_elems:
+        if not isinstance(ei["element"], Wall):
+            continue
+        walls.append(ei)
+    if not walls:
+        return None
+
+    # Cell size: half the thinnest wall, so every wall spans >= 2 cells and
+    # stays watertight against the flood fill.
+    thin = None
+    for ei in walls:
+        t = _wall_thickness_ft(ei["element"])
+        if t is None:
+            continue
+        if thin is None or t < thin:
+            thin = t
+    if thin is None or thin <= 0:
+        return None
+    step = thin / 2.0
+
+    min_x = min(ei["min_x"] for ei in walls)
+    max_x = max(ei["max_x"] for ei in walls)
+    min_y = min(ei["min_y"] for ei in walls)
+    max_y = max(ei["max_y"] for ei in walls)
+
+    # One empty ring around the model so the fill always has a seed outside.
+    min_x -= step
+    max_x += step
+    min_y -= step
+    max_y += step
+
+    nx = int(math.ceil((max_x - min_x) / step)) + 1
+    ny = int(math.ceil((max_y - min_y) / step)) + 1
+    # Guard against a pathological model turning this into a huge raster.
+    if nx < 3 or ny < 3 or nx * ny > 4000000:
+        return None
+
+    # solid[i][j] = a wall occupies this cell.
+    solid = [[False] * ny for _ in range(nx)]
+    cells_of = {}
+    for ei in walls:
+        wid = ei["element"].Id.IntegerValue
+        i0 = int(math.floor((ei["min_x"] - min_x) / step))
+        i1 = int(math.ceil((ei["max_x"] - min_x) / step))
+        j0 = int(math.floor((ei["min_y"] - min_y) / step))
+        j1 = int(math.ceil((ei["max_y"] - min_y) / step))
+        i0 = max(0, i0)
+        j0 = max(0, j0)
+        i1 = min(nx - 1, i1)
+        j1 = min(ny - 1, j1)
+        own = []
+        for i in range(i0, i1 + 1):
+            row = solid[i]
+            for j in range(j0, j1 + 1):
+                row[j] = True
+                own.append((i, j))
+        cells_of.setdefault(wid, []).extend(own)
+
+    # Flood fill the open space from the corner (guaranteed empty by the ring).
+    outside = [[False] * ny for _ in range(nx)]
+    stack = [(0, 0)]
+    outside[0][0] = True
+    while stack:
+        i, j = stack.pop()
+        for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            ni = i + di
+            nj = j + dj
+            if ni < 0 or nj < 0 or ni >= nx or nj >= ny:
+                continue
+            if outside[ni][nj] or solid[ni][nj]:
+                continue
+            outside[ni][nj] = True
+            stack.append((ni, nj))
+
+    # A wall is exterior when any of its cells touches outside-reachable space.
+    ext_ids = set()
+    for wid, cells in cells_of.items():
+        for (i, j) in cells:
+            hit = False
+            for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ni = i + di
+                nj = j + dj
+                if ni < 0 or nj < 0 or ni >= nx or nj >= ny:
+                    continue
+                if outside[ni][nj]:
+                    hit = True
+                    break
+            if hit:
+                ext_ids.add(wid)
+                break
+
+    return ext_ids or None
+
+
 def _compute_exterior_wall_ids(all_elems):
     """
     Returns a set of wall element IDs that have at least one exterior face
     (checked against both axes).  Used to exclude core/interior walls from
     the opening-dimension pass.
     """
+    if USE_FOOTPRINT_EXTERIOR_DETECTION:
+        ids = _compute_exterior_wall_ids_footprint(all_elems)
+        if ids:
+            return ids
+        _glog(u"footprint exterior detection unavailable -- using overlap test")
+
     MIN_OVERLAP = mm_to_ft(300)
     ext_ids = set()
 
