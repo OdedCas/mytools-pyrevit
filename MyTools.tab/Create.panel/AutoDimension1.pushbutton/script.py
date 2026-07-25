@@ -1,21 +1,28 @@
 # -*- coding: utf-8 -*-
 __title__ = u"AutoDimension 1"
 __doc__ = u"""Auto-dimensioning for exterior and interior walls.
-v6 - exterior three-tier dimensions plus multi-line interior dimensions.
+v9 - automatic exterior wall detection + one-click popup workflow.
 
 Usage:
-1. Click the button
-2. Select the exterior walls (grids and columns may also be selected)
-3. Press Enter
-4. Pick multiple horizontal reference points, then press Enter
-5. Pick multiple vertical reference points, then press Enter
+- Click AutoDimension 1. A popup offers:
+    * Create dimensions now  -> everything is dimensioned in one run.
+    * Place guide lines to adjust first -> guide lines are placed so you can
+      move/copy them, then run AutoDimension 1 again to dimension along them.
+- If guide lines already exist in the view, the popup is skipped and the
+  dimensions are built straight away.
 
-Scenarios:
-1. Grid inside element -> snap E->G->E (row 1) + overall E->E (row 2)
-2. Grid on edge -> snap G->E (acts as overall, row 1)
-3. Grid outside element -> single chain G->E->E (row 1)
+Exterior tiers (inner -> outer):
+  1. openings (windows + doors)
+  2. facade segments, merged across openings (breaks only at corners / jogs)
+  3. the entire facade (one overall dimension)
+Each tier references only its own (near) facade -- never across the building.
 """
 
+# Keep the IronPython engine alive after main() returns so the modeless window
+# and its Idling handler survive to run the Create Dimensions button.
+__persistentengine__ = True
+
+import os
 import clr
 
 clr.AddReference("RevitAPI")
@@ -23,7 +30,7 @@ clr.AddReference("RevitAPIUI")
 
 from Autodesk.Revit.DB import (
     FilteredElementCollector, BuiltInCategory,
-    Dimension, Grid, FamilyInstance, Wall,
+    Dimension, DimensionType, Grid, FamilyInstance, Wall,
     XYZ, Line, Reference, ReferenceArray,
     ElementId, Transaction, TransactionGroup,
     Options, ViewPlan,
@@ -33,9 +40,13 @@ from Autodesk.Revit.DB import (
     HostObjectUtils, ShellLayerType,
     FamilyInstanceReferenceType,
     BuiltInParameter, CurveElement, SketchPlane, Plane,
+    ModelLine, Category, GraphicsStyle, GraphicsStyleType,
+    TextNote, TextNoteType, ElementTypeGroup,
+    Color,
 )
+from Autodesk.Revit.UI import ExternalEvent, IExternalEventHandler
 from Autodesk.Revit.UI.Selection import ObjectType
-from pyrevit import forms, script
+from pyrevit import forms, script, revit
 
 
 class DimFailureSwallower(IFailuresPreprocessor):
@@ -67,9 +78,11 @@ class DimFailureSwallower(IFailuresPreprocessor):
         return FailureProcessingResult.Continue
 
 
-doc = __revit__.ActiveUIDocument.Document
-uidoc = __revit__.ActiveUIDocument
-view = doc.ActiveView
+# Use pyrevit.revit accessors (not __revit__) so this module is import-safe
+# (top-level runs without a UI command context).
+doc = revit.doc
+uidoc = revit.uidoc
+view = revit.active_view
 output = script.get_output()
 
 OFFSET_1_MM = 1000   # Tier 1: continuous openings/details chain
@@ -83,11 +96,24 @@ ZERO_TOL_MM = 5
 INTERSECT_TOL_MM = 50
 MAX_SNAP_DIST_MM = 10000
 
-# Marker written to a guide line's Comments so the tool can recognize it on the
-# second click.  Format: "AUTODIM_GUIDE|<axis>|<tier>", e.g. "AUTODIM_GUIDE|x|1".
+# Marker written to a guide line's Comments so the tool can recognize it later.
+# Exterior format: "AUTODIM_GUIDE|<axis>|<tier>|<side>".
+# Interior format: "AUTODIM_IGUIDE|<axis>".
 GUIDE_MARK = u"AUTODIM_GUIDE"
+IGUIDE_MARK = u"AUTODIM_IGUIDE"
 
-DEBUG = True
+# Also drop a text note at each exterior opening with its sill/head height
+# above the level (elevation data a plan dimension cannot show).
+ANNOTATE_OPENING_HEIGHTS = True
+
+# Perp positions where the interior guides were auto-seeded (building center).
+# A guide left untouched at its seed position is a template, not a request, so it
+# is skipped when dimensioning. Drag-copying a seed leaves the original here and
+# places the copy elsewhere -> only the copy gets dimensioned. Set on placement,
+# read on dimensioning (same persistent engine).
+_AD_INT_SEEDS = {"x": [], "y": []}
+
+DEBUG = False
 
 
 def mm_to_ft(mm):
@@ -96,6 +122,73 @@ def mm_to_ft(mm):
 
 def ft_to_mm(ft):
     return ft * 304.8
+
+
+# --- Silent diagnostic log (writes to a file, never opens the output window) --
+def _seg_log_path():
+    try:
+        return os.path.join(os.environ.get("USERPROFILE", ""), "dev",
+                            "autodim_seg.log")
+    except Exception:
+        return None
+
+
+def _seg_log_reset():
+    p = _seg_log_path()
+    if not p:
+        return
+    try:
+        f = open(p, "w")
+        f.close()
+    except Exception:
+        pass
+
+
+def _seg_log(msg):
+    p = _seg_log_path()
+    if not p:
+        return
+    try:
+        f = open(p, "a")
+        try:
+            f.write(msg + "\n")
+        finally:
+            f.close()
+    except Exception:
+        pass
+
+
+# Separate log for guide PLACEMENT (the dimensioning log reset would wipe it).
+def _glog_path():
+    try:
+        return os.path.join(os.environ.get("USERPROFILE", ""), "dev",
+                            "autodim_guides.log")
+    except Exception:
+        return None
+
+
+def _glog_reset():
+    p = _glog_path()
+    if not p:
+        return
+    try:
+        open(p, "w").close()
+    except Exception:
+        pass
+
+
+def _glog(msg):
+    p = _glog_path()
+    if not p:
+        return
+    try:
+        f = open(p, "a")
+        try:
+            f.write(msg + "\n")
+        finally:
+            f.close()
+    except Exception:
+        pass
 
 
 def collect_grids_from_selection(selected_elements):
@@ -405,6 +498,13 @@ def make_dim(refs, p0, p1, label=""):
                     ft_to_mm(p1.X), ft_to_mm(p1.Y),
                     d.X, d.Y))
         dim = doc.Create.NewDimension(view, ln, ra)
+        # Tag with the AUTODIM dimension type so a later run can find and delete
+        # its own dimensions (accumulation cleanup).
+        if dim is not None and _AD_DIM_TYPE_ID:
+            try:
+                dim.ChangeTypeId(_AD_DIM_TYPE_ID)
+            except Exception:
+                pass
         if DEBUG and dim:
             output.print_md(u"   ✅ Dimension created (id={})".format(dim.Id.IntegerValue))
         return dim
@@ -625,24 +725,261 @@ def _get_wall_end_edge_refs(wall, orient, run_axis):
             if n.DotProduct(orient) < 0.85:
                 continue  # only the exterior face
             try:
-                for loop in face.EdgeLoops:
-                    for edge in loop:
-                        curve = edge.AsCurve()
-                        if curve is None:
-                            continue
-                        ref = edge.Reference
-                        if ref is None:
-                            continue
-                        ep0 = curve.GetEndPoint(0)
-                        ep1 = curve.GetEndPoint(1)
-                        d = (ep1 - ep0).Normalize()
-                        if abs(d.Z) < 0.7:
-                            continue  # skip horizontal (top/bottom) edges
-                        coord = ep0.Y if run_axis == "y" else ep0.X
-                        edges.append((ref, coord))
+                loops = list(face.EdgeLoops)
+            except Exception:
+                loops = []
+            # The exterior face has an outer boundary loop (the wall's real ends)
+            # plus one inner loop per window/door hole. The hole's jamb edges
+            # would duplicate the opening references (collected separately) and
+            # produce a doubled dimension at each opening -- "one for the wall and
+            # one for the window". Keep only the outer loop (widest span along the
+            # run axis); inner loops are always narrower.
+            outer = None
+            outer_span = -1.0
+            for loop in loops:
+                lo = hi = None
+                for edge in loop:
+                    c = edge.AsCurve()
+                    if c is None:
+                        continue
+                    for k in (0, 1):
+                        p = c.GetEndPoint(k)
+                        v = p.Y if run_axis == "y" else p.X
+                        if lo is None or v < lo:
+                            lo = v
+                        if hi is None or v > hi:
+                            hi = v
+                if lo is not None and (hi - lo) > outer_span:
+                    outer_span = hi - lo
+                    outer = loop
+            if outer is None:
+                continue
+            try:
+                for edge in outer:
+                    curve = edge.AsCurve()
+                    if curve is None:
+                        continue
+                    ref = edge.Reference
+                    if ref is None:
+                        continue
+                    ep0 = curve.GetEndPoint(0)
+                    ep1 = curve.GetEndPoint(1)
+                    d = (ep1 - ep0).Normalize()
+                    if abs(d.Z) < 0.7:
+                        continue  # skip horizontal (top/bottom) edges
+                    coord = ep0.Y if run_axis == "y" else ep0.X
+                    edges.append((ref, coord))
             except Exception:
                 pass
     return edges
+
+
+def _opening_sill_head_mm(elem):
+    """(sill_mm, head_mm) above the level for a hosted window/door, or None."""
+    try:
+        ps = elem.get_Parameter(BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM)
+        ph = elem.get_Parameter(BuiltInParameter.INSTANCE_HEAD_HEIGHT_PARAM)
+        sill = ps.AsDouble() if ps else None
+        head = ph.AsDouble() if ph else None
+        if sill is None and head is None:
+            return None
+        s_mm = int(round(ft_to_mm(sill))) if sill is not None else None
+        h_mm = int(round(ft_to_mm(head))) if head is not None else None
+        return (s_mm, h_mm)
+    except Exception:
+        return None
+
+
+def _opening_note_type_id():
+    """A small text type for opening-height notes (2 mm paper), duplicated from
+    the default once and reused. Falls back to the default type."""
+    default_id = None
+    try:
+        default_id = doc.GetDefaultElementTypeId(ElementTypeGroup.TextNoteType)
+    except Exception:
+        default_id = None
+    if default_id is None or default_id == ElementId.InvalidElementId:
+        return None
+    name = u"AUTODIM_OPENING_2mm"
+    try:
+        for t in FilteredElementCollector(doc).OfClass(TextNoteType):
+            try:
+                if t.Name == name:
+                    return t.Id
+            except Exception:
+                continue
+        base = doc.GetElement(default_id)
+        dup = base.Duplicate(name)
+        p = dup.get_Parameter(BuiltInParameter.TEXT_SIZE)
+        if p is not None and not p.IsReadOnly:
+            p.Set(mm_to_ft(2.0))
+        return dup.Id
+    except Exception:
+        return default_id
+
+
+# The dimension type used for every AutoDimension dimension, so a later run can
+# find and delete its own dimensions without touching the user's or grid dims.
+AUTODIM_DIM_TYPE_NAME = u"AUTODIM"
+_AD_DIM_TYPE_ID = None
+
+
+def _autodim_dim_type_id():
+    """Id of the AUTODIM dimension type, duplicated once from the current default
+    linear dimension type so its appearance matches. Falls back to None."""
+    try:
+        for t in FilteredElementCollector(doc).OfClass(DimensionType):
+            try:
+                if t.Name == AUTODIM_DIM_TYPE_NAME:
+                    return t.Id
+            except Exception:
+                continue
+    except Exception:
+        pass
+    base = None
+    try:
+        bid = doc.GetDefaultElementTypeId(ElementTypeGroup.LinearDimensionType)
+        if bid and bid != ElementId.InvalidElementId:
+            base = doc.GetElement(bid)
+    except Exception:
+        base = None
+    if base is None:
+        try:
+            for t in FilteredElementCollector(doc).OfClass(DimensionType):
+                base = t
+                break
+        except Exception:
+            base = None
+    if base is None:
+        return None
+    try:
+        return base.Duplicate(AUTODIM_DIM_TYPE_NAME).Id
+    except Exception:
+        return None
+
+
+def _dim_references_grid(d):
+    """True if the dimension measures at least one grid (a grid dimension)."""
+    try:
+        refs = d.References
+        if refs is None:
+            return False
+        for r in refs:
+            try:
+                el = doc.GetElement(r.ElementId)
+            except Exception:
+                el = None
+            if isinstance(el, Grid):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _delete_previous_autodim():
+    """Remove wall/opening dimensions and opening-height notes so successive runs
+    do not stack overlapping strings. A dimension is removed when it is our
+    AUTODIM type OR when it references no grid (i.e. it measures walls/openings --
+    the kind this tool makes, including untagged ones from older runs). Grid
+    dimensions are always kept, and model lines are left untouched."""
+    try:
+        for d in list(FilteredElementCollector(doc, view.Id)
+                      .OfClass(Dimension).ToElements()):
+            try:
+                is_autodim = False
+                try:
+                    is_autodim = d.DimensionType.Name.startswith(
+                        AUTODIM_DIM_TYPE_NAME)
+                except Exception:
+                    is_autodim = False
+                if is_autodim or not _dim_references_grid(d):
+                    doc.Delete(d.Id)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        for tn in list(FilteredElementCollector(doc, view.Id)
+                       .OfClass(TextNote).ToElements()):
+            try:
+                tt = doc.GetElement(tn.GetTypeId())
+                if tt is not None and tt.Name.startswith(u"AUTODIM"):
+                    doc.Delete(tn.Id)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def annotate_opening_heights(all_elems, ext_wall_ids):
+    """Place a small text note just inside each exterior opening showing its
+    sill/head height above the level -- elevation data a plan dimension cannot
+    express. The note is offset off the wall toward the interior so it does not
+    sit on the wall or the dimension tiers."""
+    type_id = _opening_note_type_id()
+    if type_id is None:
+        return 0
+
+    door_cat = int(BuiltInCategory.OST_Doors)
+    win_cat = int(BuiltInCategory.OST_Windows)
+    inward = mm_to_ft(700)
+    created = 0
+    seen = set()
+    for ei in all_elems:
+        wall = ei["element"]
+        if ei["element"].Id.IntegerValue not in ext_wall_ids:
+            continue
+        if not isinstance(wall, Wall):
+            continue
+        try:
+            orient = wall.Orientation  # points to the exterior side
+        except Exception:
+            orient = None
+        try:
+            dep_ids = wall.GetDependentElements(None)
+        except Exception:
+            continue
+        for dep_id in dep_ids:
+            key = dep_id.IntegerValue
+            if key in seen:
+                continue
+            seen.add(key)
+            elem = doc.GetElement(dep_id)
+            if elem is None or not isinstance(elem, FamilyInstance):
+                continue
+            try:
+                if elem.Category.Id.IntegerValue not in (door_cat, win_cat):
+                    continue
+            except Exception:
+                continue
+            sh = _opening_sill_head_mm(elem)
+            if sh is None:
+                continue
+            try:
+                loc = elem.Location
+                pt = loc.Point if hasattr(loc, "Point") \
+                    else loc.Curve.Evaluate(0.5, True)
+            except Exception:
+                continue
+            # Nudge the note off the wall, toward the building interior.
+            if orient is not None:
+                pt = XYZ(pt.X - orient.X * inward,
+                         pt.Y - orient.Y * inward, pt.Z)
+            s_mm, h_mm = sh
+            parts = []
+            if h_mm is not None:
+                parts.append(u"H{}".format(h_mm))
+            if s_mm is not None:
+                parts.append(u"S{}".format(s_mm))
+            txt = u" ".join(parts)
+            try:
+                TextNote.Create(doc, view.Id, pt, txt, type_id)
+                created += 1
+            except Exception:
+                continue
+    if DEBUG:
+        output.print_md(u"🔺 opening-height notes: {}".format(created))
+    return created
 
 
 def dim_wall_with_openings(ei, dims_to_adjust):
@@ -770,7 +1107,10 @@ def _interior_dimension_at_point(point, axis, wall_infos, dims_to_adjust, index)
 
     face_pairs.sort(key=lambda item: item[1])
     deduped = []
-    dedup_tolerance = mm_to_ft(1)
+    # Merge near-coincident faces (e.g. two walls meeting at a T-junction) so the
+    # interior chain never emits a 0-length (or micro) segment. Kept below the
+    # thinnest real wall (~125 mm) so a wall's own two faces are never merged.
+    dedup_tolerance = mm_to_ft(50)
     for ref, coord in face_pairs:
         if not deduped or abs(coord - deduped[-1][1]) > dedup_tolerance:
             deduped.append((ref, coord))
@@ -781,6 +1121,9 @@ def _interior_dimension_at_point(point, axis, wall_infos, dims_to_adjust, index)
     refs = [ref for ref, unused_coord in deduped]
     low = deduped[0][1]
     high = deduped[-1][1]
+    _seg_log(u"  int dim axis={} at_perp_mm={} faces={} low_mm={} high_mm={}".format(
+        axis, int(round(ft_to_mm(point.X if axis == "y" else point.Y))),
+        len(deduped), int(round(ft_to_mm(low))), int(round(ft_to_mm(high)))))
     if axis == "x":
         p0 = XYZ(low, point.Y, 0)
         p1 = XYZ(high, point.Y, 0)
@@ -958,9 +1301,31 @@ def _dedupe_dimension_pairs(pairs):
     return result
 
 
-def _continuous_exterior_pairs(all_elems, ext_wall_ids, axis, include_openings):
-    """Build continuous references for one exterior dimension direction."""
-    detail_pairs = _find_exterior_face_refs(all_elems, axis)
+def _continuous_exterior_pairs(all_elems, ext_wall_ids, axis, include_openings,
+                               side=None, perp_mid=None):
+    """Build continuous references for one exterior dimension direction.
+
+    When ``side`` ("min" or "max") and ``perp_mid`` are given, the per-wall end
+    edges and openings are restricted to the wall on that side of the building,
+    so a guide near one facade does NOT reach across and pick up the opposite
+    facade's openings.
+
+    ``_find_exterior_face_refs`` returns EVERY exterior face along the axis --
+    both facades plus interior jog faces. Only the two building-END extremes are
+    legitimate shared endpoints for a side chain; the rest are either the far
+    facade (which produced cross-facade segments) or jog faces one wall-thickness
+    from a corner (which produced thickness slivers). So when a side is requested
+    we keep only those two extremes and let the side-filtered wall end edges
+    supply every real break in between.
+    """
+    envelope = _find_exterior_face_refs(all_elems, axis)
+    if side is not None and perp_mid is not None:
+        detail_pairs = []
+        if envelope:
+            detail_pairs = [min(envelope, key=lambda rc: rc[1]),
+                            max(envelope, key=lambda rc: rc[1])]
+    else:
+        detail_pairs = list(envelope)
     opening_pairs = []
 
     for ei in all_elems:
@@ -979,6 +1344,16 @@ def _continuous_exterior_pairs(all_elems, ext_wall_ids, axis, include_openings):
             if not runs_on_axis:
                 continue
 
+            # Restrict to the near-side facade when a side is requested.
+            if side is not None and perp_mid is not None:
+                if axis == "x":
+                    wc = (ei["min_y"] + ei["max_y"]) / 2.0
+                else:
+                    wc = (ei["min_x"] + ei["max_x"]) / 2.0
+                w_side = "min" if wc < perp_mid else "max"
+                if w_side != side:
+                    continue
+
             # End edges preserve every break in the continuous exterior line.
             detail_pairs.extend(_get_wall_end_edge_refs(wall, orient, axis))
             if include_openings:
@@ -989,6 +1364,98 @@ def _continuous_exterior_pairs(all_elems, ext_wall_ids, axis, include_openings):
     if include_openings:
         return _dedupe_dimension_pairs(detail_pairs + opening_pairs)
     return _dedupe_dimension_pairs(detail_pairs)
+
+
+def _facade_segment_pairs(all_elems, ext_wall_ids, axis, side, perp_mid):
+    """Tier-2 references: the building facade SEGMENTS, ignoring openings.
+
+    Walls that lie on the same facade line (same perpendicular position) are
+    merged into one run even if the model splits them at an opening, so the
+    dimension breaks only at real corners / jogs (a change in the facade's
+    perpendicular position) and at the building ends. Openings are not used.
+    """
+    # Envelope perpendicular faces. Only the two EXTREME ones (building ends)
+    # are shared endpoints for this side; middle faces belong to a jog on ONE
+    # facade and must not be injected into the other facade's chain.
+    envelope = _find_exterior_face_refs(all_elems, axis)
+    envelope_ends = []
+    if envelope:
+        envelope_ends = [
+            min(envelope, key=lambda rc: rc[1]),
+            max(envelope, key=lambda rc: rc[1]),
+        ]
+    perp_tol = mm_to_ft(250)
+    match_tol = mm_to_ft(300)
+
+    pieces = []
+    endrefs = []
+    for ei in all_elems:
+        wall = ei["element"]
+        if ei["element"].Id.IntegerValue not in ext_wall_ids:
+            continue
+        if not isinstance(wall, Wall):
+            continue
+        try:
+            orient = wall.Orientation
+            runs_on_axis = (
+                axis == "x" and abs(orient.Y) > 0.7
+            ) or (
+                axis == "y" and abs(orient.X) > 0.7
+            )
+            if not runs_on_axis:
+                continue
+            if axis == "x":
+                wc = (ei["min_y"] + ei["max_y"]) / 2.0
+                c_lo, c_hi = ei["min_x"], ei["max_x"]
+            else:
+                wc = (ei["min_x"] + ei["max_x"]) / 2.0
+                c_lo, c_hi = ei["min_y"], ei["max_y"]
+            if perp_mid is not None and side is not None:
+                if ("min" if wc < perp_mid else "max") != side:
+                    continue
+            pieces.append({"c_lo": c_lo, "c_hi": c_hi, "perp": wc})
+            for ref, coord in _get_wall_end_edge_refs(wall, orient, axis):
+                endrefs.append((ref, coord))
+        except Exception:
+            continue
+
+    if not pieces:
+        return _dedupe_dimension_pairs(envelope_ends)
+
+    # Sweep left-to-right; same-perp neighbours extend the run (openings vanish),
+    # a perp change starts a new run (a real jog / corner).
+    pieces.sort(key=lambda p: p["c_lo"])
+    runs = []
+    for p in pieces:
+        if runs and abs(p["perp"] - runs[-1]["perp"]) < perp_tol:
+            runs[-1]["c_hi"] = max(runs[-1]["c_hi"], p["c_hi"])
+            runs[-1]["c_lo"] = min(runs[-1]["c_lo"], p["c_lo"])
+        else:
+            runs.append({"c_lo": p["c_lo"], "c_hi": p["c_hi"],
+                         "perp": p["perp"]})
+
+    break_coords = []
+    for r in runs:
+        break_coords.append(r["c_lo"])
+        break_coords.append(r["c_hi"])
+
+    # Map each break coordinate to the nearest real face reference. Only the
+    # near-side wall end edges and the two building-end corners are candidates,
+    # so a far-facade jog can never appear in this side's chain.
+    all_refs = endrefs + envelope_ends
+    pairs = []
+    for bc in break_coords:
+        best = None
+        best_d = None
+        for ref, coord in all_refs:
+            d = abs(coord - bc)
+            if best_d is None or d < best_d:
+                best_d = d
+                best = ref
+        if best is not None and best_d <= match_tol:
+            pairs.append((best, bc))
+    pairs.extend(envelope_ends)  # guarantee the outer building corners
+    return _dedupe_dimension_pairs(pairs)
 
 
 def make_continuous_exterior_chains(all_elems, ext_wall_ids, dims_to_adjust):
@@ -1067,17 +1534,176 @@ def _get_comment(elem):
     return None
 
 
+# --- Guide tagging via Line Styles -----------------------------------------
+# Model lines do NOT reliably carry the Comments parameter, so tagging guides
+# through Comments silently fails. Their Line Style (a subcategory of "Lines")
+# always exists, persists across copy/move, and is locale-independent, so it is
+# used as the durable tag. Names encode the guide role; "|" is illegal in Revit
+# category names, so "_" is used as the separator.
+#   exterior: AUTODIM_GUIDE_<axis>_<tier>_<side>   e.g. AUTODIM_GUIDE_x_1_min
+#   interior: AUTODIM_IGUIDE_<axis>                e.g. AUTODIM_IGUIDE_x
+
+def _guide_style_name(axis, tier, side):
+    return u"{}_{}_{}_{}".format(GUIDE_MARK, axis, tier, side)
+
+
+def _iguide_style_name(axis):
+    return u"{}_{}".format(IGUIDE_MARK, axis)
+
+
+def _get_or_create_line_style(name):
+    """Return the projection GraphicsStyle for the "Lines" subcategory `name`,
+    creating the subcategory if it does not exist. Must run in a transaction."""
+    cats = doc.Settings.Categories
+    lines_cat = cats.get_Item(BuiltInCategory.OST_Lines)
+    subs = lines_cat.SubCategories
+    sub = None
+    try:
+        if subs.Contains(name):
+            sub = subs.get_Item(name)
+    except Exception:
+        sub = None
+    if sub is None:
+        for sc in subs:
+            if sc.Name == name:
+                sub = sc
+                break
+    if sub is None:
+        sub = cats.NewSubcategory(lines_cat, name)
+    # Force the guide style to be bright red and bold so the guide lines are
+    # always clearly visible (a freshly recreated subcategory is otherwise a thin
+    # near-invisible default).
+    try:
+        sub.LineColor = Color(255, 0, 0)
+    except Exception:
+        pass
+    try:
+        sub.SetLineWeight(6, GraphicsStyleType.Projection)
+    except Exception:
+        pass
+    return sub.GetGraphicsStyle(GraphicsStyleType.Projection)
+
+
+def _apply_line_style(mc, name):
+    """Tag a model line with the named line style; ignore if unsupported."""
+    try:
+        mc.LineStyle = _get_or_create_line_style(name)
+    except Exception:
+        pass
+
+
+def _purge_guide_line_styles():
+    """Delete every AUTODIM_* line style subcategory from Object Styles. Any
+    lines still using one revert to the default style. Must run in a
+    transaction; call only after the guide lines themselves are deleted."""
+    removed = 0
+    try:
+        lines_cat = doc.Settings.Categories.get_Item(BuiltInCategory.OST_Lines)
+        victims = []
+        for sc in lines_cat.SubCategories:
+            try:
+                nm = sc.Name
+            except Exception:
+                continue
+            if nm and (nm.startswith(GUIDE_MARK) or nm.startswith(IGUIDE_MARK)):
+                victims.append(sc.Id)
+        for sid in victims:
+            try:
+                doc.Delete(sid)
+                removed += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return removed
+
+
+def _line_style_name(ce):
+    """Name of a curve element's line style, or None."""
+    try:
+        gs = ce.LineStyle
+        if gs is None:
+            return None
+        try:
+            return gs.Name
+        except Exception:
+            return gs.GraphicsStyleCategory.Name
+    except Exception:
+        return None
+
+
+def _collect_model_lines():
+    """All model lines in the document. ModelLine is concrete, so OfClass works;
+    fall back to a category+isinstance sweep if the class filter ever fails."""
+    try:
+        return list(FilteredElementCollector(doc).OfClass(ModelLine)
+                    .WhereElementIsNotElementType())
+    except Exception:
+        out = []
+        col = FilteredElementCollector(doc).OfCategory(
+            BuiltInCategory.OST_Lines).WhereElementIsNotElementType()
+        for ce in col:
+            if isinstance(ce, CurveElement):
+                out.append(ce)
+        return out
+
+
 def _make_sketch_plane():
     """Horizontal sketch plane at the active plan's level elevation."""
     elev = 0.0
+    gl_name = "none"
     try:
         gl = view.GenLevel
         if gl is not None:
             elev = gl.Elevation
+            try:
+                gl_name = gl.Name
+            except Exception:
+                gl_name = "?"
     except Exception:
         pass
+    _glog(u"sketch plane: level='{}' elev_mm={}".format(
+        gl_name, int(round(ft_to_mm(elev)))))
     plane = Plane.CreateByNormalAndOrigin(XYZ.BasisZ, XYZ(0, 0, elev))
     return SketchPlane.Create(doc, plane), elev
+
+
+def _max_wall_thickness(exterior_elems):
+    """Largest exterior wall thickness (feet), for the thickness-sliver filter.
+    Falls back to a modest default if no width can be read."""
+    widths = []
+    for ei in exterior_elems:
+        try:
+            w = ei["element"].Width
+            if w and w > 0:
+                widths.append(w)
+        except Exception:
+            continue
+    if widths:
+        return max(widths)
+    return mm_to_ft(300)
+
+
+def _drop_thickness_refs(pairs, min_ft):
+    """Remove chain references that would create a segment at or below one wall
+    thickness, so the exterior string never shows a wall-thickness dimension.
+
+    Keeps the outermost reference on each end (the true building extent) and
+    drops the inner face of the corner/jog that sits a thickness away."""
+    if len(pairs) <= 2:
+        return pairs
+    ordered = sorted(pairs, key=lambda item: item[1])
+    kept = [ordered[0]]
+    for p in ordered[1:-1]:
+        if abs(p[1] - kept[-1][1]) > min_ft:
+            kept.append(p)
+    last = ordered[-1]
+    if abs(last[1] - kept[-1][1]) > min_ft:
+        kept.append(last)
+    else:
+        # A sliver at the far end: keep the outer face, drop the inner one.
+        kept[-1] = last
+    return kept
 
 
 def _exterior_tier_geometry(all_elems, ext_wall_ids, axis):
@@ -1095,7 +1721,6 @@ def _exterior_tier_geometry(all_elems, ext_wall_ids, axis):
     ]
     if not exterior_elems:
         return None
-    tier1 = _continuous_exterior_pairs(all_elems, ext_wall_ids, axis, True)
     # Two perpendicular extremes so tiers can be placed on BOTH sides:
     #   axis "x": perp_min = bottom (min Y), perp_max = top (max Y)
     #   axis "y": perp_min = left  (min X), perp_max = right (max X)
@@ -1107,14 +1732,35 @@ def _exterior_tier_geometry(all_elems, ext_wall_ids, axis):
         ei["max_y"] if axis == "x" else ei["max_x"]
         for ei in exterior_elems
     )
+    perp_mid = (perp_min + perp_max) / 2.0
+
+    # Wall-thickness tolerance, derived from the actual exterior walls (no
+    # hardcoded distance). Any exterior chain segment at or below this length is
+    # a wall-thickness sliver and is dropped, so we never dimension a thickness.
+    # Factor > 1 covers mitered/joined corners, where the end-cap face sits a
+    # bit further than one nominal thickness from the outer envelope face.
+    thick_tol = _max_wall_thickness(exterior_elems) * 1.6
+
+    # Side-aware tiers: a guide on the "min" facade references only min-side
+    # walls/openings, and likewise for "max" — so dimensions never reach across
+    # the building to the opposite facade. Envelope endpoints are shared.
+    def _pairs(open_, side):
+        return _continuous_exterior_pairs(
+            all_elems, ext_wall_ids, axis, open_, side=side, perp_mid=perp_mid)
+
     return {
         "axis": axis,
         "c_min": tier2[0][1],
         "c_max": tier2[-1][1],
         "perp_min": perp_min,
         "perp_max": perp_max,
-        "tier1": tier1,
-        "tier2": tier2,
+        "thick_tol": thick_tol,
+        "tier1_min": _pairs(True, "min"),
+        "tier1_max": _pairs(True, "max"),
+        "tier2_min": _facade_segment_pairs(
+            all_elems, ext_wall_ids, axis, "min", perp_mid),
+        "tier2_max": _facade_segment_pairs(
+            all_elems, ext_wall_ids, axis, "max", perp_mid),
         "overall": [tier2[0], tier2[-1]],
     }
 
@@ -1132,9 +1778,17 @@ def _create_guide_line(sp, axis, tier, side, c_min, c_max, perp, elev):
         p1 = XYZ(perp, c_max, elev)
     ln = Line.CreateBound(p0, p1)
     mc = doc.Create.NewModelCurve(ln, sp)
+    # Durable tag = line style. Comments is also set as a best-effort fallback.
+    _apply_line_style(mc, _guide_style_name(axis, tier, side))
     p = mc.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
     if p is not None and not p.IsReadOnly:
         p.Set(_guide_comment(axis, tier, side))
+    applied = _line_style_name(mc)
+    _glog(u"guide {}-t{}-{}: ({},{})->({},{}) z_mm={} style='{}'".format(
+        axis, tier, side,
+        int(round(ft_to_mm(p0.X))), int(round(ft_to_mm(p0.Y))),
+        int(round(ft_to_mm(p1.X))), int(round(ft_to_mm(p1.Y))),
+        int(round(ft_to_mm(elev))), applied))
     return mc
 
 
@@ -1165,23 +1819,33 @@ def _find_guide_lines():
     the user made between click 1 and click 2.
     """
     guides = []
-    col = FilteredElementCollector(doc).OfCategory(
-        BuiltInCategory.OST_Lines).WhereElementIsNotElementType()
-    for ce in col:
-        if not isinstance(ce, CurveElement):
+    for ce in _collect_model_lines():
+        axis = tier = side = None
+        # Primary tag: line style name  AUTODIM_GUIDE_<axis>_<tier>_<side>
+        sn = _line_style_name(ce)
+        if sn and sn.startswith(GUIDE_MARK + u"_"):
+            rest = sn[len(GUIDE_MARK) + 1:].split(u"_")
+            if len(rest) == 3:
+                axis = rest[0]
+                try:
+                    tier = int(rest[1])
+                except Exception:
+                    tier = None
+                side = rest[2]
+        # Fallback tag: Comments  AUTODIM_GUIDE|<axis>|<tier>|<side>
+        if axis is None:
+            c = _get_comment(ce)
+            if c and c.startswith(GUIDE_MARK + u"|"):
+                parts = c.split(u"|")
+                if len(parts) == 4:
+                    axis = parts[1]
+                    try:
+                        tier = int(parts[2])
+                    except Exception:
+                        tier = None
+                    side = parts[3]
+        if axis is None or tier is None:
             continue
-        c = _get_comment(ce)
-        if not c or not c.startswith(GUIDE_MARK):
-            continue
-        parts = c.split(u"|")
-        if len(parts) != 4:
-            continue
-        axis = parts[1]
-        try:
-            tier = int(parts[2])
-        except Exception:
-            continue
-        side = parts[3]
         try:
             crv = ce.GeometryCurve
             mid = crv.Evaluate(0.5, True)
@@ -1197,6 +1861,7 @@ def dimension_along_guides(all_elems, ext_wall_ids, guides, dims_to_adjust):
     """Click 2: place a dimension at each guide line's position (all sides)."""
     created = 0
     geo_cache = {}
+    _seg_log_reset()
     for g in guides:
         axis = g["axis"]
         if axis not in geo_cache:
@@ -1206,22 +1871,45 @@ def dimension_along_guides(all_elems, ext_wall_ids, guides, dims_to_adjust):
         if not geo:
             continue
         tier = g["tier"]
+        side = g.get("side")
+        if side not in ("min", "max"):
+            perp_mid = (geo["perp_min"] + geo["perp_max"]) / 2.0
+            side = "min" if g["perp"] < perp_mid else "max"
         if tier == 1:
-            pairs = geo["tier1"]
+            pairs = geo["tier1_max"] if side == "max" else geo["tier1_min"]
         elif tier == 2:
-            pairs = geo["tier2"]
+            pairs = geo["tier2_max"] if side == "max" else geo["tier2_min"]
         else:
             pairs = geo["overall"]
+        # Exterior rule: never dimension a wall thickness — drop thickness slivers.
+        raw_mm = [int(round(ft_to_mm(c))) for unused_r, c in
+                  sorted(pairs, key=lambda it: it[1])]
+        ttol = geo.get("thick_tol", mm_to_ft(330))
+        pairs = _drop_thickness_refs(pairs, ttol)
+        kept_mm = [int(round(ft_to_mm(c))) for unused_r, c in pairs]
+        segs_mm = [kept_mm[i + 1] - kept_mm[i] for i in range(len(kept_mm) - 1)]
+        _seg_log(u"axis={} tier={} side={} thick_tol_mm={} n_raw={} n_kept={}"
+                 u"\n  raw={}\n  kept={}\n  segs={}".format(
+                     axis, tier, side, int(round(ft_to_mm(ttol))),
+                     len(raw_mm), len(kept_mm), raw_mm, kept_mm, segs_mm))
         if len(pairs) < 2:
             continue
         refs = [ref for ref, unused_coord in pairs]
         perp = g["perp"]
         if axis == "x":
-            p0 = XYZ(geo["c_min"], perp, 0)
-            p1 = XYZ(geo["c_max"], perp, 0)
+            a = XYZ(geo["c_min"], perp, 0)
+            b = XYZ(geo["c_max"], perp, 0)
         else:
-            p0 = XYZ(perp, geo["c_min"], 0)
-            p1 = XYZ(perp, geo["c_max"], 0)
+            a = XYZ(perp, geo["c_min"], 0)
+            b = XYZ(perp, geo["c_max"], 0)
+        # Revit places dimension text on the +90deg side of the line direction.
+        # For the lower (bottom, axis-x min) string, drawing left->right puts the
+        # text on the building side; reverse it so the text sits away from the
+        # facade wall, matching the (already-correct) upper string.
+        if axis == "x" and side == "min":
+            p0, p1 = b, a
+        else:
+            p0, p1 = a, b
         dim = make_dim(refs, p0, p1, "guide-t{}-{}-{}".format(
             tier, axis, g.get("side", "")))
         if dim:
@@ -1236,6 +1924,122 @@ def _delete_guides(guides):
             doc.Delete(g["elem"].Id)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Interior guide lines (one horizontal + one vertical, user copies/moves them)
+# ---------------------------------------------------------------------------
+
+def _iguide_comment(axis):
+    return u"{}|{}".format(IGUIDE_MARK, axis)
+
+
+def create_interior_guides(all_elems):
+    """Seed one horizontal + one vertical interior guide line through the
+    building center. The user copies/moves them to each row/column to dimension.
+
+    axis "x": horizontal line -> measures the N/S walls it crosses.
+    axis "y": vertical line   -> measures the E/W walls it crosses.
+    """
+    if not all_elems:
+        return 0
+    sp, elev = _make_sketch_plane()
+    min_x = min(ei["min_x"] for ei in all_elems)
+    max_x = max(ei["max_x"] for ei in all_elems)
+    min_y = min(ei["min_y"] for ei in all_elems)
+    max_y = max(ei["max_y"] for ei in all_elems)
+    cx = (min_x + max_x) / 2.0
+    cy = (min_y + max_y) / 2.0
+    # Remember the seed positions so untouched seeds are skipped when dimensioning
+    # (perp for a horizontal "x" guide is its Y; for a vertical "y" guide, its X).
+    _AD_INT_SEEDS["x"] = [cy]
+    _AD_INT_SEEDS["y"] = [cx]
+    created = 0
+    seeds = (
+        ("x", XYZ(min_x, cy, elev), XYZ(max_x, cy, elev)),
+        ("y", XYZ(cx, min_y, elev), XYZ(cx, max_y, elev)),
+    )
+    for axis, p0, p1 in seeds:
+        try:
+            ln = Line.CreateBound(p0, p1)
+            mc = doc.Create.NewModelCurve(ln, sp)
+            _apply_line_style(mc, _iguide_style_name(axis))
+            p = mc.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+            if p is not None and not p.IsReadOnly:
+                p.Set(_iguide_comment(axis))
+            created += 1
+        except Exception:
+            continue
+    return created
+
+
+def _find_interior_guides():
+    """Return existing interior guide lines as dicts (elem, axis, perp).
+
+    Any copies the user made are picked up too, since they inherit the marker.
+    """
+    guides = []
+    for ce in _collect_model_lines():
+        axis = None
+        # Primary tag: line style name  AUTODIM_IGUIDE_<axis>
+        sn = _line_style_name(ce)
+        if sn and sn.startswith(IGUIDE_MARK + u"_"):
+            axis = sn[len(IGUIDE_MARK) + 1:]
+        # Fallback tag: Comments  AUTODIM_IGUIDE|<axis>
+        if axis is None:
+            c = _get_comment(ce)
+            if c and c.startswith(IGUIDE_MARK + u"|"):
+                parts = c.split(u"|")
+                if len(parts) == 2:
+                    axis = parts[1]
+        if axis not in ("x", "y"):
+            continue
+        try:
+            crv = ce.GeometryCurve
+            mid = crv.Evaluate(0.5, True)
+            perp = mid.Y if axis == "x" else mid.X
+        except Exception:
+            continue
+        guides.append({"elem": ce, "axis": axis, "perp": perp})
+    return guides
+
+
+def dimension_along_interior_guides(all_elems, guides, dims_to_adjust):
+    """Create an interior dimension along each interior guide line, reusing the
+    existing per-line wall-crossing logic (_interior_dimension_at_point)."""
+    created = 0
+    _seg_log(u"--- interior guides found: {} ---".format(len(guides)))
+    seed_tol = mm_to_ft(30)
+
+    def _is_seed(axis, perp):
+        return any(abs(perp - s) <= seed_tol for s in _AD_INT_SEEDS.get(axis, []))
+
+    # An axis is "active" if it has at least one guide the user moved/copied away
+    # from the seed. Only then do we treat the leftover seed as a copy-template to
+    # skip. If the user left the single seed where it is, it IS the request.
+    moved_axes = set(g["axis"] for g in guides if not _is_seed(g["axis"], g["perp"]))
+
+    done_perp = {"x": [], "y": []}
+    for i, g in enumerate(guides):
+        axis = g["axis"]
+        perp = g["perp"]
+        if _is_seed(axis, perp) and axis in moved_axes:
+            _seg_log(u"int guide #{} axis={} perp_mm={} SKIPPED (leftover copy seed)".format(
+                i + 1, axis, int(round(ft_to_mm(perp)))))
+            continue
+        # De-duplicate guides landing on the same line (e.g. a copy dropped on top
+        # of another), so the same interior dimension is not created twice.
+        if any(abs(perp - p) <= seed_tol for p in done_perp.get(axis, [])):
+            _seg_log(u"int guide #{} axis={} perp_mm={} SKIPPED (duplicate line)".format(
+                i + 1, axis, int(round(ft_to_mm(perp)))))
+            continue
+        done_perp[axis].append(perp)
+        _seg_log(u"int guide #{} axis={} perp_mm={}".format(
+            i + 1, axis, int(round(ft_to_mm(perp)))))
+        point = XYZ(0, perp, 0) if axis == "x" else XYZ(perp, 0, 0)
+        created += _interior_dimension_at_point(
+            point, axis, all_elems, dims_to_adjust, i + 1)
+    return created
 
 
 def make_building_chains(all_elems, dims_to_adjust):
@@ -1816,218 +2620,260 @@ def _find_existing_grid_dim_offset(grids_sorted, measure_axis, side=1):
     return best_perp
 
 
-def main():
+def place_all_guides(notify=True):
+    """Auto-detect exterior walls and place every guide line: 3 exterior tiers
+    on all 4 sides + one horizontal and one vertical interior guide. With
+    ``notify`` the user is told to adjust the guides and re-run; when called as
+    part of the one-run path it stays silent. Returns (n_ext, n_int) or None on
+    failure."""
+    _glog_reset()
+    _glog(u"=== place_all_guides ===")
+    all_elems = collect_walls_in_view()
+    _glog(u"walls in view: {}".format(len(all_elems)))
+    if not all_elems:
+        forms.alert(u"No walls found in this view.", title=__title__)
+        return None
+
+    ext_wall_ids = _compute_exterior_wall_ids(all_elems)
+    _glog(u"exterior wall ids: {}".format(len(ext_wall_ids)))
+
+    # Clear any leftover guides from a previous run, then seed fresh ones.
+    stale = _find_guide_lines() + _find_interior_guides()
+    _glog(u"stale guides cleared: {}".format(len(stale)))
+    t = Transaction(doc, u"AutoDimension guides")
+    t.Start()
+    try:
+        if stale:
+            _delete_guides(stale)
+        n_ext = create_exterior_guides(all_elems, ext_wall_ids)
+        n_int = create_interior_guides(all_elems)
+        t.Commit()
+    except Exception as e:
+        t.RollBack()
+        _glog(u"guide creation EXCEPTION: {}".format(str(e)))
+        forms.alert(u"Failed to create guide lines:\n{}".format(str(e)),
+                    title=__title__)
+        return None
+    _glog(u"guides created: ext={} int={}".format(n_ext, n_int))
+
+    if notify:
+        forms.alert(
+            u"Placed {} exterior guide lines (3 tiers x 4 sides) and {} interior "
+            u"guide lines (1 horizontal + 1 vertical).\n\n"
+            u"Move or copy the guides where you want dimensions, then run "
+            u"AutoDimension 1 again to create the dimensions.".format(
+                n_ext, n_int),
+            title=__title__)
+    return (n_ext, n_int)
+
+
+def create_all_dimensions(notify=True):
+    """Read the guide lines and build exterior + interior dimensions along them,
+    then delete the guides. Runs as an ordinary command, so the transaction
+    context is always valid (no modeless / ExternalEvent)."""
     if not isinstance(view, ViewPlan):
         forms.alert(u"Please open a plan view.", title=__title__)
         return
 
+    all_elems = collect_walls_in_view()
+    ext_guides = _find_guide_lines()
+    int_guides = _find_interior_guides()
+    if not ext_guides and not int_guides:
+        forms.alert(u"No guide lines found. Run AutoDimension 1 to place "
+                    u"guides first.", title=__title__)
+        return
+
+    ext_wall_ids = _compute_exterior_wall_ids(all_elems)
+    fh = DimFailureSwallower()
+    t = Transaction(doc, u"AutoDimension create")
+    opts = t.GetFailureHandlingOptions()
+    opts.SetFailuresPreprocessor(fh)
+    t.SetFailureHandlingOptions(opts)
+    t.Start()
     try:
-        sel_refs = uidoc.Selection.PickObjects(
-            ObjectType.Element,
-            u"Select the exterior walls (grids/columns optional), then press Enter"
-        )
-    except Exception:
-        return
-
-    if not sel_refs:
-        forms.alert(u"Nothing selected.", title=__title__)
-        return
-
-    selected_elements = [doc.GetElement(r.ElementId) for r in sel_refs]
-
-    all_grids = collect_grids_from_selection(selected_elements)
-    all_elems = collect_elements_from_selection(selected_elements)
-
-    h_grids = sorted([g for g in all_grids if g["orientation"] == "horizontal"],
-                     key=lambda g: g["coord_ft"])
-    v_grids = sorted([g for g in all_grids if g["orientation"] == "vertical"],
-                     key=lambda g: g["coord_ft"])
-
-    if DEBUG:
-        n_walls = sum(1 for e in all_elems if e["category"] == "Wall")
-        n_cols = sum(1 for e in all_elems if e["category"] == "Column")
-        output.print_md(u"## Data (from selection)")
-        output.print_md(u"- H grids: **{}** ({})".format(
-            len(h_grids), u", ".join(g["name"] for g in h_grids)))
-        output.print_md(u"- V grids: **{}** ({})".format(
-            len(v_grids), u", ".join(g["name"] for g in v_grids)))
-        output.print_md(u"- Elements: **{}** (walls: {}, columns: {})".format(
-            len(all_elems), n_walls, n_cols))
-
-    if not all_elems:
-        forms.alert(u"No walls or columns in the selection.", title=__title__)
-        return
-
-    # Two-click guide-line workflow (no-grid exterior only).
-    #   Click 1 (no guides yet): draw the three tier lines, then stop.
-    #   Click 2 (guides present): dimension along them and delete them.
-    existing_guides = _find_guide_lines()
-    no_grid = not h_grids and not v_grids
-    ext_wall_ids = None
-    if no_grid:
-        ext_wall_ids = _compute_exterior_wall_ids(all_elems)
-        if not existing_guides:
-            t = Transaction(doc, u"AutoDimension guide lines")
-            t.Start()
-            try:
-                n_guides = create_exterior_guides(all_elems, ext_wall_ids)
-                t.Commit()
-            except Exception as e:
-                t.RollBack()
-                forms.alert(u"Failed to create guide lines:\n{}".format(str(e)),
-                            title=__title__)
-                return
-            forms.alert(
-                u"Placed {} exterior guide lines — 3 tiers "
-                u"(opening / facade / overall) on all 4 sides.\n\n"
-                u"Move any line to where you want that dimension tier, then run "
-                u"AutoDimension again to create the dimensions.".format(n_guides),
-                title=__title__)
-            return
-
-    # Interior points are picked after the exterior dimensions are committed.
-    # Revit does not allow interactive selection while a transaction is open.
-    interior_walls = collect_walls_in_view()
-
-    tg = TransactionGroup(doc, __title__)
-    tg.Start()
-    total = 0
-    failure_handler = DimFailureSwallower()
-
-    try:
-        t1 = Transaction(doc, u"Chains")
-        opts1 = t1.GetFailureHandlingOptions()
-        opts1.SetFailuresPreprocessor(failure_handler)
-        t1.SetFailureHandlingOptions(opts1)
-        t1.Start()
-        n_chains = 0
-        if len(v_grids) >= 2:
-            n_chains += make_grid_chain(v_grids, "x", OFFSET_CHAIN_1_MM)
-            if len(v_grids) > 2:
-                n_chains += make_grid_chain(
-                    [v_grids[0], v_grids[-1]], "x",
-                    OFFSET_CHAIN_1_MM + OFFSET_CHAIN_GAP_MM)
-        if len(h_grids) >= 2:
-            n_chains += make_grid_chain(h_grids, "y", OFFSET_CHAIN_1_MM)
-            if len(h_grids) > 2:
-                n_chains += make_grid_chain(
-                    [h_grids[0], h_grids[-1]], "y",
-                    OFFSET_CHAIN_1_MM + OFFSET_CHAIN_GAP_MM)
-        t1.Commit()
-        total += n_chains
-        if DEBUG:
-            output.print_md(u"✅ Grid chains: **{}**".format(n_chains))
-
-        t2 = Transaction(doc, u"Snaps+Overalls")
-        opts2 = t2.GetFailureHandlingOptions()
-        opts2.SetFailuresPreprocessor(failure_handler)
-        t2.SetFailureHandlingOptions(opts2)
-        t2.Start()
-        n_x = 0
-        n_y = 0
-        dims_to_adjust = []
-        occupied_zones = []
-
-        # Identify exterior walls once — used to filter both chains and openings.
-        # In no-grid mode this was already computed above for the guide phase.
-        if ext_wall_ids is None:
-            ext_wall_ids = _compute_exterior_wall_ids(all_elems)
-        if DEBUG:
-            output.print_md(u"🏢 Exterior walls detected: **{}** / {}".format(
-                len(ext_wall_ids), len(all_elems)))
-
-        if no_grid:
-            # Guides exist (click 2): place each tier along its guide line,
-            # then remove the guide lines.
-            n_chains = dimension_along_guides(
-                all_elems, ext_wall_ids, existing_guides, dims_to_adjust
-            )
-            n_x += n_chains
-            _delete_guides(existing_guides)
-        else:
-            for ei in all_elems:
-                side_x = _pick_side(ei, "x", h_grids)
-                side_y = side_x
-
-                try:
-                    n_x += dim_along_axis(ei, "x", v_grids, h_grids, all_elems, dims_to_adjust,
-                                          forced_side=side_x, occupied_zones=occupied_zones)
-                except Exception as e:
-                    if DEBUG:
-                        output.print_md(u"⚠ Error on X axis: {}".format(str(e)))
-                try:
-                    n_y += dim_along_axis(ei, "y", h_grids, v_grids, all_elems, dims_to_adjust,
-                                          forced_side=side_y, occupied_zones=occupied_zones)
-                except Exception as e:
-                    if DEBUG:
-                        output.print_md(u"⚠ Error on Y axis: {}".format(str(e)))
-
-        # Grid mode keeps the existing per-wall opening dimensions. Without
-        # grids, openings are already included in continuous tier 1 above.
-        n_openings = 0
-        if h_grids or v_grids:
-            for ei in all_elems:
-                if ei["element"].Id.IntegerValue not in ext_wall_ids:
-                    continue  # skip core/interior walls
-                try:
-                    n_openings += dim_wall_with_openings(ei, dims_to_adjust)
-                except Exception as e:
-                    if DEBUG:
-                        output.print_md(u"⚠ along-wall error (id={}): {}".format(
-                            ei["element"].Id.IntegerValue, str(e)))
-        n_x += n_openings
-
+        global _AD_DIM_TYPE_ID
+        _AD_DIM_TYPE_ID = _autodim_dim_type_id()
+        # Remove this tool's dimensions/notes from earlier runs so strings don't
+        # stack (leaves the user's own and grid dimensions untouched).
+        _delete_previous_autodim()
+        dims = []
+        n_ext = 0
+        n_int = 0
+        if ext_guides:
+            n_ext = dimension_along_guides(
+                all_elems, ext_wall_ids, ext_guides, dims)
+        if int_guides:
+            n_int = dimension_along_interior_guides(all_elems, int_guides, dims)
+        if ANNOTATE_OPENING_HEIGHTS:
+            annotate_opening_heights(all_elems, ext_wall_ids)
+        _delete_guides(ext_guides + int_guides)
         doc.Regenerate()
-
-        for d in dims_to_adjust:
+        for d in dims:
             _displace_small_texts(d)
-
-        t2.Commit()
-        total += n_x + n_y
-        if DEBUG:
-            output.print_md(u"✅ Dimensions along X: **{}**, along Y: **{}**".format(n_x, n_y))
-            if occupied_zones:
-                output.print_md(u"📦 Reserved zones: **{}**".format(len(occupied_zones)))
-            if failure_handler.had_errors:
-                output.print_md(u"⚠ Revit errors (auto-resolved): **{}**".format(len(failure_handler.had_errors)))
-                for err_msg in failure_handler.had_errors:
-                    output.print_md(u"   - {}".format(err_msg))
-
-        # Phase 1: Enter ends horizontal selection and immediately creates
-        # horizontal interior dimensions before vertical selection begins.
-        horizontal_points = _pick_reference_points(
-            u"Pick horizontal interior points, then click Finish to create horizontal dimensions"
-        )
-        n_horizontal = create_interior_phase(
-            horizontal_points, "x", interior_walls, failure_handler
-        )
-        total += n_horizontal
-        if DEBUG:
-            output.print_md(u"✅ Horizontal interior dimensions: **{}**".format(n_horizontal))
-
-        # Phase 2: Enter ends vertical selection and immediately creates the
-        # vertical interior dimensions, then the routine finishes.
-        vertical_points = _pick_reference_points(
-            u"Pick vertical interior points, then click Finish to create vertical dimensions and finish"
-        )
-        n_vertical = create_interior_phase(
-            vertical_points, "y", interior_walls, failure_handler
-        )
-        total += n_vertical
-        if DEBUG:
-            output.print_md(u"✅ Vertical interior dimensions: **{}**".format(n_vertical))
-            output.print_md(u"- Visible walls available for interior dimensions: **{}**".format(
-                len(interior_walls)))
-
-        tg.Assimilate()
-
+        # Purge the AUTODIM_* line styles so they don't accumulate in the model.
+        _purge_guide_line_styles()
+        t.Commit()
     except Exception as e:
-        tg.RollBack()
-        forms.alert(u"Error:\n{}".format(str(e)), title=__title__)
+        t.RollBack()
+        forms.alert(u"Error creating dimensions:\n{}".format(str(e)),
+                    title=__title__)
         return
 
-    output.print_md(u"---")
-    output.print_md(u"## Result: **{}** dimensions created".format(total))
+    if notify:
+        forms.alert(
+            u"Created {} exterior + {} interior dimensions.".format(
+                n_ext, n_int),
+            title=__title__)
+
+
+def _cleanup_guides_only():
+    """Delete all guide lines and purge their styles without dimensioning
+    (the Cancel path). Runs in its own transaction."""
+    guides = _find_guide_lines() + _find_interior_guides()
+    if not guides:
+        return
+    t = Transaction(doc, u"AutoDimension cancel")
+    t.Start()
+    try:
+        _delete_guides(guides)
+        _purge_guide_line_styles()
+        t.Commit()
+    except Exception:
+        t.RollBack()
+
+
+# ---------------------------------------------------------------------------
+# One-run modeless flow: place guides -> floating window waits while the user
+# adjusts them -> button creates the dimensions. Revit API calls from a modeless
+# window must run in a valid context, so the button only sets a request flag and
+# Revit's own Idling event (always an active context) does the transaction on the
+# next tick. Needs __persistentengine__ so the handler survives past main().
+# ---------------------------------------------------------------------------
+
+_AD_WINDOW = None
+_AD_REQUEST = None          # None | "create" | "cancel"
+_AD_IDLING_HOOKED = False
+
+
+def _ad_uiapp():
+    from pyrevit import HOST_APP
+    return HOST_APP.uiapp
+
+
+def _on_idling(sender, args):
+    """Runs on every Revit idle tick; does work only when a button set a
+    request. Idling is a valid context for a transaction."""
+    global _AD_REQUEST, _AD_WINDOW
+    req = _AD_REQUEST
+    if req is None:
+        return
+    _AD_REQUEST = None  # consume before doing work, so it runs once
+    try:
+        if req == u"cancel":
+            _cleanup_guides_only()
+        else:
+            create_all_dimensions(notify=False)
+    except Exception as ex:
+        try:
+            forms.alert(u"Error creating dimensions:\n{}".format(str(ex)),
+                        title=__title__)
+        except Exception:
+            pass
+    try:
+        if _AD_WINDOW is not None:
+            _AD_WINDOW.Close()
+    except Exception:
+        pass
+    _AD_WINDOW = None
+
+
+def _hook_idling():
+    """Subscribe to Idling once for the engine lifetime."""
+    global _AD_IDLING_HOOKED
+    if _AD_IDLING_HOOKED:
+        return
+    _ad_uiapp().Idling += _on_idling
+    _AD_IDLING_HOOKED = True
+
+
+class AutoDimWindow(forms.WPFWindow):
+    """Modeless floating window with Create Dimensions / Cancel buttons. The
+    buttons only set a request flag -- the Idling handler does the model work."""
+
+    def __init__(self, xaml_path):
+        forms.WPFWindow.__init__(self, xaml_path)
+
+    def _request(self, action, busy_text):
+        global _AD_REQUEST
+        try:
+            self.status.Text = busy_text
+        except Exception:
+            pass
+        _AD_REQUEST = action
+
+    def create_click(self, sender, args):
+        self._request(u"create", u"Creating dimensions...")
+
+    def cancel_click(self, sender, args):
+        self._request(u"cancel", u"Removing guides...")
+
+
+def _open_modeless_window():
+    """Show the modeless window and arm the Idling handler. Returns True on
+    success."""
+    global _AD_WINDOW
+    try:
+        _hook_idling()
+        xaml_path = os.path.join(os.path.dirname(__file__), u"AutoDimWindow.xaml")
+        win = AutoDimWindow(xaml_path)
+        _AD_WINDOW = win
+        win.show()
+        return True
+    except Exception as ex:
+        try:
+            output.print_md(u"modeless window failed: {}".format(str(ex)))
+        except Exception:
+            pass
+        return False
+
+
+def main():
+    """One-run floating-window flow: place the bold-red guide lines, then open a
+    modeless window that waits while the user moves/copies the guides. Clicking
+    Create Dimensions builds the dimensions and deletes the guides."""
+    if not isinstance(view, ViewPlan):
+        forms.alert(u"Please open a plan view.", title=__title__)
+        return
+
+    # If the window is already open, don't disturb the guides being adjusted --
+    # just bring it forward. If it was closed via the X, start a fresh cycle.
+    global _AD_WINDOW
+    if _AD_WINDOW is not None:
+        still_open = False
+        try:
+            still_open = bool(_AD_WINDOW.IsVisible)
+        except Exception:
+            still_open = False
+        if still_open:
+            try:
+                _AD_WINDOW.Activate()
+            except Exception:
+                pass
+            return
+        _AD_WINDOW = None
+
+    placed = place_all_guides(notify=False)
+    if placed is None:
+        return
+    n_ext, n_int = placed
+
+    if not _open_modeless_window():
+        # Window unavailable: leave the guides in place (don't delete them).
+        forms.alert(
+            u"Placed {} exterior + {} interior guide lines, but the floating "
+            u"button could not open. Reload pyRevit and run AutoDimension 1 "
+            u"again.".format(n_ext, n_int),
+            title=__title__)
 
 
 if __name__ == "__main__":
