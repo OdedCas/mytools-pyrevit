@@ -110,6 +110,10 @@ IGUIDE_MARK = u"AUTODIM_IGUIDE"
 # above the level (elevation data a plan dimension cannot show).
 ANNOTATE_OPENING_HEIGHTS = True
 
+# How far inside the wall the UK=<sill> note sits, in mm. Raise it if the note
+# clashes with what is drawn just inside the opening.
+OPENING_NOTE_OFFSET_MM = 700
+
 # Find exterior walls by flood-filling the building footprint instead of the
 # old "is any wall further out?" overlap test, which dropped walls on steps,
 # recesses and U-shaped notches. Set to False to fall back to the old test.
@@ -969,9 +973,10 @@ def annotate_opening_heights(all_elems, ext_wall_ids):
     bcx = (min(e["min_x"] for e in ext_elems) + max(e["max_x"] for e in ext_elems)) / 2.0
     bcy = (min(e["min_y"] for e in ext_elems) + max(e["max_y"] for e in ext_elems)) / 2.0
 
-    # Push the note past every exterior tier so it never overlaps a dimension
-    # string (tier 3 -- the outermost -- sits at OFFSET_3_MM outside the wall).
-    inward = mm_to_ft(OFFSET_3_MM + 500)
+    # Just clear of the wall, toward the interior. The exterior tiers sit on the
+    # OTHER side of the wall, so this never has to clear them -- what used to
+    # drop the note onto a dimension string was the offset SIGN, handled below.
+    inward = mm_to_ft(OPENING_NOTE_OFFSET_MM)
     created = 0
     seen = set()
     for ei in all_elems:
