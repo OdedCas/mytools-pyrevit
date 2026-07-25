@@ -529,13 +529,23 @@ def make_dim(refs, p0, p1, label=""):
 
 
 def _displace_small_texts(dim):
+    """Move the labels of segments too narrow to hold their own text.
+
+    Pushing them all the same way along the dimension line only works for a
+    lone narrow segment: a RUN of them (thin walls, a jamb next to a jog) all
+    shift by the same amount and land on top of each other. So offset
+    PERPENDICULAR to the line instead, alternating side and stepping a row
+    further out every two, which keeps each label over its own segment and lets
+    Revit draw the leader. Row height and the width threshold both scale with
+    the view, so this holds at any plot scale."""
     try:
         scale = view.Scale
     except Exception:
         scale = 100
 
+    # Roughly the model-space width/height of one line of dimension text.
     text_width_mm = 5.0 * scale
-    displace_mm = text_width_mm
+    row_mm = 3.5 * scale
 
     try:
         crv = dim.Curve
@@ -544,34 +554,42 @@ def _displace_small_texts(dim):
         direction = crv.Direction.Normalize()
     except Exception:
         return
+    # In-plane normal of the dimension line.
+    perp = XYZ(-direction.Y, direction.X, 0.0)
+
+    def _shift(target, run_index):
+        """Offset one label off the line; returns True if it was moved."""
+        try:
+            if not target.IsTextPositionAdjustable():
+                return False
+            tp = target.TextPosition
+            if tp is None:
+                return False
+            side = 1.0 if (run_index % 2 == 0) else -1.0
+            level = (run_index // 2) + 1
+            off = mm_to_ft(row_mm * level) * side
+            target.TextPosition = XYZ(tp.X + perp.X * off,
+                                      tp.Y + perp.Y * off,
+                                      tp.Z)
+            return True
+        except Exception:
+            return False
 
     try:
         segs = list(dim.Segments)
         if segs and len(segs) > 0:
-            for i, seg in enumerate(segs):
+            run = 0
+            for seg in segs:
                 try:
                     val = seg.Value
                     if val is None:
+                        run = 0
                         continue
-                    val_mm = ft_to_mm(val)
-                    if val_mm >= text_width_mm:
+                    if ft_to_mm(val) >= text_width_mm:
+                        run = 0          # wide enough: breaks the crowded run
                         continue
-
-                    if not seg.IsTextPositionAdjustable():
-                        continue
-
-                    tp = seg.TextPosition
-                    if tp is None:
-                        continue
-
-                    sign = -1.0 if i == 0 else 1.0
-                    offset_ft = mm_to_ft(displace_mm)
-                    new_tp = XYZ(
-                        tp.X + direction.X * offset_ft * sign,
-                        tp.Y + direction.Y * offset_ft * sign,
-                        tp.Z,
-                    )
-                    seg.TextPosition = new_tp
+                    if _shift(seg, run):
+                        run += 1
                 except Exception:
                     continue
             return
@@ -582,24 +600,9 @@ def _displace_small_texts(dim):
         val = dim.Value
         if val is None:
             return
-        val_mm = ft_to_mm(val)
-        if val_mm >= text_width_mm:
+        if ft_to_mm(val) >= text_width_mm:
             return
-
-        if not dim.IsTextPositionAdjustable():
-            return
-
-        tp = dim.TextPosition
-        if tp is None:
-            return
-
-        offset_ft = mm_to_ft(displace_mm)
-        new_tp = XYZ(
-            tp.X + direction.X * offset_ft,
-            tp.Y + direction.Y * offset_ft,
-            tp.Z,
-        )
-        dim.TextPosition = new_tp
+        _shift(dim, 0)
     except Exception:
         pass
 
