@@ -115,9 +115,10 @@ ANNOTATE_OPENING_HEIGHTS = True
 # recesses and U-shaped notches. Set to False to fall back to the old test.
 USE_FOOTPRINT_EXTERIOR_DETECTION = True
 
-# Drop interior chain segments at or below one wall thickness, so the interior
-# strings stop reporting wall thicknesses as if they were rooms.
-FILTER_INTERIOR_THICKNESS = True
+# Interior chains intentionally KEEP each wall's two faces, so the string reads
+# room / wall thickness / room -- that thickness is wanted information here.
+# (The exterior tiers still drop thickness slivers; that is a separate filter.)
+FILTER_INTERIOR_THICKNESS = False
 
 # Perp positions where the interior guides were auto-seeded (building center).
 # A guide left untouched at its seed position is a template, not a request, so it
