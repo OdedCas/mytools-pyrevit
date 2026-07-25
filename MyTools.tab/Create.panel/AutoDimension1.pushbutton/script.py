@@ -1633,19 +1633,19 @@ def _line_style_name(ce):
 
 
 def _collect_model_lines():
-    """All model lines in the document. ModelLine is concrete, so OfClass works;
-    fall back to a category+isinstance sweep if the class filter ever fails."""
+    """Guide lines are DETAIL curves in the active view (view-specific, so they
+    are always visible in the plan regardless of level elevation, view range,
+    crop, or worksets). Collect every curve element in this view."""
+    out = []
     try:
-        return list(FilteredElementCollector(doc).OfClass(ModelLine)
-                    .WhereElementIsNotElementType())
-    except Exception:
-        out = []
-        col = FilteredElementCollector(doc).OfCategory(
+        col = FilteredElementCollector(doc, view.Id).OfCategory(
             BuiltInCategory.OST_Lines).WhereElementIsNotElementType()
         for ce in col:
             if isinstance(ce, CurveElement):
                 out.append(ce)
-        return out
+    except Exception:
+        pass
+    return out
 
 
 def _make_sketch_plane():
@@ -1777,7 +1777,9 @@ def _create_guide_line(sp, axis, tier, side, c_min, c_max, perp, elev):
         p0 = XYZ(perp, c_min, elev)
         p1 = XYZ(perp, c_max, elev)
     ln = Line.CreateBound(p0, p1)
-    mc = doc.Create.NewModelCurve(ln, sp)
+    # Detail curve (view-specific) instead of model line, so guides always show
+    # in this plan regardless of level elevation / view range / crop / worksets.
+    mc = doc.Create.NewDetailCurve(view, ln)
     # Durable tag = line style. Comments is also set as a best-effort fallback.
     _apply_line_style(mc, _guide_style_name(axis, tier, side))
     p = mc.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
@@ -1962,7 +1964,7 @@ def create_interior_guides(all_elems):
     for axis, p0, p1 in seeds:
         try:
             ln = Line.CreateBound(p0, p1)
-            mc = doc.Create.NewModelCurve(ln, sp)
+            mc = doc.Create.NewDetailCurve(view, ln)
             _apply_line_style(mc, _iguide_style_name(axis))
             p = mc.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
             if p is not None and not p.IsReadOnly:
