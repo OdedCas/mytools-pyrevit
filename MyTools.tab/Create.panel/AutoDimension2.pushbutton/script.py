@@ -2270,6 +2270,16 @@ def pick_and_create_interior_guides(all_elems):
     max_y = max(ei["max_y"] for ei in all_elems)
     elev = _level_elevation()
 
+    # Hand focus back to the drawing area before picking. Straight after the
+    # ribbon command and the exterior-guide commit, Revit tends to eat the first
+    # click or two just to activate the view, and those clicks never reach
+    # PickPoint at all (confirmed from the log: every point that DID arrive
+    # produced a line).
+    try:
+        uidoc.RefreshActiveView()
+    except Exception:
+        pass
+
     created = 0
     # axis "y" = vertical line (spans Y, positioned by X); "x" = horizontal.
     phases = (
@@ -2278,6 +2288,7 @@ def pick_and_create_interior_guides(all_elems):
     )
     for axis, prompt in phases:
         n_axis = 0
+        n_points = 0
         while True:
             try:
                 pt = uidoc.Selection.PickPoint(prompt)
@@ -2288,6 +2299,7 @@ def pick_and_create_interior_guides(all_elems):
                 break
             if pt is None:
                 break
+            n_points += 1
             perp = pt.X if axis == "y" else pt.Y
             if axis == "y":
                 ok = _create_interior_guide(axis, perp, min_y, max_y, elev)
@@ -2296,7 +2308,10 @@ def pick_and_create_interior_guides(all_elems):
             if ok:
                 created += 1
                 n_axis += 1
-        _glog(u"interior guides placed on axis {}: {}".format(axis, n_axis))
+        # points vs placed: if they match but you clicked more times than that,
+        # the extra clicks were swallowed by Revit before reaching PickPoint.
+        _glog(u"interior guides axis {}: {} points picked, {} placed".format(
+            axis, n_points, n_axis))
 
     # Every line here is an explicit request, so there is no seed to skip later.
     _AD_INT_SEEDS["x"] = []
