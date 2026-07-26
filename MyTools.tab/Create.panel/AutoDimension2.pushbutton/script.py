@@ -114,6 +114,12 @@ ANNOTATE_OPENING_HEIGHTS = True
 # clashes with what is drawn just inside the opening.
 OPENING_NOTE_OFFSET_MM = 700
 
+# Click the interior guides into place instead of seeding two at the building
+# centre: left click drops one, right-click/Esc ends vertical placement and
+# starts horizontal, a second cancel finishes. Set False for the old two-seed
+# copy/move behaviour.
+INTERACTIVE_INTERIOR_GUIDES = True
+
 # Find exterior walls by flood-filling the building footprint instead of the
 # old "is any wall further out?" overlap test, which dropped walls on steps,
 # recesses and U-shaped notches. Set to False to fall back to the old test.
@@ -2204,9 +2210,52 @@ def _iguide_comment(axis):
     return u"{}|{}".format(IGUIDE_MARK, axis)
 
 
-def create_interior_guides(all_elems):
-    """Seed one horizontal + one vertical interior guide line through the
-    building center. The user copies/moves them to each row/column to dimension.
+def pick_interior_guide_positions():
+    """Let the user click where the interior guides go.
+
+    Left click drops a guide, right click (-> Cancel on Revit's context menu)
+    or Esc ends the phase: first phase places VERTICAL guides, second places
+    HORIZONTAL ones, and the second cancel leaves placement altogether.
+
+    Must be called from a command context with NO transaction open -- PickPoint
+    cannot run inside a transaction, and not at all from the modeless window.
+
+    Returns (vertical_x_positions, horizontal_y_positions); either may be empty
+    if the user cancelled straight away, which simply means "no interior
+    dimensions on that axis".
+    """
+    verticals = []
+    horizontals = []
+    phases = (
+        (verticals, u"Click where you want a VERTICAL interior guide "
+                    u"(right-click > Cancel or Esc for horizontal)"),
+        (horizontals, u"Click where you want a HORIZONTAL interior guide "
+                      u"(right-click > Cancel or Esc when done)"),
+    )
+    for bucket, prompt in phases:
+        while True:
+            try:
+                pt = uidoc.Selection.PickPoint(prompt)
+            except Exception:
+                # Esc / right-click-Cancel raises OperationCanceledException;
+                # anything else (no work plane, view cannot pick) also ends the
+                # phase rather than killing the whole run.
+                break
+            if pt is None:
+                break
+            bucket.append(pt.X if bucket is verticals else pt.Y)
+    _glog(u"picked interior guides: {} vertical, {} horizontal".format(
+        len(verticals), len(horizontals)))
+    return verticals, horizontals
+
+
+def create_interior_guides(all_elems, picked=None):
+    """Create the interior guide lines the user clicked for.
+
+    ``picked`` is (vertical_x_positions, horizontal_y_positions) from
+    ``pick_interior_guide_positions``. Without it, fall back to seeding one
+    horizontal + one vertical guide through the building centre for the user to
+    copy/move (the pre-click-to-place behaviour).
 
     axis "x": horizontal line -> measures the N/S walls it crosses.
     axis "y": vertical line   -> measures the E/W walls it crosses.
@@ -2218,18 +2267,30 @@ def create_interior_guides(all_elems):
     max_x = max(ei["max_x"] for ei in all_elems)
     min_y = min(ei["min_y"] for ei in all_elems)
     max_y = max(ei["max_y"] for ei in all_elems)
-    cx = (min_x + max_x) / 2.0
-    cy = (min_y + max_y) / 2.0
-    # Remember the seed positions so untouched seeds are skipped when dimensioning
-    # (perp for a horizontal "x" guide is its Y; for a vertical "y" guide, its X).
-    _AD_INT_SEEDS["x"] = [cy]
-    _AD_INT_SEEDS["y"] = [cx]
+
+    if picked is not None:
+        verticals, horizontals = picked
+        # Every line is an explicit request, so there is no seed to skip later.
+        _AD_INT_SEEDS["x"] = []
+        _AD_INT_SEEDS["y"] = []
+        lines = [("y", XYZ(x, min_y, elev), XYZ(x, max_y, elev))
+                 for x in verticals]
+        lines += [("x", XYZ(min_x, y, elev), XYZ(max_x, y, elev))
+                  for y in horizontals]
+    else:
+        cx = (min_x + max_x) / 2.0
+        cy = (min_y + max_y) / 2.0
+        # Remember the seed positions so untouched seeds are skipped when
+        # dimensioning (perp is Y for a horizontal "x" guide, X for a "y" one).
+        _AD_INT_SEEDS["x"] = [cy]
+        _AD_INT_SEEDS["y"] = [cx]
+        lines = [
+            ("x", XYZ(min_x, cy, elev), XYZ(max_x, cy, elev)),
+            ("y", XYZ(cx, min_y, elev), XYZ(cx, max_y, elev)),
+        ]
+
     created = 0
-    seeds = (
-        ("x", XYZ(min_x, cy, elev), XYZ(max_x, cy, elev)),
-        ("y", XYZ(cx, min_y, elev), XYZ(cx, max_y, elev)),
-    )
-    for axis, p0, p1 in seeds:
+    for axis, p0, p1 in lines:
         try:
             ln = Line.CreateBound(p0, p1)
             mc = doc.Create.NewDetailCurve(view, ln)
@@ -2909,16 +2970,18 @@ def place_all_guides(notify=True):
     _glog(u"exterior wall ids: {}".format(len(ext_wall_ids)))
     _diag_dump_model(all_elems, ext_wall_ids)
 
-    # Clear any leftover guides from a previous run, then seed fresh ones.
+    # Clear any leftover guides from a previous run, then place the exterior
+    # ones. Committed on its own so they are visible while the user clicks the
+    # interior positions -- and because PickPoint cannot run inside an open
+    # transaction.
     stale = _find_guide_lines() + _find_interior_guides()
     _glog(u"stale guides cleared: {}".format(len(stale)))
-    t = Transaction(doc, u"AutoDimension guides")
+    t = Transaction(doc, u"AutoDimension exterior guides")
     t.Start()
     try:
         if stale:
             _delete_guides(stale)
         n_ext = create_exterior_guides(all_elems, ext_wall_ids)
-        n_int = create_interior_guides(all_elems)
         t.Commit()
     except Exception as e:
         t.RollBack()
@@ -2926,6 +2989,26 @@ def place_all_guides(notify=True):
         forms.alert(u"Failed to create guide lines:\n{}".format(str(e)),
                     title=__title__)
         return None
+
+    # Now ask where the interior guides go (no transaction open here).
+    picked = None
+    if INTERACTIVE_INTERIOR_GUIDES:
+        try:
+            picked = pick_interior_guide_positions()
+        except Exception as e:
+            _glog(u"interior pick EXCEPTION: {} -- falling back to seeds".format(
+                str(e)))
+            picked = None
+
+    t = Transaction(doc, u"AutoDimension interior guides")
+    t.Start()
+    try:
+        n_int = create_interior_guides(all_elems, picked)
+        t.Commit()
+    except Exception as e:
+        t.RollBack()
+        _glog(u"interior guide EXCEPTION: {}".format(str(e)))
+        n_int = 0
     _glog(u"guides created: ext={} int={}".format(n_ext, n_int))
 
     if notify:
