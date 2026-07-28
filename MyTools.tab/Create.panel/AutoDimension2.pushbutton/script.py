@@ -48,6 +48,14 @@ from Autodesk.Revit.DB import (
     TextNote, TextNoteType, ElementTypeGroup,
     Color,
 )
+try:
+    # Unit API. Guarded on its own so a Revit version that renamed any of these
+    # cannot stop the whole script from loading -- FORCE_CM_UNITS just no-ops.
+    from Autodesk.Revit.DB import FormatOptions, UnitTypeId, SpecTypeId
+    _UNITS_API = True
+except Exception:
+    _UNITS_API = False
+
 from Autodesk.Revit.UI import ExternalEvent, IExternalEventHandler
 from Autodesk.Revit.UI.Selection import ObjectType
 from pyrevit import forms, script, revit
@@ -112,7 +120,16 @@ ANNOTATE_OPENING_HEIGHTS = True
 
 # How far inside the wall the UK=<sill> note sits, in mm. Raise it if the note
 # clashes with what is drawn just inside the opening.
-OPENING_NOTE_OFFSET_MM = 700
+OPENING_NOTE_OFFSET_MM = 400
+
+# Unit the UK= value is written in -- "cm" to match the drawing units, "mm" for
+# the old behaviour. The offset above stays in mm; it is a code distance, not a
+# number anybody reads off the sheet.
+OPENING_NOTE_UNITS = "cm"
+
+# Paper text height of the UK= note, in mm. History: 2.0 -> 1.4 (30% smaller)
+# -> 1.7 (20% bigger again, 1.68 rounded).
+OPENING_NOTE_TEXT_MM = 1.7
 
 # Click the interior guides into place instead of seeding two at the building
 # centre: left click drops one, right-click/Esc ends vertical placement and
@@ -124,6 +141,25 @@ INTERACTIVE_INTERIOR_GUIDES = True
 # old "is any wall further out?" overlap test, which dropped walls on steps,
 # recesses and U-shaped notches. Set to False to fall back to the old test.
 USE_FOOTPRINT_EXTERIOR_DETECTION = True
+
+# Put the project's Length units in centimetres and make the AUTODIM dimension
+# type follow the project units instead of carrying its own override, so the
+# drawing and its dimensions always read in the same unit. Set False to leave
+# whatever the model already has.
+FORCE_CM_UNITS = True
+
+# Rounding shown on a cm dimension: 0.1 keeps millimetre precision (352.5),
+# 1.0 rounds to whole centimetres (353).
+CM_ACCURACY = 0.1
+
+# Witness line appearance on the AUTODIM dimension type. "Fixed to Dimension
+# Line" makes every witness line the same length regardless of how far the
+# element sits from the string, so the tiers read as clean parallel bands.
+# WITNESS_LINE_LENGTH_MM is the part below the dimension line, EXTENSION the
+# part sticking out above it.
+WITNESS_LINE_FIXED_TO_DIM = True
+WITNESS_LINE_LENGTH_MM = 5
+WITNESS_LINE_EXTENSION_MM = 2
 
 # Interior chains intentionally KEEP each wall's two faces, so the string reads
 # room / wall thickness / room -- that thickness is wanted information here.
@@ -842,9 +878,20 @@ def _opening_sill_head_mm(elem):
         return None
 
 
+def _opening_note_text(s_mm):
+    """The UK= value, in the same unit as the drawing (see OPENING_NOTE_UNITS).
+    Trailing '.0' is dropped so a round value stays short."""
+    if OPENING_NOTE_UNITS == "cm":
+        v = s_mm / 10.0
+        if abs(v - round(v)) < 0.05:
+            return u"{}".format(int(round(v)))
+        return u"{:.1f}".format(v)
+    return u"{}".format(s_mm)
+
+
 def _opening_note_type_id():
-    """A small text type for opening-height notes (2 mm paper), duplicated from
-    the default once and reused. Falls back to the default type."""
+    """A small text type for opening-height notes, duplicated from the default
+    once and reused. Falls back to the default type."""
     default_id = None
     try:
         default_id = doc.GetDefaultElementTypeId(ElementTypeGroup.TextNoteType)
@@ -852,7 +899,9 @@ def _opening_note_type_id():
         default_id = None
     if default_id is None or default_id == ElementId.InvalidElementId:
         return None
-    name = u"AUTODIM_OPENING_2mm"
+    # The size is in the type name, so changing OPENING_NOTE_TEXT_MM makes a new
+    # type rather than silently leaving the old one at the old size.
+    name = u"AUTODIM_OPENING_{}mm".format(OPENING_NOTE_TEXT_MM)
     try:
         for t in FilteredElementCollector(doc).OfClass(TextNoteType):
             try:
@@ -864,7 +913,7 @@ def _opening_note_type_id():
         dup = base.Duplicate(name)
         p = dup.get_Parameter(BuiltInParameter.TEXT_SIZE)
         if p is not None and not p.IsReadOnly:
-            p.Set(mm_to_ft(2.0))
+            p.Set(mm_to_ft(OPENING_NOTE_TEXT_MM))
         return dup.Id
     except Exception:
         return default_id
@@ -876,6 +925,99 @@ AUTODIM_DIM_TYPE_NAME = u"AUTODIM"
 _AD_DIM_TYPE_ID = None
 
 
+def _ensure_cm_project_units():
+    """Switch the project's Length units to centimetres. Needs an open
+    transaction. Returns True when the units are cm afterwards."""
+    if not (FORCE_CM_UNITS and _UNITS_API):
+        return False
+    try:
+        units = doc.GetUnits()
+        fo = units.GetFormatOptions(SpecTypeId.Length)
+        if fo.GetUnitTypeId() == UnitTypeId.Centimeters:
+            _glog(u"project length units already cm")
+            return True
+        # SetUnitTypeId is rejected while the options still say "use default".
+        fo.UseDefault = False
+        fo.SetUnitTypeId(UnitTypeId.Centimeters)
+        try:
+            fo.Accuracy = CM_ACCURACY
+        except Exception:
+            pass
+        units.SetFormatOptions(SpecTypeId.Length, fo)
+        doc.SetUnits(units)
+        _glog(u"project length units set to cm (accuracy {})".format(
+            CM_ACCURACY))
+        return True
+    except Exception as e:
+        _glog(u"could not set project units to cm: {}".format(e))
+        return False
+
+
+def _use_project_units(dtype):
+    """Clear any unit override on the dimension type so it displays in the
+    project's Length units (cm, after _ensure_cm_project_units)."""
+    if not (FORCE_CM_UNITS and _UNITS_API) or dtype is None:
+        return
+    try:
+        fo = dtype.GetUnitsFormatOptions()
+        if fo is not None and fo.UseDefault:
+            return
+        fo = FormatOptions()
+        fo.UseDefault = True
+        dtype.SetUnitsFormatOptions(fo)
+        _glog(u"AUTODIM dimension type now follows project units")
+    except Exception as e:
+        _glog(u"could not reset dimension type units: {}".format(e))
+
+
+def _set_type_param(elem, bip_name, value):
+    """Set a parameter by BuiltInParameter name, tolerating an API version that
+    does not expose it. Returns True when the value was written."""
+    try:
+        bip = getattr(BuiltInParameter, bip_name, None)
+        if bip is None:
+            return False
+        p = elem.get_Parameter(bip)
+        if p is None or p.IsReadOnly:
+            return False
+        p.Set(value)
+        return True
+    except Exception:
+        return False
+
+
+def _apply_witness_line_settings(dtype):
+    """Force the AUTODIM type's witness lines to a fixed length below the string
+    plus a short extension above it, so all tiers read as parallel bands."""
+    if dtype is None:
+        return
+    _use_project_units(dtype)
+    if WITNESS_LINE_FIXED_TO_DIM:
+        # "Fixed to Dimension Line" is the second entry of the Witness Line
+        # Control dropdown, but the underlying int is not documented. Set it,
+        # read the label back, and keep whichever value Revit reports as fixed.
+        chosen = None
+        label = None
+        for candidate in (1, 0):
+            if not _set_type_param(dtype, "WITNESS_LINE_CONTROL", candidate):
+                continue
+            chosen = candidate
+            try:
+                label = dtype.get_Parameter(
+                    BuiltInParameter.WITNESS_LINE_CONTROL).AsValueString()
+            except Exception:
+                label = None
+            if label and u"fixed" in label.lower():
+                break
+        _glog(u"witness line control = {} ({})".format(chosen, label))
+    ok_len = _set_type_param(dtype, "WITNESS_LINE_LENGTH",
+                             mm_to_ft(WITNESS_LINE_LENGTH_MM))
+    ok_ext = _set_type_param(dtype, "WITNESS_LINE_EXTENSION",
+                             mm_to_ft(WITNESS_LINE_EXTENSION_MM))
+    _glog(u"witness line length {}mm set={} / extension {}mm set={}".format(
+        WITNESS_LINE_LENGTH_MM, ok_len, WITNESS_LINE_EXTENSION_MM, ok_ext))
+
+
 def _autodim_dim_type_id():
     """Id of the AUTODIM dimension type, duplicated once from the current default
     linear dimension type so its appearance matches. Falls back to None."""
@@ -883,6 +1025,7 @@ def _autodim_dim_type_id():
         for t in FilteredElementCollector(doc).OfClass(DimensionType):
             try:
                 if t.Name == AUTODIM_DIM_TYPE_NAME:
+                    _apply_witness_line_settings(t)
                     return t.Id
             except Exception:
                 continue
@@ -905,7 +1048,9 @@ def _autodim_dim_type_id():
     if base is None:
         return None
     try:
-        return base.Duplicate(AUTODIM_DIM_TYPE_NAME).Id
+        dup = base.Duplicate(AUTODIM_DIM_TYPE_NAME)
+        _apply_witness_line_settings(dup)
+        return dup.Id
     except Exception:
         return None
 
@@ -1023,7 +1168,7 @@ def annotate_opening_heights(all_elems, ext_wall_ids):
             s_mm, h_mm = sh
             if s_mm is None:
                 continue
-            txt = u"UK={}".format(s_mm)
+            txt = u"UK={}".format(_opening_note_text(s_mm))
             try:
                 TextNote.Create(doc, view.Id, pt, txt, type_id)
                 created += 1
@@ -3105,6 +3250,8 @@ def create_all_dimensions(notify=True):
     t.Start()
     try:
         global _AD_DIM_TYPE_ID
+        # Project units first: the dimension type is then told to follow them.
+        _ensure_cm_project_units()
         _AD_DIM_TYPE_ID = _autodim_dim_type_id()
         # Remove this tool's dimensions/notes from earlier runs so strings don't
         # stack (leaves the user's own and grid dimensions untouched).
