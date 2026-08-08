@@ -126,27 +126,6 @@ PROTRUDING_CATEGORIES = (
     BuiltInCategory.OST_StructuralFraming,
 )
 
-# Each balcony also gets its own two dimensions: LENGTH along the facade and
-# DEPTH out from it. Depth is measured from the exterior WALL FACE to the
-# balcony's outer edge -- i.e. the true protrusion -- so it still reads right
-# when the balcony slab is modelled as one piece with the interior floor and has
-# no inner face of its own.
-DIMENSION_BALCONIES = True
-
-# Only the slab is dimensioned. Railings sit on top of it and would just repeat
-# the same two numbers a few centimetres off; stairs and framing are not
-# balconies. This is deliberately narrower than PROTRUDING_CATEGORIES, which is
-# about keeping guides CLEAR of things and so casts a wider net.
-BALCONY_DIM_CATEGORIES = (
-    BuiltInCategory.OST_Floors,
-    BuiltInCategory.OST_GenericModel,
-)
-
-# How far the balcony's own two strings sit off it (mm). Purely an annotation
-# offset -- it must stay under OFFSET_1_MM so they land between the balcony and
-# tier 1 rather than colliding with it.
-BALCONY_DIM_OFFSET_MM = 500
-
 ZERO_TOL_MM = 5
 INTERSECT_TOL_MM = 50
 MAX_SNAP_DIST_MM = 10000
@@ -2240,55 +2219,6 @@ def _reset_protrusion_cache():
     _AD_PROTRUSION_CACHE = None
 
 
-def _overhang_records(env, categories):
-    """Every element of ``categories`` that hangs off a facade, one record per
-    facade it overhangs (a corner balcony yields two).
-
-    Record keys:
-      element   the Revit element
-      bb        its bounding box
-      run_axis  axis the facade runs along -- "x" for the min/max-Y facades
-      side      "min" or "max" on the perpendicular axis
-      outer     outermost coordinate on the perpendicular axis (feet)
-      span_lo   extent along run_axis (feet)
-      span_hi
-    """
-    recs = []
-    tol = mm_to_ft(ZERO_TOL_MM)
-    for cat in categories:
-        try:
-            elems = FilteredElementCollector(doc, view.Id) \
-                .OfCategory(cat).WhereElementIsNotElementType().ToElements()
-        except Exception:
-            continue
-        for e in elems:
-            try:
-                bb = e.get_BoundingBox(view) or e.get_BoundingBox(None)
-            except Exception:
-                bb = None
-            if bb is None or not _touches_envelope(bb, env):
-                continue
-            # ZERO_TOL_MM keeps a face flush with the wall from reading as an
-            # overhang; anything past it genuinely sticks out.
-            if bb.Min.Y < env["min_y"] - tol:
-                recs.append({"element": e, "bb": bb, "run_axis": "x",
-                             "side": "min", "outer": bb.Min.Y,
-                             "span_lo": bb.Min.X, "span_hi": bb.Max.X})
-            if bb.Max.Y > env["max_y"] + tol:
-                recs.append({"element": e, "bb": bb, "run_axis": "x",
-                             "side": "max", "outer": bb.Max.Y,
-                             "span_lo": bb.Min.X, "span_hi": bb.Max.X})
-            if bb.Min.X < env["min_x"] - tol:
-                recs.append({"element": e, "bb": bb, "run_axis": "y",
-                             "side": "min", "outer": bb.Min.X,
-                             "span_lo": bb.Min.Y, "span_hi": bb.Max.Y})
-            if bb.Max.X > env["max_x"] + tol:
-                recs.append({"element": e, "bb": bb, "run_axis": "y",
-                             "side": "max", "outer": bb.Max.X,
-                             "span_lo": bb.Min.Y, "span_hi": bb.Max.Y})
-    return recs
-
-
 def _protruding_envelope(exterior_elems):
     """The exterior wall envelope widened to cover whatever hangs off it.
 
@@ -2306,15 +2236,27 @@ def _protruding_envelope(exterior_elems):
         _AD_PROTRUSION_CACHE = out
         return out
 
-    recs = _overhang_records(env, PROTRUDING_CATEGORIES)
-    for r in recs:
-        if r["side"] == "min":
-            key = "min_y" if r["run_axis"] == "x" else "min_x"
-            out[key] = min(out[key], r["outer"])
-        else:
-            key = "max_y" if r["run_axis"] == "x" else "max_x"
-            out[key] = max(out[key], r["outer"])
-    hits = len(recs)
+    hits = 0
+    for cat in PROTRUDING_CATEGORIES:
+        try:
+            elems = FilteredElementCollector(doc, view.Id) \
+                .OfCategory(cat).WhereElementIsNotElementType().ToElements()
+        except Exception:
+            continue
+        for e in elems:
+            try:
+                bb = e.get_BoundingBox(view) or e.get_BoundingBox(None)
+            except Exception:
+                bb = None
+            if bb is None or not _touches_envelope(bb, env):
+                continue
+            if (bb.Min.X < out["min_x"] or bb.Max.X > out["max_x"]
+                    or bb.Min.Y < out["min_y"] or bb.Max.Y > out["max_y"]):
+                hits += 1
+            out["min_x"] = min(out["min_x"], bb.Min.X)
+            out["max_x"] = max(out["max_x"], bb.Max.X)
+            out["min_y"] = min(out["min_y"], bb.Min.Y)
+            out["max_y"] = max(out["max_y"], bb.Max.Y)
 
     _glog(u"protrusions: {} overhanging elems; walls "
           u"x[{},{}] y[{},{}] -> guides x[{},{}] y[{},{}] (mm)".format(
@@ -2551,251 +2493,6 @@ def dimension_along_guides(all_elems, ext_wall_ids, guides, dims_to_adjust):
         if dim:
             dims_to_adjust.append(dim)
             created += 1
-    return created
-
-
-def _iter_planar_faces(elem):
-    """Yield (face, solid-owning geometry) planar faces of an element in world
-    space, with References computed.
-
-    opt.View is omitted on purpose -- the same rule the wall/opening code
-    follows. Plan-cut geometry hands back faces whose Reference is null, which
-    makes them useless for dimensioning.
-    """
-    opt = Options()
-    opt.ComputeReferences = True
-    opt.IncludeNonVisibleObjects = False
-    try:
-        geo = elem.get_Geometry(opt)
-    except Exception:
-        geo = None
-    if not geo:
-        return
-    for item in geo:
-        try:
-            if isinstance(item, GeometryInstance):
-                inner = item.GetInstanceGeometry()
-                if not inner:
-                    continue
-                for sub in inner:
-                    if isinstance(sub, Solid) and sub.Faces.Size > 0:
-                        for f in sub.Faces:
-                            if isinstance(f, PlanarFace) and f.Reference is not None:
-                                yield f
-            elif isinstance(item, Solid) and item.Faces.Size > 0:
-                for f in item.Faces:
-                    if isinstance(f, PlanarFace) and f.Reference is not None:
-                        yield f
-        except Exception:
-            continue
-
-
-def _face_normal_axis(face):
-    """"x", "y" or None -- the axis a planar face is perpendicular to."""
-    try:
-        n = face.FaceNormal
-    except Exception:
-        return None
-    if abs(n.Z) > 0.9:
-        return None
-    if abs(n.X) > 0.9:
-        return "x"
-    if abs(n.Y) > 0.9:
-        return "y"
-    return None
-
-
-def _face_extent(face, axis):
-    """(lo, hi) of a face along one axis, from its edge loops.
-
-    PlanarFace.GetBoundingBox is in UV, so the extent has to come from the
-    edges. Used to tell which side faces belong to the part of a slab that
-    actually sticks out past the wall.
-    """
-    lo = hi = None
-    try:
-        loops = face.GetEdgesAsCurveLoops()
-    except Exception:
-        return None, None
-    for loop in loops:
-        for crv in loop:
-            try:
-                pts = list(crv.Tessellate())
-            except Exception:
-                try:
-                    pts = [crv.GetEndPoint(0), crv.GetEndPoint(1)]
-                except Exception:
-                    continue
-            for p in pts:
-                c = p.X if axis == "x" else p.Y
-                if lo is None or c < lo:
-                    lo = c
-                if hi is None or c > hi:
-                    hi = c
-    return lo, hi
-
-
-def _face_coord(face, axis):
-    try:
-        o = face.Origin
-    except Exception:
-        return None
-    return o.X if axis == "x" else o.Y
-
-
-def _balcony_outer_face(elem, depth_axis, side):
-    """(ref, coord) of the balcony's outermost face on the protruding side."""
-    best_ref = None
-    best_c = None
-    for f in _iter_planar_faces(elem):
-        if _face_normal_axis(f) != depth_axis:
-            continue
-        c = _face_coord(f, depth_axis)
-        if c is None:
-            continue
-        if best_c is None \
-                or (side == "min" and c < best_c) \
-                or (side == "max" and c > best_c):
-            best_c = c
-            best_ref = f.Reference
-    return best_ref, best_c
-
-
-def _balcony_end_faces(elem, run_axis, depth_axis, side, env):
-    """The two cheek faces of the part that sticks out, as (ref, coord) pairs.
-
-    Filtering by "does this face lie beyond the wall envelope" is what makes a
-    balcony modelled as one piece with the interior floor still measure its own
-    length: the floor's far-side cheeks sit inside the envelope and drop out,
-    leaving only the ones bounding the overhang.
-    """
-    tol = mm_to_ft(ZERO_TOL_MM)
-    picks = []
-    for f in _iter_planar_faces(elem):
-        if _face_normal_axis(f) != run_axis:
-            continue
-        d_lo, d_hi = _face_extent(f, depth_axis)
-        if d_lo is None:
-            continue
-        if side == "min":
-            if d_lo > env["min_y" if run_axis == "x" else "min_x"] - tol:
-                continue
-        else:
-            if d_hi < env["max_y" if run_axis == "x" else "max_x"] + tol:
-                continue
-        c = _face_coord(f, run_axis)
-        if c is None:
-            continue
-        picks.append((f.Reference, c))
-    if len(picks) < 2:
-        return None, None
-    picks.sort(key=lambda it: it[1])
-    return picks[0], picks[-1]
-
-
-def _wall_face_behind(all_elems, ext_wall_ids, rec, depth_axis):
-    """(ref, coord) of the exterior face of the wall the balcony hangs from.
-
-    The wall is chosen by overlap with the balcony's span along the facade, and
-    among those the one whose exterior face sits furthest out -- that is the
-    facade plane the balcony actually projects from.
-    """
-    side = rec["side"]
-    best = None
-    for ei in all_elems:
-        if ei["element"].Id.IntegerValue not in ext_wall_ids:
-            continue
-        if rec["run_axis"] == "x":
-            w_lo, w_hi = ei["min_x"], ei["max_x"]
-        else:
-            w_lo, w_hi = ei["min_y"], ei["max_y"]
-        if w_hi <= rec["span_lo"] or w_lo >= rec["span_hi"]:
-            continue  # no overlap along the facade
-        lo_ref, hi_ref, lo_c, hi_c = get_faces(ei["element"], depth_axis)
-        if lo_ref is None:
-            continue
-        ref, coord = (lo_ref, lo_c) if side == "min" else (hi_ref, hi_c)
-        if best is None \
-                or (side == "min" and coord < best[1]) \
-                or (side == "max" and coord > best[1]):
-            best = (ref, coord)
-    if best is None:
-        return None, None
-    return best[0], best[1]
-
-
-def dimension_balconies(all_elems, ext_wall_ids, dims_to_adjust):
-    """One LENGTH and one DEPTH dimension per balcony, on every facade."""
-    if not DIMENSION_BALCONIES:
-        return 0
-    exterior_elems = [
-        ei for ei in all_elems
-        if ei["element"].Id.IntegerValue in ext_wall_ids
-    ]
-    if not exterior_elems:
-        return 0
-    env = _wall_envelope(exterior_elems)
-    recs = _overhang_records(env, BALCONY_DIM_CATEGORIES)
-    if not recs:
-        _glog(u"balconies: none found")
-        return 0
-
-    off = mm_to_ft(BALCONY_DIM_OFFSET_MM)
-    created = 0
-    for rec in recs:
-        run_axis = rec["run_axis"]
-        depth_axis = "y" if run_axis == "x" else "x"
-        side = rec["side"]
-        sign = -1.0 if side == "min" else 1.0
-        eid = rec["element"].Id.IntegerValue
-
-        outer_ref, outer_c = _balcony_outer_face(
-            rec["element"], depth_axis, side)
-        lo_pick, hi_pick = _balcony_end_faces(
-            rec["element"], run_axis, depth_axis, side, env)
-
-        # --- LENGTH: along the facade, just outside the balcony's outer edge ---
-        if lo_pick and hi_pick:
-            perp = (outer_c if outer_c is not None else rec["outer"]) + sign * off
-            if run_axis == "x":
-                p0 = XYZ(lo_pick[1], perp, 0)
-                p1 = XYZ(hi_pick[1], perp, 0)
-            else:
-                p0 = XYZ(perp, lo_pick[1], 0)
-                p1 = XYZ(perp, hi_pick[1], 0)
-            d = make_dim([lo_pick[0], hi_pick[0]], p0, p1,
-                         "balcony-length-{}".format(eid))
-            if d:
-                dims_to_adjust.append(d)
-                created += 1
-        else:
-            _glog(u"balcony {}: no end faces on {} side, length skipped".format(
-                eid, side))
-
-        # --- DEPTH: wall exterior face -> balcony outer edge, beside the balcony ---
-        wall_ref, wall_c = _wall_face_behind(
-            all_elems, ext_wall_ids, rec, depth_axis)
-        if outer_ref is not None and wall_ref is not None:
-            # Sit it just past the balcony's near end so it does not cross the
-            # slab; which end does not matter, so use the lower one.
-            along = rec["span_lo"] - off
-            if run_axis == "x":
-                p0 = XYZ(along, wall_c, 0)
-                p1 = XYZ(along, outer_c, 0)
-            else:
-                p0 = XYZ(wall_c, along, 0)
-                p1 = XYZ(outer_c, along, 0)
-            d = make_dim([wall_ref, outer_ref], p0, p1,
-                         "balcony-depth-{}".format(eid))
-            if d:
-                dims_to_adjust.append(d)
-                created += 1
-        else:
-            _glog(u"balcony {}: outer_ref={} wall_ref={}, depth skipped".format(
-                eid, outer_ref is not None, wall_ref is not None))
-
-    _glog(u"balconies: {} overhangs -> {} dimensions".format(
-        len(recs), created))
     return created
 
 
@@ -3708,13 +3405,11 @@ def create_all_dimensions(notify=True):
         dims = []
         n_ext = 0
         n_int = 0
-        n_bal = 0
         if ext_guides:
             n_ext = dimension_along_guides(
                 all_elems, ext_wall_ids, ext_guides, dims)
         if int_guides:
             n_int = dimension_along_interior_guides(all_elems, int_guides, dims)
-        n_bal = dimension_balconies(all_elems, ext_wall_ids, dims)
         if ANNOTATE_OPENING_HEIGHTS:
             annotate_opening_heights(all_elems, ext_wall_ids)
         _delete_guides(ext_guides + int_guides)
@@ -3732,8 +3427,8 @@ def create_all_dimensions(notify=True):
 
     if notify:
         forms.alert(
-            u"Created {} exterior + {} interior dimensions, "
-            u"{} balcony dimensions.".format(n_ext, n_int, n_bal),
+            u"Created {} exterior + {} interior dimensions.".format(
+                n_ext, n_int),
             title=__title__)
 
 
