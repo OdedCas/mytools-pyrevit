@@ -104,6 +104,28 @@ OFFSET_3_MM = 3000   # Tier 3: overall side-to-side chain
 OFFSET_CHAIN_1_MM = 1500
 OFFSET_CHAIN_GAP_MM = 700
 
+# Balconies, canopies, external stairs and the like hang OFF the facade, so a
+# guide measured from the exterior wall envelope alone lands on top of them and
+# the dimension string reads through the balcony. When this is on, the guide
+# base for each side is pushed out to whatever protrudes furthest there, and the
+# three tier offsets are then measured from that -- so the tiers keep their
+# spacing and simply start outside the obstruction. No fixed clearance distance
+# is involved: the model's own geometry sets the base.
+AVOID_PROTRUDING_ELEMENTS = True
+
+# Categories scanned for those overhangs. Roofs are deliberately absent: a roof
+# overhang is usually not what a floor plan dimensions against, and including it
+# pushes every string out by the eave. Add BuiltInCategory.OST_Roofs here if the
+# office wants roofs cleared too.
+PROTRUDING_CATEGORIES = (
+    BuiltInCategory.OST_Floors,
+    BuiltInCategory.OST_StairsRailing,
+    BuiltInCategory.OST_Stairs,
+    BuiltInCategory.OST_Ramps,
+    BuiltInCategory.OST_GenericModel,
+    BuiltInCategory.OST_StructuralFraming,
+)
+
 ZERO_TOL_MM = 5
 INTERSECT_TOL_MM = 50
 MAX_SNAP_DIST_MM = 10000
@@ -158,8 +180,12 @@ CM_ACCURACY = 0.1
 # WITNESS_LINE_LENGTH_MM is the part below the dimension line, EXTENSION the
 # part sticking out above it.
 WITNESS_LINE_FIXED_TO_DIM = True
-WITNESS_LINE_LENGTH_MM = 5
+WITNESS_LINE_LENGTH_MM = 10
 WITNESS_LINE_EXTENSION_MM = 2
+# Witness Line Control enum values. Revit does not document these; 1 is
+# "Fixed to Dimension Line" and 0 is "Gap to Element" on every build tested.
+WITNESS_LINE_FIXED_VALUE = 1
+WITNESS_LINE_GAP_VALUE = 0
 
 # Interior chains intentionally KEEP each wall's two faces, so the string reads
 # room / wall thickness / room -- that thickness is wanted information here.
@@ -996,9 +1022,17 @@ def _apply_witness_line_settings(dtype):
         # "Fixed to Dimension Line" is the second entry of the Witness Line
         # Control dropdown, but the underlying int is not documented. Set it,
         # read the label back, and keep whichever value Revit reports as fixed.
+        #
+        # The label test only works on an English Revit. On a localized one
+        # ("קבוע לקו המידה") no candidate reads as fixed, and probing must NOT
+        # be allowed to leave the type on the last value tried -- that is
+        # WITNESS_LINE_GAP_TO_ELEMENT, the exact opposite of what was asked for.
+        # So: probe, and if nothing self-identified, settle on the documented
+        # fixed value rather than on wherever the loop happened to stop.
         chosen = None
         label = None
-        for candidate in (1, 0):
+        confirmed = False
+        for candidate in (WITNESS_LINE_FIXED_VALUE, WITNESS_LINE_GAP_VALUE):
             if not _set_type_param(dtype, "WITNESS_LINE_CONTROL", candidate):
                 continue
             chosen = candidate
@@ -1008,8 +1042,19 @@ def _apply_witness_line_settings(dtype):
             except Exception:
                 label = None
             if label and u"fixed" in label.lower():
+                confirmed = True
                 break
-        _glog(u"witness line control = {} ({})".format(chosen, label))
+        if not confirmed:
+            if _set_type_param(dtype, "WITNESS_LINE_CONTROL",
+                               WITNESS_LINE_FIXED_VALUE):
+                chosen = WITNESS_LINE_FIXED_VALUE
+            try:
+                label = dtype.get_Parameter(
+                    BuiltInParameter.WITNESS_LINE_CONTROL).AsValueString()
+            except Exception:
+                label = None
+        _glog(u"witness line control = {} ({}) confirmed={}".format(
+            chosen, label, confirmed))
     ok_len = _set_type_param(dtype, "WITNESS_LINE_LENGTH",
                              mm_to_ft(WITNESS_LINE_LENGTH_MM))
     ok_ext = _set_type_param(dtype, "WITNESS_LINE_EXTENSION",
@@ -2138,6 +2183,96 @@ def _drop_thickness_refs(pairs, min_ft):
     return kept
 
 
+def _wall_envelope(exterior_elems):
+    """Bounding box of the exterior walls only, in feet."""
+    return {
+        "min_x": min(ei["min_x"] for ei in exterior_elems),
+        "max_x": max(ei["max_x"] for ei in exterior_elems),
+        "min_y": min(ei["min_y"] for ei in exterior_elems),
+        "max_y": max(ei["max_y"] for ei in exterior_elems),
+    }
+
+
+def _touches_envelope(bb, env):
+    """True when a bounding box overlaps the exterior wall envelope.
+
+    This is the whole filter for "is it attached to the building". A balcony
+    slab or a canopy always overlaps the facade it hangs from; a detached site
+    slab, a neighbouring block or a linked context model does not -- so neither
+    can drag the guides halfway across the sheet. Nothing here is a distance
+    threshold, which is why it holds on any plan.
+    """
+    if bb.Max.X < env["min_x"] or bb.Min.X > env["max_x"]:
+        return False
+    if bb.Max.Y < env["min_y"] or bb.Min.Y > env["max_y"]:
+        return False
+    return True
+
+
+# Cached per run so the four sides do not re-collect the same elements. Reset
+# alongside the hosted-openings cache at the start of each command.
+_AD_PROTRUSION_CACHE = None
+
+
+def _reset_protrusion_cache():
+    global _AD_PROTRUSION_CACHE
+    _AD_PROTRUSION_CACHE = None
+
+
+def _protruding_envelope(exterior_elems):
+    """The exterior wall envelope widened to cover whatever hangs off it.
+
+    Returns the same four keys as ``_wall_envelope``. With
+    ``AVOID_PROTRUDING_ELEMENTS`` off, or when nothing overhangs, the values are
+    the wall envelope unchanged -- so guides land exactly where they always did.
+    """
+    global _AD_PROTRUSION_CACHE
+    if _AD_PROTRUSION_CACHE is not None:
+        return _AD_PROTRUSION_CACHE
+
+    env = _wall_envelope(exterior_elems)
+    out = dict(env)
+    if not AVOID_PROTRUDING_ELEMENTS:
+        _AD_PROTRUSION_CACHE = out
+        return out
+
+    hits = 0
+    for cat in PROTRUDING_CATEGORIES:
+        try:
+            elems = FilteredElementCollector(doc, view.Id) \
+                .OfCategory(cat).WhereElementIsNotElementType().ToElements()
+        except Exception:
+            continue
+        for e in elems:
+            try:
+                bb = e.get_BoundingBox(view) or e.get_BoundingBox(None)
+            except Exception:
+                bb = None
+            if bb is None or not _touches_envelope(bb, env):
+                continue
+            if (bb.Min.X < out["min_x"] or bb.Max.X > out["max_x"]
+                    or bb.Min.Y < out["min_y"] or bb.Max.Y > out["max_y"]):
+                hits += 1
+            out["min_x"] = min(out["min_x"], bb.Min.X)
+            out["max_x"] = max(out["max_x"], bb.Max.X)
+            out["min_y"] = min(out["min_y"], bb.Min.Y)
+            out["max_y"] = max(out["max_y"], bb.Max.Y)
+
+    _glog(u"protrusions: {} overhanging elems; walls "
+          u"x[{},{}] y[{},{}] -> guides x[{},{}] y[{},{}] (mm)".format(
+              hits,
+              int(round(ft_to_mm(env["min_x"]))),
+              int(round(ft_to_mm(env["max_x"]))),
+              int(round(ft_to_mm(env["min_y"]))),
+              int(round(ft_to_mm(env["max_y"]))),
+              int(round(ft_to_mm(out["min_x"]))),
+              int(round(ft_to_mm(out["max_x"]))),
+              int(round(ft_to_mm(out["min_y"]))),
+              int(round(ft_to_mm(out["max_y"])))))
+    _AD_PROTRUSION_CACHE = out
+    return out
+
+
 def _exterior_tier_geometry(all_elems, ext_wall_ids, axis):
     """Shared geometry for both guide creation and dimensioning along one axis.
 
@@ -2166,6 +2301,13 @@ def _exterior_tier_geometry(all_elems, ext_wall_ids, axis):
     )
     perp_mid = (perp_min + perp_max) / 2.0
 
+    # Where the guide LINES go. perp_min/perp_max stay wall-based above, because
+    # they decide which facade a wall belongs to (perp_mid) and must not move
+    # when a balcony appears. Only the line position is pushed outward.
+    prot = _protruding_envelope(exterior_elems)
+    guide_min = prot["min_y"] if axis == "x" else prot["min_x"]
+    guide_max = prot["max_y"] if axis == "x" else prot["max_x"]
+
     # Wall-thickness tolerance, derived from the actual exterior walls (no
     # hardcoded distance). Any exterior chain segment at or below this length is
     # a wall-thickness sliver and is dropped, so we never dimension a thickness.
@@ -2186,6 +2328,8 @@ def _exterior_tier_geometry(all_elems, ext_wall_ids, axis):
         "c_max": tier2[-1][1],
         "perp_min": perp_min,
         "perp_max": perp_max,
+        "guide_min": guide_min,
+        "guide_max": guide_max,
         "thick_tol": thick_tol,
         "tier1_min": _pairs(True, "min"),
         "tier1_max": _pairs(True, "max"),
@@ -2237,9 +2381,9 @@ def create_exterior_guides(all_elems, ext_wall_ids):
         for side in ("min", "max"):
             for tier, off_mm in GUIDE_TIER_OFFSETS:
                 if side == "min":
-                    perp = geo["perp_min"] - mm_to_ft(off_mm)
+                    perp = geo["guide_min"] - mm_to_ft(off_mm)
                 else:
-                    perp = geo["perp_max"] + mm_to_ft(off_mm)
+                    perp = geo["guide_max"] + mm_to_ft(off_mm)
                 _create_guide_line(
                     sp, axis, tier, side, geo["c_min"], geo["c_max"], perp, elev)
                 created += 1
@@ -3161,6 +3305,7 @@ def place_all_guides(notify=True):
     _glog_reset()
     _glog(u"=== place_all_guides ===")
     _reset_hosted_openings_cache()
+    _reset_protrusion_cache()
     all_elems = collect_walls_in_view()
     _glog(u"walls in view: {}".format(len(all_elems)))
     if not all_elems:
@@ -3233,6 +3378,7 @@ def create_all_dimensions(notify=True):
         return
 
     _reset_hosted_openings_cache()
+    _reset_protrusion_cache()
     all_elems = collect_walls_in_view()
     ext_guides = _find_guide_lines()
     int_guides = _find_interior_guides()
@@ -3313,11 +3459,31 @@ def _cleanup_guides_only():
 _AD_WINDOW = None
 _AD_REQUEST = None          # None | "create" | "cancel"
 _AD_IDLING_HOOKED = False
+_AD_IDLING_DELEGATE = None  # the ONE delegate object used for both += and -=
 
 
 def _ad_uiapp():
     from pyrevit import HOST_APP
     return HOST_APP.uiapp
+
+
+def _ad_idling_delegate():
+    """The single .NET delegate wrapping _on_idling.
+
+    IronPython builds a NEW delegate every time a Python function is handed to
+    a .NET event, so `Idling -= _on_idling` would not match what `+=` added and
+    would silently remove nothing -- while the caller believes it unsubscribed
+    and subscribes again, stacking handlers that all run the request. (pyRevit's
+    own revit/events.py has the same shape: remove_handler wants back the exact
+    object add_handler returned.) Building it once and reusing it is what makes
+    unsubscribing actually work.
+    """
+    global _AD_IDLING_DELEGATE
+    if _AD_IDLING_DELEGATE is None:
+        from pyrevit import framework
+        from Autodesk.Revit.UI.Events import IdlingEventArgs
+        _AD_IDLING_DELEGATE = framework.EventHandler[IdlingEventArgs](_on_idling)
+    return _AD_IDLING_DELEGATE
 
 
 def _on_idling(sender, args):
@@ -3348,12 +3514,32 @@ def _on_idling(sender, args):
 
 
 def _hook_idling():
-    """Subscribe to Idling once for the engine lifetime."""
+    """Subscribe to Idling for this run of the window."""
     global _AD_IDLING_HOOKED
     if _AD_IDLING_HOOKED:
         return
-    _ad_uiapp().Idling += _on_idling
+    _ad_uiapp().Idling += _ad_idling_delegate()
     _AD_IDLING_HOOKED = True
+
+
+def _unhook_idling():
+    """Unsubscribe from Idling so Revit can settle again.
+
+    A live Idling subscription keeps Revit's message loop spinning and the
+    screen flickering (הבהוב); with __persistentengine__ it used to outlive the
+    window, so the flicker only stopped on a pyRevit reload. Called from the
+    window's Closed event -- i.e. on the WPF dispatcher, NOT from inside
+    _on_idling: mutating the subscription while Revit is dispatching that very
+    event is what crashed Revit on Create Dimensions once already.
+    """
+    global _AD_IDLING_HOOKED
+    if not _AD_IDLING_HOOKED:
+        return
+    _AD_IDLING_HOOKED = False  # clear first: never leave it stuck armed
+    try:
+        _ad_uiapp().Idling -= _ad_idling_delegate()
+    except Exception:
+        pass
 
 
 class AutoDimWindow(forms.WPFWindow):
@@ -3362,6 +3548,27 @@ class AutoDimWindow(forms.WPFWindow):
 
     def __init__(self, xaml_path):
         forms.WPFWindow.__init__(self, xaml_path)
+        self.Closed += self.on_closed
+
+    def on_closed(self, sender, args):
+        """The run is over -- let Revit settle so the screen stops flickering.
+
+        The unhook is QUEUED on the WPF dispatcher rather than done here: when
+        the dimensions finish, _on_idling calls Close(), so this handler runs
+        inside Revit's dispatch of Idling, and unsubscribing there crashes
+        Revit. BeginInvoke runs it once that stack has unwound. Closing with the
+        X arrives on the dispatcher anyway, so both paths behave the same.
+        """
+        global _AD_WINDOW, _AD_REQUEST
+        _AD_REQUEST = None
+        _AD_WINDOW = None
+        try:
+            from System import Action
+            self.Dispatcher.BeginInvoke(Action(_unhook_idling))
+        except Exception:
+            # Worst case the subscription stays and the flicker persists --
+            # never let this take the window (or Revit) down with it.
+            pass
 
     def _request(self, action, busy_text):
         global _AD_REQUEST
