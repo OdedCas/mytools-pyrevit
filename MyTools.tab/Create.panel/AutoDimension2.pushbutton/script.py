@@ -202,6 +202,18 @@ DIM_INTERIOR_OPENINGS = True
 # openings to join the chain. ~50 cm covers a guide drawn just inside a room.
 INTERIOR_OPENING_NEAR_MM = 500
 
+# Ask which dimension style to use at the start of every run. The type this
+# tool actually places is duplicated from the style you pick and named
+# "AUTODIM - <style>", so several styles can coexist in one model and the
+# tool can still recognise (and clean up) its own dimensions by name.
+# Set False to always use Revit's default linear dimension type.
+PICK_DIM_STYLE = True
+
+# Force this tool's witness-line and unit settings onto the style you picked.
+# Off by default: if you went to the trouble of choosing a style, its own
+# appearance wins. The fallback default style is always tuned regardless.
+OVERRIDE_PICKED_STYLE_APPEARANCE = False
+
 # Perp positions where the interior guides were auto-seeded (building center).
 # A guide left untouched at its seed position is a template, not a request, so it
 # is skipped when dimensioning. Drag-copying a seed leaves the original here and
@@ -1085,6 +1097,11 @@ def _opening_note_type_id():
 AUTODIM_DIM_TYPE_NAME = u"AUTODIM"
 _AD_DIM_TYPE_ID = None
 
+# Dimension style the user picked this session, kept across the modeless window
+# by the persistent engine. None -> fall back to Revit's default linear type.
+_AD_BASE_TYPE_ID = None
+_AD_BASE_TYPE_NAME = None
+
 
 def _ensure_cm_project_units():
     """Switch the project's Length units to centimetres. Needs an open
@@ -1198,26 +1215,131 @@ def _apply_witness_line_settings(dtype):
         WITNESS_LINE_LENGTH_MM, ok_len, WITNESS_LINE_EXTENSION_MM, ok_ext))
 
 
+def _autodim_type_name(base_name):
+    """Name of the type this tool places. Derived from the picked style so two
+    styles can live in one model, and still prefixed AUTODIM so
+    _delete_previous_autodim's startswith test keeps finding all of them."""
+    if not base_name:
+        return AUTODIM_DIM_TYPE_NAME
+    return u"{} - {}".format(AUTODIM_DIM_TYPE_NAME, base_name)
+
+
+def _linear_dim_types():
+    """(name, DimensionType) for every linear dimension style in the model,
+    sorted by name. This tool's own AUTODIM types are left out -- picking one
+    would duplicate a duplicate."""
+    found = []
+    try:
+        types = list(FilteredElementCollector(doc).OfClass(DimensionType))
+    except Exception:
+        return found
+    for t in types:
+        try:
+            name = t.Name
+        except Exception:
+            continue
+        if not name or name.startswith(AUTODIM_DIM_TYPE_NAME):
+            continue
+        # Keep linear styles only where the API exposes the family. Angular,
+        # radial and arc-length styles cannot dimension a wall face.
+        try:
+            style = t.StyleType
+            if style is not None and unicode(style) != u"Linear":
+                continue
+        except Exception:
+            pass
+        found.append((name, t))
+    found.sort(key=lambda item: item[0].lower())
+    return found
+
+
+def pick_dim_style():
+    """Ask which dimension style to build the dimensions from. Remembers the
+    last pick as the default. Must run OUTSIDE a transaction.
+
+    Returns True when a style is set (or the picker is switched off), False when
+    the user cancelled -- in which case the run should stop."""
+    global _AD_BASE_TYPE_ID, _AD_BASE_TYPE_NAME
+    if not PICK_DIM_STYLE:
+        return True
+    styles = _linear_dim_types()
+    if not styles:
+        # Nothing to choose from: fall through to the default type.
+        _glog(u"no dimension styles found, using the default type")
+        return True
+    names = [name for name, unused_t in styles]
+    # SelectFromList has no "preselect" option, so the last pick is floated to
+    # the top of the list instead -- it is right under the cursor next run.
+    if _AD_BASE_TYPE_NAME in names:
+        names.remove(_AD_BASE_TYPE_NAME)
+        names.insert(0, _AD_BASE_TYPE_NAME)
+    try:
+        chosen = forms.SelectFromList.show(
+            names,
+            title=u"AutoDimension 2 - dimension style",
+            button_name=u"Use this style",
+            multiselect=False)
+    except Exception as e:
+        _glog(u"style picker failed ({}), using the default type".format(e))
+        return True
+    if not chosen:
+        _glog(u"style pick cancelled")
+        return False
+    for name, t in styles:
+        if name == chosen:
+            _AD_BASE_TYPE_ID = t.Id
+            _AD_BASE_TYPE_NAME = name
+            _glog(u"dimension style picked: {}".format(name))
+            return True
+    return False
+
+
 def _autodim_dim_type_id():
-    """Id of the AUTODIM dimension type, duplicated once from the current default
-    linear dimension type so its appearance matches. Falls back to None."""
+    """Id of the type this tool places: a duplicate of the picked style (or of
+    the default linear type when nothing was picked), so its appearance matches.
+    Falls back to None.
+
+    A picked style is copied AS IS -- the witness-line and unit overrides are
+    only forced on when OVERRIDE_PICKED_STYLE_APPEARANCE is set, since the point
+    of choosing a style is to get that style's look.
+    """
+    base = None
+    if _AD_BASE_TYPE_ID is not None:
+        try:
+            base = doc.GetElement(_AD_BASE_TYPE_ID)
+        except Exception:
+            base = None
+    picked = base is not None
+    base_name = None
+    if picked:
+        try:
+            base_name = base.Name
+        except Exception:
+            base_name = None
+    want = _autodim_type_name(base_name)
+    tune = (not picked) or OVERRIDE_PICKED_STYLE_APPEARANCE
+
+    # Reuse the derived type from an earlier run if it is still there.
     try:
         for t in FilteredElementCollector(doc).OfClass(DimensionType):
             try:
-                if t.Name == AUTODIM_DIM_TYPE_NAME:
-                    _apply_witness_line_settings(t)
+                if t.Name == want:
+                    if tune:
+                        _apply_witness_line_settings(t)
                     return t.Id
             except Exception:
                 continue
     except Exception:
         pass
-    base = None
-    try:
-        bid = doc.GetDefaultElementTypeId(ElementTypeGroup.LinearDimensionType)
-        if bid and bid != ElementId.InvalidElementId:
-            base = doc.GetElement(bid)
-    except Exception:
-        base = None
+
+    if base is None:
+        try:
+            bid = doc.GetDefaultElementTypeId(
+                ElementTypeGroup.LinearDimensionType)
+            if bid and bid != ElementId.InvalidElementId:
+                base = doc.GetElement(bid)
+        except Exception:
+            base = None
     if base is None:
         try:
             for t in FilteredElementCollector(doc).OfClass(DimensionType):
@@ -1228,10 +1350,13 @@ def _autodim_dim_type_id():
     if base is None:
         return None
     try:
-        dup = base.Duplicate(AUTODIM_DIM_TYPE_NAME)
-        _apply_witness_line_settings(dup)
+        dup = base.Duplicate(want)
+        if tune:
+            _apply_witness_line_settings(dup)
+        _glog(u"dimension type '{}' created (tuned={})".format(want, tune))
         return dup.Id
-    except Exception:
+    except Exception as e:
+        _glog(u"could not create dimension type '{}': {}".format(want, e))
         return None
 
 
@@ -3782,6 +3907,12 @@ def _open_modeless_window():
         xaml_path = os.path.join(os.path.dirname(__file__), u"AutoDimWindow.xaml")
         win = AutoDimWindow(xaml_path)
         _AD_WINDOW = win
+        if _AD_BASE_TYPE_NAME:
+            try:
+                win.status.Text = u"{}\n\nStyle: {}".format(
+                    win.status.Text, _AD_BASE_TYPE_NAME)
+            except Exception:
+                pass
         win.show()
         return True
     except Exception as ex:
@@ -3816,6 +3947,11 @@ def main():
                 pass
             return
         _AD_WINDOW = None
+
+    # Ask for the dimension style first: it needs a plain command context with
+    # no transaction open, and cancelling here should cost the user nothing.
+    if not pick_dim_style():
+        return
 
     placed = place_all_guides(notify=False)
     if placed is None:
