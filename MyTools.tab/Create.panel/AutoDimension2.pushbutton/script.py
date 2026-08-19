@@ -192,6 +192,16 @@ WITNESS_LINE_GAP_VALUE = 0
 # (The exterior tiers still drop thickness slivers; that is a separate filter.)
 FILTER_INTERIOR_THICKNESS = False
 
+# An interior guide also measures the openings sitting close to it. Only walls
+# running PARALLEL to the guide qualify: their openings' jambs are spread along
+# the axis the chain measures, so they slot straight into the string (a wall the
+# guide crosses has its jambs along the other axis and is left alone).
+# Doors and plain wall openings are measured; WINDOWS ARE NEVER MEASURED here.
+DIM_INTERIOR_OPENINGS = True
+# How close the wall face may sit to the guide line, in model mm, for its
+# openings to join the chain. ~50 cm covers a guide drawn just inside a room.
+INTERIOR_OPENING_NEAR_MM = 500
+
 # Perp positions where the interior guides were auto-seeded (building center).
 # A guide left untouched at its seed position is a template, not a request, so it
 # is skipped when dimensioning. Drag-copying a seed leaves the original here and
@@ -771,16 +781,141 @@ def _hosted_openings_map():
     return result
 
 
-def _collect_opening_face_refs(wall, run_axis):
+def _category_id(elem):
+    """BuiltInCategory integer of an element, or None."""
+    try:
+        return elem.Category.Id.IntegerValue
+    except Exception:
+        return None
+
+
+def _is_door_like(elem):
+    """True for a door or a plain wall opening, False for a window.
+
+    The interior chain measures these but deliberately skips windows: a window
+    is a facade item and already has its own exterior tier.
+    """
+    cid = _category_id(elem)
+    if cid is None:
+        return False
+    # ElementId(BuiltInCategory) rather than int(): casting the enum directly is
+    # not reliable across IronPython / Revit builds.
+    for bic in (BuiltInCategory.OST_Doors,
+                BuiltInCategory.OST_SWallRectOpening):
+        try:
+            if cid == ElementId(bic).IntegerValue:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+_WALL_OPENINGS_CACHE = None
+
+
+def _reset_wall_openings_cache():
+    global _WALL_OPENINGS_CACHE
+    _WALL_OPENINGS_CACHE = None
+
+
+def _wall_openings_map():
+    """Wall element id -> list of plain rectangular wall openings (no family).
+
+    Kept apart from _hosted_openings_map so the exterior tiers keep measuring
+    exactly what they measured before; only the interior chain reads this.
+    """
+    global _WALL_OPENINGS_CACHE
+    if _WALL_OPENINGS_CACHE is not None:
+        return _WALL_OPENINGS_CACHE
+    result = {}
+    try:
+        elems = FilteredElementCollector(doc, view.Id) \
+            .OfCategory(BuiltInCategory.OST_SWallRectOpening) \
+            .WhereElementIsNotElementType().ToElements()
+    except Exception:
+        elems = []
+    for elem in elems:
+        try:
+            host = elem.Host
+        except Exception:
+            host = None
+        if host is None:
+            continue
+        result.setdefault(host.Id.IntegerValue, []).append(elem)
+    _WALL_OPENINGS_CACHE = result
+    return result
+
+
+def _plain_solid_face_refs(elem, run_axis):
+    """(ref, coord) for the two outermost faces of an element's own solids whose
+    normals run along run_axis. Used for wall openings, whose geometry is a bare
+    Solid rather than the GeometryInstance a family produces."""
+    opt = Options()
+    opt.ComputeReferences = True
+    try:
+        geo = elem.get_Geometry(opt)
+    except Exception:
+        geo = None
+    if not geo:
+        return []
+    refs = []
+    stack = [item for item in geo]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, GeometryInstance):
+            try:
+                inst_geo = item.GetInstanceGeometry()
+            except Exception:
+                inst_geo = None
+            if inst_geo:
+                for sub in inst_geo:
+                    stack.append(sub)
+            continue
+        if not isinstance(item, Solid) or item.Faces.Size == 0:
+            continue
+        for face in item.Faces:
+            if not isinstance(face, PlanarFace):
+                continue
+            ref = face.Reference
+            if ref is None:
+                continue
+            n = face.FaceNormal
+            if abs(n.Z) > 0.9:
+                continue
+            if run_axis == "x" and abs(n.X) > 0.7:
+                refs.append((ref, face.Origin.X))
+            elif run_axis == "y" and abs(n.Y) > 0.7:
+                refs.append((ref, face.Origin.Y))
+    if len(refs) >= 2:
+        refs.sort(key=lambda item: item[1])
+        return [refs[0], refs[-1]]
+    return []
+
+
+def _wall_opening_face_refs(wall, run_axis):
+    """(ref, coord) jamb references of the plain wall openings cut into wall."""
+    results = []
+    for elem in _wall_openings_map().get(wall.Id.IntegerValue, []):
+        pair = _plain_solid_face_refs(elem, run_axis)
+        if len(pair) >= 2:
+            results.extend(pair)
+    return results
+
+
+def _collect_opening_face_refs(wall, run_axis, doors_only=False):
     """
     Returns (ref, coord) for Left/Right jamb references of every hosted
     door/window.  Primary: FamilyInstanceReferenceType.Left/Right.
     Fallback: geometry traversal without opt.View.
+
+    With doors_only the windows are dropped (see _is_door_like).
     """
     results = []
     dep_elems = _hosted_openings_map().get(wall.Id.IntegerValue, [])
 
     for elem in dep_elems:
+        if doors_only and not _is_door_like(elem):
+            continue
         try:
             loc = elem.Location
             pt = loc.Point if hasattr(loc, "Point") else loc.Curve.Evaluate(0.5, True)
@@ -1312,6 +1447,54 @@ def _pick_reference_points(prompt):
         return []
 
 
+def _add_nearby_opening_refs(point, axis, wall_infos, face_pairs):
+    """Append the jamb references of doors / plain wall openings that sit close
+    to this interior guide line, so the chain measures them as well.
+
+    Only walls running PARALLEL to the guide are considered -- those are the
+    ones whose jambs are spread along the axis the chain measures. A wall the
+    guide crosses is already handled by its two faces. Windows are skipped.
+
+    ``face_pairs`` is extended in place; returns how many references were added.
+    """
+    if not DIM_INTERIOR_OPENINGS:
+        return 0
+    near_tol = mm_to_ft(INTERIOR_OPENING_NEAR_MM)
+    guide_perp = point.Y if axis == "x" else point.X
+    added = 0
+    for ei in wall_infos:
+        wall = ei["element"]
+        try:
+            orient = wall.Orientation
+            if axis == "x":
+                # Guide runs east/west -> parallel walls have a north/south
+                # normal, and their openings' jambs are spread along X.
+                if abs(orient.Y) < 0.7:
+                    continue
+                lo, hi = ei["min_y"], ei["max_y"]
+            else:
+                if abs(orient.X) < 0.7:
+                    continue
+                lo, hi = ei["min_x"], ei["max_x"]
+            # Perpendicular gap between the guide and the wall body (0 when the
+            # guide runs through the wall itself).
+            gap = max(lo - guide_perp, guide_perp - hi, 0.0)
+            if gap > near_tol:
+                continue
+            refs = _collect_opening_face_refs(wall, axis, doors_only=True)
+            refs = refs + _wall_opening_face_refs(wall, axis)
+            if not refs:
+                continue
+            for item in refs:
+                face_pairs.append(item)
+            added += len(refs)
+            _seg_log(u"  int opening wall {} gap_mm={} refs={}".format(
+                wall.Id.IntegerValue, int(round(ft_to_mm(gap))), len(refs)))
+        except Exception:
+            continue
+    return added
+
+
 def _interior_dimension_at_point(point, axis, wall_infos, dims_to_adjust, index):
     """Dimension every wall face crossed by one user-selected reference line."""
     face_pairs = []
@@ -1344,6 +1527,8 @@ def _interior_dimension_at_point(point, axis, wall_infos, dims_to_adjust, index)
         except Exception:
             continue
 
+    n_open = _add_nearby_opening_refs(point, axis, wall_infos, face_pairs)
+
     if len(face_pairs) < 2:
         if DEBUG:
             output.print_md(u"   ⏭ Interior {} point: fewer than two wall faces".format(axis))
@@ -1375,10 +1560,11 @@ def _interior_dimension_at_point(point, axis, wall_infos, dims_to_adjust, index)
     refs = [ref for ref, unused_coord in deduped]
     low = deduped[0][1]
     high = deduped[-1][1]
-    _seg_log(u"  int dim axis={} at_perp_mm={} faces={}->{} low_mm={} high_mm={}".format(
-        axis, int(round(ft_to_mm(point.X if axis == "y" else point.Y))),
-        n_before, len(deduped), int(round(ft_to_mm(low))),
-        int(round(ft_to_mm(high)))))
+    _seg_log(u"  int dim axis={} at_perp_mm={} faces={}->{} openings={} "
+             u"low_mm={} high_mm={}".format(
+                 axis, int(round(ft_to_mm(point.X if axis == "y" else point.Y))),
+                 n_before, len(deduped), n_open, int(round(ft_to_mm(low))),
+                 int(round(ft_to_mm(high)))))
     if axis == "x":
         p0 = XYZ(low, point.Y, 0)
         p1 = XYZ(high, point.Y, 0)
@@ -3305,6 +3491,7 @@ def place_all_guides(notify=True):
     _glog_reset()
     _glog(u"=== place_all_guides ===")
     _reset_hosted_openings_cache()
+    _reset_wall_openings_cache()
     _reset_protrusion_cache()
     all_elems = collect_walls_in_view()
     _glog(u"walls in view: {}".format(len(all_elems)))
@@ -3378,6 +3565,7 @@ def create_all_dimensions(notify=True):
         return
 
     _reset_hosted_openings_cache()
+    _reset_wall_openings_cache()
     _reset_protrusion_cache()
     all_elems = collect_walls_in_view()
     ext_guides = _find_guide_lines()
