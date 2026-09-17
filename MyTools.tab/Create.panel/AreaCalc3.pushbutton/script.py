@@ -825,6 +825,9 @@ def build_report_data(results, multipliers):
     def rng(col, f, l):
         return "=SUM({0}{1}:{0}{2})".format(col, f, l)
 
+    def sprng(col, f, l):
+        return "=SUMPRODUCT({0}{1}:{0}{2},C{1}:C{2})".format(col, f, l)
+
     def cell_sum(col, row_indices):
         if not row_indices:
             return 0
@@ -841,28 +844,39 @@ def build_report_data(results, multipliers):
             mult = multipliers.get((b, lv), 1)
             cats = summary[b][lv]
             ri = len(summary_rows) + 1
-            d_v = round(cats[u"מגורים"] * mult, 2)
-            e_v = round(cats[u"מסחר"] * mult, 2)
-            f_v = round(cats[u"תעסוקה"] * mult, 2)
-            g_v = round(cats[u"עיקרי"] * mult, 2)
-            i_v = round(cats[u"חנייה"] * mult, 2)
-            j_v = round(cats[u"מבואות ומדרגות"] * mult, 2)
-            k_v = round(cats[u"אחסנה"] * mult, 2)
-            l_v = round(cats[u"מערכות טכניות"] * mult, 2)
-            m_v = round(cats[u"בליטות"] * mult, 2)
-            n_v = round(cats[u"קומות עמודים מפולשת"] * mult, 2)
-            o_v = round(cats[u"שירות"] * mult, 2)
-            r_v = round(cats[u"הורדות"] * mult, 2)
-            s_v = round(cats[u"שטח מרוצף"] * mult, 2)
-            t_v = round(cats[u"מצללה"] * mult, 2)
+            d_v = round(cats[u"מגורים"], 2)
+            e_v = round(cats[u"מסחר"], 2)
+            f_v = round(cats[u"תעסוקה"], 2)
+            g_v = round(cats[u"עיקרי"], 2)
+            i_v = round(cats[u"חנייה"], 2)
+            j_v = round(cats[u"מבואות ומדרגות"], 2)
+            k_v = round(cats[u"אחסנה"], 2)
+            l_v = round(cats[u"מערכות טכניות"], 2)
+            m_v = round(cats[u"בליטות"], 2)
+            n_v = round(cats[u"קומות עמודים מפולשת"], 2)
+            o_v = round(cats[u"שירות"], 2)
+            r_v = round(cats[u"הורדות"], 2)
+            s_v = round(cats[u"שטח מרוצף"], 2)
+            t_v = round(cats[u"מצללה"], 2)
             summary_rows.append([
                 b, lv, mult,
-                d_v, e_v, f_v, g_v,
+                "={0}*C{1}".format(d_v, ri),
+                "={0}*C{1}".format(e_v, ri),
+                "={0}*C{1}".format(f_v, ri),
+                "={0}*C{1}".format(g_v, ri),
                 "=D{0}+E{0}+F{0}+G{0}".format(ri),
-                i_v, j_v, k_v, l_v, m_v, n_v, o_v,
+                "={0}*C{1}".format(i_v, ri),
+                "={0}*C{1}".format(j_v, ri),
+                "={0}*C{1}".format(k_v, ri),
+                "={0}*C{1}".format(l_v, ri),
+                "={0}*C{1}".format(m_v, ri),
+                "={0}*C{1}".format(n_v, ri),
+                "={0}*C{1}".format(o_v, ri),
                 "=I{0}+J{0}+K{0}+L{0}+M{0}+N{0}+O{0}".format(ri),
                 "=H{0}+P{0}".format(ri),
-                r_v, s_v, t_v,
+                "={0}*C{1}".format(r_v, ri),
+                "={0}*C{1}".format(s_v, ri),
+                "={0}*C{1}".format(t_v, ri),
             ])
             summary_styles[ri] = building_data_xf[b]
 

@@ -10,3 +10,10 @@ snapshots/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Secrets
+api_key.txt
+*api_key*.txt
+
+# Backups
+*.bak_before_merge_*

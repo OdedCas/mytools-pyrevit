@@ -1224,30 +1224,74 @@ def _autodim_type_name(base_name):
     return u"{} - {}".format(AUTODIM_DIM_TYPE_NAME, base_name)
 
 
+# Dimension styles that cannot measure a wall face, so they are never offered.
+# Matched by the STRING of DimensionType.StyleType. The test is a blacklist on
+# purpose: an unrecognised style name is kept and offered rather than silently
+# swallowing the whole list, which is exactly how the picker first went missing.
+NON_LINEAR_DIM_STYLES = (
+    u"Angular", u"Radial", u"Diameter", u"ArcLength",
+    u"SpotElevation", u"SpotCoordinate", u"SpotSlope",
+)
+
+
+def _dim_type_by_name(name):
+    """Find a DimensionType by exact name, scanning ElementType broadly rather
+    than OfClass(DimensionType) -- the two do not always agree, which is how a
+    type can exist for Duplicate's name check yet be missed by the scan."""
+    try:
+        for t in FilteredElementCollector(doc).OfClass(DimensionType):
+            try:
+                if t.Name == name:
+                    return t
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        for t in FilteredElementCollector(doc).WhereElementIsElementType():
+            if not isinstance(t, DimensionType):
+                continue
+            try:
+                if t.Name == name:
+                    return t
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
 def _linear_dim_types():
-    """(name, DimensionType) for every linear dimension style in the model,
-    sorted by name. This tool's own AUTODIM types are left out -- picking one
-    would duplicate a duplicate."""
+    """(name, DimensionType) for every dimension style that can measure a wall
+    face, sorted by name. This tool's own AUTODIM types are left out -- picking
+    one would duplicate a duplicate."""
     found = []
     try:
         types = list(FilteredElementCollector(doc).OfClass(DimensionType))
-    except Exception:
+    except Exception as e:
+        _glog(u"dimension type collector FAILED: {}".format(e))
         return found
+    _glog(u"dimension types in model: {}".format(len(types)))
     for t in types:
         try:
             name = t.Name
-        except Exception:
+        except Exception as e:
+            _glog(u"  <unnamed type> skipped: {}".format(e))
             continue
-        if not name or name.startswith(AUTODIM_DIM_TYPE_NAME):
+        if not name:
             continue
-        # Keep linear styles only where the API exposes the family. Angular,
-        # radial and arc-length styles cannot dimension a wall face.
+        style = u"?"
         try:
-            style = t.StyleType
-            if style is not None and unicode(style) != u"Linear":
-                continue
+            style = u"{}".format(t.StyleType)
         except Exception:
-            pass
+            style = u"?"
+        if name.startswith(AUTODIM_DIM_TYPE_NAME):
+            _glog(u"  '{}' [{}] skipped (our own type)".format(name, style))
+            continue
+        if style in NON_LINEAR_DIM_STYLES:
+            _glog(u"  '{}' [{}] skipped (not linear)".format(name, style))
+            continue
+        _glog(u"  '{}' [{}] offered".format(name, style))
         found.append((name, t))
     found.sort(key=lambda item: item[0].lower())
     return found
@@ -1264,8 +1308,11 @@ def pick_dim_style():
         return True
     styles = _linear_dim_types()
     if not styles:
-        # Nothing to choose from: fall through to the default type.
+        # Say so out loud. Falling through silently is indistinguishable from
+        # the picker never having been wired up at all.
         _glog(u"no dimension styles found, using the default type")
+        forms.alert(u"No dimension styles were found in this model, so the "
+                    u"default type will be used.", title=__title__)
         return True
     names = [name for name, unused_t in styles]
     # SelectFromList has no "preselect" option, so the last pick is floated to
@@ -1280,7 +1327,10 @@ def pick_dim_style():
             button_name=u"Use this style",
             multiselect=False)
     except Exception as e:
-        _glog(u"style picker failed ({}), using the default type".format(e))
+        _glog(u"style picker FAILED ({}), using the default type".format(e))
+        forms.alert(u"The dimension style picker could not open:\n{}\n\n"
+                    u"The default type will be used.".format(e),
+                    title=__title__)
         return True
     if not chosen:
         _glog(u"style pick cancelled")
@@ -1357,7 +1407,31 @@ def _autodim_dim_type_id():
         return dup.Id
     except Exception as e:
         _glog(u"could not create dimension type '{}': {}".format(want, e))
-        return None
+
+    # Duplicate refuses a name already in use, yet the scan above did not find
+    # it -- Revit checks the name across dimension types the OfClass collector
+    # does not always hand back. Look it up by name the other way round, and
+    # only if that fails too take a numbered name so the run still produces
+    # dimensions instead of silently making none.
+    existing = _dim_type_by_name(want)
+    if existing is not None:
+        _glog(u"reusing existing dimension type '{}' (id {})".format(
+            want, existing.Id.IntegerValue))
+        if tune:
+            _apply_witness_line_settings(existing)
+        return existing.Id
+    for n in range(2, 20):
+        alt = u"{} {}".format(want, n)
+        try:
+            dup = base.Duplicate(alt)
+        except Exception:
+            continue
+        if tune:
+            _apply_witness_line_settings(dup)
+        _glog(u"dimension type '{}' created instead".format(alt))
+        return dup.Id
+    _glog(u"no dimension type could be created for '{}'".format(want))
+    return None
 
 
 def _dim_references_grid(d):
@@ -3613,7 +3687,8 @@ def place_all_guides(notify=True):
     ``notify`` the user is told to adjust the guides and re-run; when called as
     part of the one-run path it stays silent. Returns (n_ext, n_int) or None on
     failure."""
-    _glog_reset()
+    # NB: the log is reset in main(), before the style picker runs -- resetting
+    # here would throw away everything the picker recorded.
     _glog(u"=== place_all_guides ===")
     _reset_hosted_openings_cache()
     _reset_wall_openings_cache()
@@ -3950,6 +4025,10 @@ def main():
 
     # Ask for the dimension style first: it needs a plain command context with
     # no transaction open, and cancelling here should cost the user nothing.
+    # The log is reset here rather than in place_all_guides so the picker's own
+    # diagnostics survive.
+    _glog_reset()
+    _glog(u"=== AutoDimension 2 run ===")
     if not pick_dim_style():
         return
 
