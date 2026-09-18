@@ -19,11 +19,18 @@ import sys
 
 from trace import axis_segments, load_gray, merge_sandwich, wall_mask
 
-# From s2rv8/README.md: the bottom dimension string totals 886 cm over about
-# 680 px on the sample. This is step 2's job (find a dimension string and ask
-# the user to confirm it); until that exists the value is an UNVERIFIED
-# default and every exported length inherits its error.
-DEFAULT_PX_PER_CM = 0.7675
+# 726 px / 815 cm, measured on the long left exterior wall of the sample and
+# confirmed against the drawing by Oded on 2026-09-18.
+#
+# NOT the 0.7675 the README quotes. That came from reading the bottom dimension
+# string (886 cm) as the building width, but the wall envelope is only 691 px
+# wide, and 886 cm reaches past the walls to the boundary line. Calibrating on
+# a single wall whose two ends are both measurable avoids that trap.
+#
+# This is still one drawing's number. Step 2 (find a dimension string, ask the
+# user to confirm it) is what should produce it per plan; until then pass
+# --px-per-cm for any other drawing or every exported length is wrong.
+DEFAULT_PX_PER_CM = 0.8908
 
 LAYER_EXT = "A-WALL-EXT"
 LAYER_INT = "A-WALL-INT"
@@ -130,7 +137,9 @@ def convert(image_path, dxf_path, px_per_cm=DEFAULT_PX_PER_CM):
         sum(1 for v in layer_of.values() if v == LAYER_EXT),
         sum(1 for v in layer_of.values() if v == LAYER_INT)))
     print("lines written: {}".format(sum(len(v) for v in by_layer.values())))
-    print("scale: {} px/cm  (UNVERIFIED - step 2 calibration not built)".format(px_per_cm))
+    note = "confirmed on this sample" if px_per_cm == DEFAULT_PX_PER_CM else "supplied"
+    print("scale: {} px/cm  ({}; pass --px-per-cm for another drawing)".format(
+        px_per_cm, note))
     print("wall thickness cm: min={:.1f} median={:.1f} max={:.1f}".format(
         thicks_cm[0], thicks_cm[len(thicks_cm) // 2], thicks_cm[-1]))
     xs = [p[0] for v in by_layer.values() for ln in v for p in ln]
