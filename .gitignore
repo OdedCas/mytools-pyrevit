@@ -17,3 +17,7 @@ api_key.txt
 
 # Backups
 *.bak_before_merge_*
+
+# S2Rv8 local prototyping
+.venv/
+s2rv8_work/
