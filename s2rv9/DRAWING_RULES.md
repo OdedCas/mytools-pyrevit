@@ -20,6 +20,11 @@ builder must follow these. When code and this file disagree, this file wins.
 7. **A balcony is not a wall.** Its edge (railing / parapet) is drawn as a
    thin double line, but it is left out of the Revit model. The wall between
    the apartment and the balcony (e.g. the `5N` window wall) *is* a wall.
+   **The balcony is whatever lies outside the window wall.**
+8. **A thin wall on the outside edge can be a neighbour (party) wall**, e.g.
+   the `815` wall (~10 cm). It is a real wall and part of the apartment's
+   outline, even though it has no windows and is thinner than rule 3's
+   20–50 cm.
 
 ## Wall material by thickness
 

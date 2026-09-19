@@ -68,8 +68,14 @@ def _pair_band(px_lines, i, j):
             "lines": [i, j]}
 
 
-def merge_touching(bands, px_per_cm, max_gap_cm=6.0, min_overlap_ratio=0.5):
-    """Join bands whose faces are at most max_gap_cm apart into one wall."""
+def merge_touching(bands, px_per_cm, max_gap_cm=6.0, min_overlap_ratio=0.5,
+                   max_thick_cm=50.0):
+    """Join bands whose faces are at most max_gap_cm apart into one wall.
+
+    Never past max_thick_cm: DRAWING_RULES.md rule 3 caps a wall at 50 cm, so
+    a merge that would exceed it is a wall plus something beside it (a
+    column, a door pocket), not one thicker wall.
+    """
     bands = [dict(b) for b in bands]
     changed = True
     while changed:
@@ -84,6 +90,8 @@ def merge_touching(bands, px_per_cm, max_gap_cm=6.0, min_overlap_ratio=0.5):
                     continue
                 ov = min(a["s1"], b["s1"]) - max(a["s0"], b["s0"])
                 if ov <= 0 or ov < min_overlap_ratio * min(a["s1"] - a["s0"], b["s1"] - b["s0"]):
+                    continue
+                if (max(a["p1"], b["p1"]) - min(a["p0"], b["p0"])) / px_per_cm > max_thick_cm:
                     continue
                 bands[x] = {"axis": a["axis"],
                             "p0": min(a["p0"], b["p0"]), "p1": max(a["p1"], b["p1"]),
