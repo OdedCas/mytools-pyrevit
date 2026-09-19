@@ -21,3 +21,7 @@ api_key.txt
 # S2Rv8 local prototyping
 .venv/
 s2rv8_work/
+
+# S2Rv9 local prototyping
+.venv
+s2rv9_work/
