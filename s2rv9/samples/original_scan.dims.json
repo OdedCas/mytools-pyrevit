@@ -1,0 +1,45 @@
+{
+  "_about": "Outside dimension strings of original_scan.jpeg, in the order they run. Read from the scan and reviewed with Oded in the 2026-09-18/19 session. In the Revit tool these come from Claude reading the image, confirmed by the user in a dialog. 'w' marks a window segment; sill = UK value in cm.",
+  "px_per_cm": 0.78,
+  "strings": {
+    "top": {
+      "direction": "left to right",
+      "segments": [
+        {"cm": 15},
+        {"cm": 120, "window": true, "sill_cm": 60},
+        {"cm": 145},
+        {"cm": 100, "window": true, "sill_cm": 60, "tag": "4N"},
+        {"cm": 133}
+      ],
+      "note": "15: Oded - correct, but measure it rather than trust it"
+    },
+    "right": {
+      "direction": "top to bottom",
+      "segments": [
+        {"cm": 258},
+        {"cm": 100, "window": true, "sill_cm": 60, "tag": "4N"},
+        {"cm": 186},
+        {"cm": 100, "window": true, "sill_cm": 110, "tag": "3N"},
+        {"cm": 186},
+        {"cm": 100, "window": true, "sill_cm": 60, "tag": "4N"},
+        {"cm": 182}
+      ],
+      "check_total_cm": 1112,
+      "note": "second row reads 1,112 = sum of the segments"
+    },
+    "bottom": {
+      "direction": "left to right",
+      "segments": [
+        {"cm": 192},
+        {"cm": 100, "window": true, "sill_cm": 60, "tag": "4N"},
+        {"cm": 198},
+        {"cm": 144, "window": true, "glass": true},
+        {"cm": 208}
+      ],
+      "note": "second row reads 352 = 144 + 208; 208 is the balcony"
+    }
+  },
+  "glazed_walls": [
+    {"tag": "5N", "width_cm": 505, "note": "living room / balcony glass wall; the 505 beside it"}
+  ]
+}
